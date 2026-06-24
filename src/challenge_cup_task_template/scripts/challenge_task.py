@@ -60,43 +60,34 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     launcher.start(node_name=node_name or config["node_name"], timeout=timeout)
 
     import rospy
-    from geometry_msgs.msg import Twist
-    from sensor_msgs.msg import JointState
 
     rospy.loginfo("=== %s任务启动 ===", config["title"])
-
-    cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-    arm_traj_pub = rospy.Publisher("/kuavo_arm_traj", JointState, queue_size=10)
-
     rospy.sleep(1.0)
     rospy.loginfo("场景实例已初始化。")
 
-    # ========================================
-    # TODO: 在此实现三场景共用或按 scene 分支的任务逻辑
-    # ========================================
+    # ====================================================================
+    # 选手任务实现区（本区为允许选手修改的部分）
+    # --------------------------------------------------------------------
+    # 任务逻辑已拆分到本包内的 Python 子包 challenge_task_lib，按职责分文件：
+    #   challenge_task_lib/config.py        所有需标定的常量(★TODO 集中地)
+    #   challenge_task_lib/perception.py    合法传感器订阅与缓存
+    #   challenge_task_lib/hardware.py      行走/手臂/夹爪/IK 底层 IO
+    #   challenge_task_lib/vision.py        颜色定位 + 深度反投影到 base_link
+    #   challenge_task_lib/manipulation.py  抓取/放置/搜索动作宏
+    #   challenge_task_lib/scenes.py        三场景流水线
+    #   challenge_task_lib/runner.py        顶层组装入口 execute_task()
     #
-    # if scene == "scene1":
-    #     pass  # 包裹称重与摆放
-    # elif scene == "scene2":
-    #     pass  # 分拣归档
-    # elif scene == "scene3":
-    #     pass  # SMT 料盘出库
-    #
-    # 可用接口：
-    #   /cmd_vel                  geometry_msgs/Twist
-    #   /kuavo_arm_traj           sensor_msgs/JointState
-    #   /lidar/points             sensor_msgs/PointCloud2
-    #   /sensors_data_raw         kuavo_msgs/sensorsData
-    #   /control_robot_leju_claw  kuavo_msgs/controlLejuClaw
-    #   /leju_claw_command        kuavo_msgs/lejuClawCommand
-    #   /leju_claw_state          kuavo_msgs/lejuClawState
-    #
-    # 示例：
-    # twist = Twist()
-    # twist.linear.x = 0.1
-    # cmd_vel_pub.publish(twist)
+    # 调参时主要改 config.py；扩展逻辑改对应模块。本入口只负责导入并调用。
+    # ====================================================================
 
-    rospy.spin()
+    # 兼容直接 rosrun（未编译 catkin python 包）的情况：把 ../src 加入路径
+    _lib_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+    if os.path.isdir(_lib_src) and _lib_src not in sys.path:
+        sys.path.insert(0, _lib_src)
+
+    from challenge_task_lib.runner import execute_task
+
+    execute_task(scene=scene, title=config["title"])
 
 
 def main():

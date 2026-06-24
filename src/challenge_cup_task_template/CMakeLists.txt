@@ -3,6 +3,8 @@ project(challenge_cup_task_template)
 
 find_package(catkin REQUIRED)
 
+catkin_python_setup()
+
 catkin_package()
 
 catkin_install_python(PROGRAMS
