@@ -54,6 +54,21 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 
 `--seed` 用于本地生成不同场景实例。正式评测 seed 由组委会指定，选手不应依赖某个固定 seed 或硬编码物体位置。
 
+仿真启动等待默认值已调为 `300` 秒，以兼容算力较弱或首次启动较慢的服务器。如果需要覆盖，可使用：
+
+```bash
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --timeout 420
+```
+
+或环境变量：
+
+```bash
+export CHALLENGE_TASK_SIM_TIMEOUT=420
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3
+```
+
+这项等待主要用于给 `/sensors_data_raw`、`set_object_position` 等仿真初始化链路留出足够时间；过短时，慢机上可能误报“场景初始化服务不可用”。
+
 ## 比赛计时
 
 默认不限制时长，只显示计时，便于调试。
