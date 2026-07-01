@@ -368,7 +368,7 @@ class Hardware(object):
         end = rospy.Time.now() + rospy.Duration(timeout)
         rate = rospy.Rate(20)
         while rospy.Time.now() < end and not rospy.is_shutdown():
-            if all(s >= 2 for s in self.perception.snapshot()["claw"]):
+            if all(s >= config.CLAW_OPEN_MIN_STATE for s in self.perception.snapshot()["claw"]):
                 return True
             rate.sleep()
         return False

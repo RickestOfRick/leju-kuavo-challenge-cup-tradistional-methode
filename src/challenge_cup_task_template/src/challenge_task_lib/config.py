@@ -73,6 +73,9 @@ HEAD_SCAN_YAWS = (0.0, -20.0, 20.0)   # 低头后只转脖子扫桌面，不转�
 # ---- 夹爪行程（0 张开 / 100 闭合）----
 CLAW_OPEN = 5.0
 CLAW_CLOSE = 95.0
+# 仿真里夹住包裹时，目标侧夹爪可能长期停在 kMoving(1)，不一定会上报 kGrabbed(3)。
+CLAW_CLOSE_MIN_STATE = 1
+CLAW_OPEN_MIN_STATE = 2
 
 # ---- HSV 颜色表 (下界, 上界)。★TODO: 对着实际画面用取色器精修 ----
 HSV_COLORS = {
@@ -93,9 +96,15 @@ HSV_COLORS = {
 # ---- 右手抓取 ----
 RIGHT_PICK_IK_Z = -0.03           # 最终抓取高度基准(IK z)。抓太高/太低先调这里
 RIGHT_PICK_TRANSIT_IK_Z = 0.120   # 抓取前横移高度
+# 视觉给的是包裹中心点；真正夹取时需要向可抓边缘做少量平移/压深补偿。
+RIGHT_PICK_OFFSET_FAR_ROW = (-0.03, 0.0, 0.0)
+RIGHT_PICK_OFFSET_NEAR_ROW = (-0.03, 0.02, -0.02)
+RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
 LIFT_Z_OFFSET = 0.300             # 夹紧后抬起高度
 RIGHT_PICK_FIRST_YPR_DEG = (0.0, -90.0, 0.0)
 RIGHT_PICK_SECOND_YPR_DEG = (90.0, 0.0, 0.0)
+RIGHT_PICK_TRANSIT_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
+RIGHT_PICK_FINAL_CONSTRAINT_MODE = IK_MODE_POS_HARD_ORI_HARD
 
 # ---- 称重区释放（A 阶段终点）----
 WEIGH_RELEASE_IK = (0.396, -0.574, 0.146217)    # 释放点(已含落点补偿)

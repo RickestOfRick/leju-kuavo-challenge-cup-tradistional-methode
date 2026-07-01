@@ -19,6 +19,23 @@ class Manipulation(object):
         self.hw = hardware
         self.vision = vision
 
+    @staticmethod
+    def _pick_offset_for(pos_ik):
+        """按目标 y 所在分区给抓取点做小偏移，避免夹在长边端头或压深不足。"""
+        if pos_ik is None:
+            return (0.0, 0.0, 0.0)
+        if pos_ik[1] > config.RIGHT_PICK_NEAR_FAR_Y_THRESHOLD:
+            return config.RIGHT_PICK_OFFSET_NEAR_ROW
+        return config.RIGHT_PICK_OFFSET_FAR_ROW
+
+    @staticmethod
+    def _claw_state_ok(claw_state, side, min_state):
+        if side == "left":
+            return len(claw_state) >= 1 and claw_state[0] >= min_state
+        if side == "right":
+            return len(claw_state) >= 2 and claw_state[1] >= min_state
+        return all(s >= min_state for s in claw_state)
+
     # ---------------- 搜索：低头扫描定位 ----------------
     def scan_locate(self, color_name):
         """低头保持低头姿态，转脖子扫桌面找指定颜色物体。
@@ -45,7 +62,8 @@ class Manipulation(object):
         if pos_ik is None:
             rospy.logwarn("pick: 目标位置为空")
             return False
-        x, y, _z = pos_ik
+        ox, oy, oz = self._pick_offset_for(pos_ik)
+        x, y, _z = pos_ik[0] + ox, pos_ik[1] + oy, pos_ik[2] + oz
         first = config.RIGHT_PICK_FIRST_YPR_DEG
         second = config.RIGHT_PICK_SECOND_YPR_DEG
 
@@ -55,12 +73,14 @@ class Manipulation(object):
 
         # 1) 横移到抓取上方（用固定横移高度，xy 取视觉值）
         if not self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_TRANSIT_IK_Z),
-                                   first, second):
+                                   first, second,
+                                   constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE):
             rospy.logwarn("pick: 横移到上方 IK 无解")
             return False
         # 2) 下降到抓取高度（z 用标定基准，不用视觉 z，避免深度噪声扎太深）
         if not self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_IK_Z),
-                                   first, second):
+                                   first, second,
+                                   constraint_mode=config.RIGHT_PICK_FINAL_CONSTRAINT_MODE):
             rospy.logwarn("pick: 下降到抓取高度 IK 无解")
             return False
         # 3) 硬解夹紧
@@ -68,8 +88,11 @@ class Manipulation(object):
         self.hw.wait_claw_settled()
         # 4) 抬起
         self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_IK_Z + config.LIFT_Z_OFFSET),
-                            first, second)
-        return all(s >= 2 for s in self.perception.snapshot()["claw"])
+                            first, second,
+                            constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE)
+        return self._claw_state_ok(
+            self.perception.snapshot()["claw"], side, config.CLAW_CLOSE_MIN_STATE
+        )
 
     # ---------------- 放到称重区（A 阶段终点）----------------
     def place_weigh(self, side="right"):
@@ -111,7 +134,9 @@ class Manipulation(object):
         self.hw.wait_claw_settled()
         # 抬回高位
         self.hw.move_eef_to(side, (rx, ry, config.WEIGH_RELEASE_IK[2]), first, second)
-        return all(s >= 2 for s in self.perception.snapshot()["claw"])
+        return self._claw_state_ok(
+            self.perception.snapshot()["claw"], side, config.CLAW_CLOSE_MIN_STATE
+        )
 
     # ---------------- B 阶段：右手交给左手 ----------------
     def handoff_to_left(self):
