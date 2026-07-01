@@ -72,31 +72,25 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     rospy.loginfo("场景实例已初始化。")
 
     # ========================================
-    # TODO: 在此实现三场景共用或按 scene 分支的任务逻辑
+    # 场景分支
     # ========================================
-    #
-    # if scene == "scene1":
-    #     pass  # 包裹称重与摆放
-    # elif scene == "scene2":
-    #     pass  # 分拣归档
-    # elif scene == "scene3":
-    #     pass  # SMT 料盘出库
-    #
-    # 可用接口：
-    #   /cmd_vel                  geometry_msgs/Twist
-    #   /kuavo_arm_traj           sensor_msgs/JointState
-    #   /lidar/points             sensor_msgs/PointCloud2
-    #   /sensors_data_raw         kuavo_msgs/sensorsData
-    #   /control_robot_leju_claw  kuavo_msgs/controlLejuClaw
-    #   /leju_claw_command        kuavo_msgs/lejuClawCommand
-    #   /leju_claw_state          kuavo_msgs/lejuClawState
-    #
-    # 示例：
-    # twist = Twist()
-    # twist.linear.x = 0.1
-    # cmd_vel_pub.publish(twist)
-
-    rospy.spin()
+    if scene == "scene3":
+        _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from scene3_impl import Scene3Controller
+        controller = Scene3Controller(cmd_vel_pub, arm_traj_pub)
+        controller.run()
+    elif scene == "scene2":
+        # TODO: 实现场景二（分拣归档）
+        rospy.loginfo("场景二尚未实现，进入待机。")
+        rospy.spin()
+    elif scene == "scene1":
+        # TODO: 实现场景一（包裹称重与摆放）
+        rospy.loginfo("场景一尚未实现，进入待机。")
+        rospy.spin()
+    else:
+        rospy.spin()
 
 
 def main():
