@@ -270,13 +270,19 @@ class Hardware(object):
         if not res.success:
             rospy.logwarn("IK 无解: %s", getattr(res, "error_reason", ""))
             return None
-        # 取 14 关节：优先 hand_poses.*.joint_angles，回退 q_arm
+        # 单臂 IK 只采用目标手的新解，另一只手保持当前关节不动。
+        # 否则求解器给出的“另一手补偿解”也会被一起发布，容易把上身大幅带偏甚至摔倒。
         lj = list(res.hand_poses.left_pose.joint_angles)
         rj = list(res.hand_poses.right_pose.joint_angles)
         if len(lj) == 7 and len(rj) == 7:
-            return lj + rj
+            if side == "left":
+                return lj + cur[7:14]
+            return cur[0:7] + rj
         if len(res.q_arm) >= 14:
-            return list(res.q_arm[:14])
+            solved = list(res.q_arm[:14])
+            if side == "left":
+                return solved[0:7] + cur[7:14]
+            return cur[0:7] + solved[7:14]
         rospy.logwarn("IK 返回未含 14 关节")
         return None
 
