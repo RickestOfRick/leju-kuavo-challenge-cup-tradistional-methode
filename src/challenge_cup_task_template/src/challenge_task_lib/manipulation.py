@@ -29,6 +29,21 @@ class Manipulation(object):
         return config.RIGHT_PICK_OFFSET_FAR_ROW
 
     @staticmethod
+    def _right_pick_yz_align_ik(current_right_ik, right_pick_pre_ik):
+        """先在安全 x 上拉 y/姿态，下一步再去真实抓取上方，降低坏 IK 概率。"""
+        if current_right_ik is None:
+            return None
+        current_x = float(current_right_ik[0])
+        target_x = float(right_pick_pre_ik[0])
+        safe_x = float(config.RIGHT_PICK_YZ_ALIGN_SAFE_IK_X)
+        if current_x <= target_x:
+            align_x = min(target_x, max(current_x, safe_x))
+        else:
+            align_x = max(target_x, min(current_x, safe_x))
+        align_z = max(float(current_right_ik[2]), float(right_pick_pre_ik[2]))
+        return (align_x, float(right_pick_pre_ik[1]), align_z)
+
+    @staticmethod
     def _claw_state_ok(claw_state, side, min_state):
         if side == "left":
             return len(claw_state) >= 1 and claw_state[0] >= min_state
@@ -71,25 +86,57 @@ class Manipulation(object):
         self.hw.gripper(close=False)
         self.hw.look_forward()   # 抓取前头回正，避免遮挡
 
-        # 1) 横移到抓取上方（用固定横移高度，xy 取视觉值）
-        if not self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_TRANSIT_IK_Z),
-                                   first, second,
-                                   constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE):
+        pre_pick = (x, y, config.RIGHT_PICK_TRANSIT_IK_Z)
+        current_right, _quat = self.hw.current_eef_pose(side)
+        yz_align = self._right_pick_yz_align_ik(current_right, pre_pick)
+
+        # 1) 先在安全 x 上把 y/姿态拉到抓取通道，避免从预设位直接斜切到抓取上方。
+        if yz_align is not None and not self.hw.move_eef_to(
+                side, yz_align, first, second,
+                constraint_mode=config.IK_MODE_THREE_POINT_MIXED,
+                move_time=config.PICK_ALIGN_MOVE_TIME,
+                max_pos_error=config.IK_VALIDATION_TRANSIT_POS_TOL,
+                max_ori_error_deg=config.IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
+            rospy.logwarn("pick: y/z 对齐 IK 无解或误差过大")
+            return False
+
+        # 2) 横移到抓取上方（用固定横移高度，xy 取视觉值）
+        if not self.hw.move_eef_to(side, pre_pick, first, second,
+                                   constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
+                                   move_time=config.PICK_ALIGN_MOVE_TIME,
+                                   max_pos_error=config.IK_VALIDATION_TRANSIT_POS_TOL,
+                                   max_ori_error_deg=config.IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
             rospy.logwarn("pick: 横移到上方 IK 无解")
             return False
-        # 2) 下降到抓取高度（z 用标定基准，不用视觉 z，避免深度噪声扎太深）
+        # 3) 下降到抓取高度（z 用标定基准，不用视觉 z，避免深度噪声扎太深）
         if not self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_IK_Z),
                                    first, second,
-                                   constraint_mode=config.RIGHT_PICK_FINAL_CONSTRAINT_MODE):
-            rospy.logwarn("pick: 下降到抓取高度 IK 无解")
-            return False
-        # 3) 硬解夹紧
+                                   constraint_mode=config.RIGHT_PICK_FINAL_CONSTRAINT_MODE,
+                                   move_time=config.PICK_GRASP_MOVE_TIME,
+                                   max_pos_error=config.IK_VALIDATION_FINAL_POS_TOL,
+                                   max_ori_error_deg=config.IK_VALIDATION_FINAL_ORI_TOL_DEG):
+            rospy.logwarn("pick: 0x03 下降抓取失败，回退 0x06 再试")
+            if not self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_IK_Z),
+                                       first, second,
+                                       constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
+                                       move_time=config.PICK_GRASP_MOVE_TIME,
+                                       max_pos_error=config.IK_VALIDATION_FINAL_POS_TOL,
+                                       max_ori_error_deg=config.IK_VALIDATION_FINAL_ORI_TOL_DEG):
+                rospy.logwarn("pick: 下降到抓取高度 IK 无解")
+                return False
+        # 4) 硬解夹紧
         self.hw.gripper(close=True)
         self.hw.wait_claw_settled()
-        # 4) 抬起
-        self.hw.move_eef_to(side, (x, y, config.RIGHT_PICK_IK_Z + config.LIFT_Z_OFFSET),
-                            first, second,
-                            constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE)
+        # 5) 抬起
+        if not self.hw.move_eef_to(
+                side, (x, y, config.RIGHT_PICK_IK_Z + config.LIFT_Z_OFFSET),
+                first, second,
+                constraint_mode=config.RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
+                move_time=config.PICK_LIFT_MOVE_TIME,
+                max_pos_error=config.IK_VALIDATION_TRANSIT_POS_TOL,
+                max_ori_error_deg=config.IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
+            rospy.logwarn("pick: 抬起阶段 IK 无解或误差过大")
+            return False
         return self._claw_state_ok(
             self.perception.snapshot()["claw"], side, config.CLAW_CLOSE_MIN_STATE
         )

@@ -98,6 +98,12 @@ def quat_from_ypr(first_ypr_deg, second_ypr_deg=None):
     return _rot_to_quat_xyzw(matrix)
 
 
+def _quat_angle_error_rad(actual_xyzw, desired_xyzw):
+    dot = sum(float(actual_xyzw[i]) * float(desired_xyzw[i]) for i in range(4))
+    dot = max(-1.0, min(1.0, abs(dot)))
+    return 2.0 * math.acos(dot)
+
+
 class Hardware(object):
     """封装底层控制 IO，依赖 Perception 读取当前关节角作 IK 初值/FK 输入。"""
 
@@ -216,6 +222,42 @@ class Hardware(object):
         except rospy.ServiceException as exc:
             rospy.logerr("FK 调用失败: %s", exc)
             return None
+
+    def current_eef_pose(self, side):
+        """读取当前指定手的 FK 位姿，返回 (pos_xyz, quat_xyzw) 或 (None, None)。"""
+        cur = self.current_arm_rad()
+        fk = self.call_fk(cur)
+        if fk is None:
+            return None, None
+        pose = fk.left_pose if side == "left" else fk.right_pose
+        return list(pose.pos_xyz), list(pose.quat_xyzw)
+
+    def validate_ik_solution(self, side, joint_rad, target_pos, target_quat,
+                             max_pos_error=None, max_ori_error_deg=None):
+        """用 FK 复核 IK 输出，避免把明显跑偏的“成功解”下发给控制器。"""
+        fk = self.call_fk(joint_rad)
+        if fk is None:
+            return False
+        pose = fk.left_pose if side == "left" else fk.right_pose
+        pos_err = 0.0
+        ori_err_deg = 0.0
+        if target_pos is not None:
+            pos_err = math.sqrt(sum(
+                (float(pose.pos_xyz[i]) - float(target_pos[i])) ** 2 for i in range(3)
+            ))
+        if target_quat is not None:
+            ori_err_deg = math.degrees(
+                _quat_angle_error_rad(pose.quat_xyzw, target_quat)
+            )
+        pos_ok = max_pos_error is None or pos_err <= float(max_pos_error)
+        ori_ok = max_ori_error_deg is None or ori_err_deg <= float(max_ori_error_deg)
+        if not (pos_ok and ori_ok):
+            rospy.logwarn(
+                "IK 解校验失败 side=%s pos_err=%.1fmm ori_err=%.1fdeg target=%s",
+                side, pos_err * 1000.0, ori_err_deg,
+                [round(float(v), 4) for v in target_pos] if target_pos is not None else None,
+            )
+        return pos_ok and ori_ok
 
     def _make_ik_param(self, constraint_mode):
         param = ikSolveParam()
@@ -338,11 +380,17 @@ class Hardware(object):
         rospy.sleep(config.PRESET_SETTLE_TIME if settle is None else settle)
 
     def move_eef_to(self, side, pos_ik, first_ypr, second_ypr=None,
-                    constraint_mode=None, move_time=None):
+                    constraint_mode=None, move_time=None,
+                    max_pos_error=None, max_ori_error_deg=None):
         """完整一步：FK 锁另一手 → IK 解目标手 → 100Hz 插值发布。成功返回 True。"""
         quat = quat_from_ypr(first_ypr, second_ypr)
         sol_rad = self.solve_ik(side, pos_ik, quat, constraint_mode=constraint_mode)
         if sol_rad is None:
+            return False
+        if not self.validate_ik_solution(
+                side, sol_rad, pos_ik, quat,
+                max_pos_error=max_pos_error,
+                max_ori_error_deg=max_ori_error_deg):
             return False
         start_deg = [math.degrees(a) for a in self.current_arm_rad()]
         target_deg = [math.degrees(a) for a in sol_rad]
