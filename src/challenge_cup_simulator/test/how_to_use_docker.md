@@ -148,10 +148,11 @@ conda activate letools
 cd /path/to/LeTools-Learning
 source /opt/ros/noetic/setup.bash  # 进入python环境先source好ros自带的python库，建议这行写入/root/.bashrc
 # Install dependencies
+git config --global --add safe.directory /path/to/LeTools-Learning/third_party/lerobot #添加git信任，用于子模块拉取
 chmod +x setup_env.sh #脚本里面有GitHub拉代码的部分，自己带了gh-proxy加速
 bash setup_env.sh    # 需确保 ROS Noetic 已安装 (推荐)
 apt update
 apt install ros-noetic-apriltag-ros
-pip install pyarrow
+pip install pyarrow --no-deps
 ```
 - 后续衔接 LeTools-Learning文档网站 进行使用即可。
