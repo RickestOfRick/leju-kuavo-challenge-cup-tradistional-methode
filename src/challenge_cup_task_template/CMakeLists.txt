@@ -9,4 +9,5 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   scripts/challenge_task.py
+  scripts/challenge_task_scene1.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
