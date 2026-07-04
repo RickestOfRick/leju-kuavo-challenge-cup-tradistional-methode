@@ -14,7 +14,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
 
@@ -42,18 +42,23 @@ IK_WORLD_Z_THRESHOLD = 0.75
 IK_WORLD_TO_LOCAL_Z_OFFSET = -0.923783
 HAND_WORKSPACES = {
     "left": {
-        "x": (0.18, 0.60),
+        "x": (0.18, 0.48),
         "y": (0.04, 0.36),
         "z": (-0.06, 0.60),
         "park": (0.28, 0.24, 0.55),
     },
     "right": {
-        "x": (0.18, 0.60),
+        "x": (0.18, 0.48),
         "y": (-0.36, -0.04),
         "z": (-0.06, 0.60),
         "park": (0.28, -0.24, 0.55),
     },
 }
+BASE_APPROACH_TARGET_X = 0.42
+BASE_APPROACH_MAX_DISTANCE = 0.85
+BASE_APPROACH_MIN_DISTANCE = 0.04
+BASE_APPROACH_SPEED = 0.16
+BASE_APPROACH_SETTLE = 0.25
 
 
 def _log_action(rospy, action):
@@ -838,6 +843,7 @@ class TaskExecutor:
         self.perception = perception
         self.control = control
         self.cache = cache
+        self.base_forward_offset = 0.0
 
     def execute_pick_place(self, target, place, max_attempts=2):
         preferred_side = self._choose_side(target, place)
@@ -866,6 +872,8 @@ class TaskExecutor:
         return False
 
     def _run_pick_place_attempt(self, target, place, side):
+        target = self._estimate_in_current_base(target)
+        place = self._estimate_in_current_base(place)
         action = "抓取{}并放置到{}".format(target.kind, place.kind)
         grasp_z = self._safe_z(target.z + 0.035)
         pre_z = self._safe_z(grasp_z + 0.16)
@@ -876,6 +884,9 @@ class TaskExecutor:
         # self.rospy.loginfo("抓取 %s -> %s, side=%s", target.kind, place.kind, side)
         _log_action(self.rospy, action)
         if not self.control.open_claw(side):
+            _log_failure(self.rospy, action)
+            return False
+        if not self._approach_fixed_target(target, "抓取点", [target, place]):
             _log_failure(self.rospy, action)
             return False
         steps = [
@@ -896,6 +907,15 @@ class TaskExecutor:
 
         steps = [
             (target.x, target.y, lift_z, target.yaw, 1.4),
+        ]
+        for x, y, z, yaw, duration in steps:
+            if not self.control.move_end_effector(side, x, y, z, yaw, duration):
+                _log_failure(self.rospy, action)
+                return False
+        if not self._approach_fixed_target(place, "放置点", [place]):
+            _log_failure(self.rospy, action)
+            return False
+        steps = [
             (place.x, place.y, pre_place_z, place.yaw, 2.4),
             (place.x, place.y, place_z, place.yaw, 1.2),
         ]
@@ -914,6 +934,43 @@ class TaskExecutor:
             return True
         _log_failure(self.rospy, action)
         return False
+
+    def _approach_fixed_target(self, primary, label, shifted_estimates):
+        x_max = HAND_WORKSPACES["left"]["x"][1]
+        if primary.x <= x_max:
+            return True
+
+        distance = min(
+            BASE_APPROACH_MAX_DISTANCE,
+            max(0.0, float(primary.x) - BASE_APPROACH_TARGET_X),
+        )
+        if distance < BASE_APPROACH_MIN_DISTANCE:
+            return True
+
+        action = "底盘前移接近{}".format(label)
+        _log_action(self.rospy, action)
+        self.control.drive_timed(
+            vx=BASE_APPROACH_SPEED,
+            duration=distance / BASE_APPROACH_SPEED,
+        )
+        self.base_forward_offset += distance
+        for estimate in shifted_estimates:
+            estimate.x = float(estimate.x) - distance
+        self.rospy.sleep(BASE_APPROACH_SETTLE)
+
+        if primary.x <= x_max:
+            _log_success(self.rospy, action)
+            return True
+        self.rospy.logwarn(
+            "%s仍超出手臂前向工作空间: x=%.3f, limit=%.3f",
+            label, float(primary.x), x_max)
+        _log_failure(self.rospy, action)
+        return False
+
+    def _estimate_in_current_base(self, estimate):
+        adjusted = replace(estimate)
+        adjusted.x = float(adjusted.x) - self.base_forward_offset
+        return adjusted
 
     def _choose_side(self, target, place=None):
         left_cost = self._workspace_cost("left", target, place)
