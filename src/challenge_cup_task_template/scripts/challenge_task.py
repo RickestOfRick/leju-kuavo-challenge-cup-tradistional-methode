@@ -190,9 +190,9 @@ class SensorCache:
                 self.rospy.Duration(0.15),
             )
         except Exception as exc:
-            # self.rospy.logwarn_throttle(
-            #     2.0, "TF转换失败 %s -> %s: %s",
-            #     source_frame, target_frame, exc)
+            self.rospy.logwarn_throttle(
+                2.0, "%sTF转换失败 %s -> %s: %s",
+                LOG_PREFIX, source_frame, target_frame, exc)
             return None
 
         t = trans.transform.translation
@@ -232,12 +232,12 @@ class Perception:
             estimates.extend(self._scan_once(scene, "head"))
             self.rospy.sleep(0.06)
         merged = self._merge_estimates(estimates)
-        # self.rospy.loginfo("识别到 %d 个候选目标", len(merged))
-        # for est in merged:
-        #     self.rospy.loginfo(
-        #         "  %s/%s conf=%.2f pos=(%.3f, %.3f, %.3f) size=(%.3f, %.3f, %.3f)",
-        #         est.kind, est.label, est.confidence,
-        #         est.x, est.y, est.z, est.size[0], est.size[1], est.size[2])
+        self.rospy.loginfo("%s识别到 %d 个候选目标", LOG_PREFIX, len(merged))
+        for est in merged:
+            self.rospy.loginfo(
+                "%s  %s/%s conf=%.2f pos=(%.3f, %.3f, %.3f) size=(%.3f, %.3f, %.3f)",
+                LOG_PREFIX, est.kind, est.label, est.confidence,
+                est.x, est.y, est.z, est.size[0], est.size[1], est.size[2])
         if merged:
             _log_success(self.rospy, action)
         else:
@@ -318,7 +318,8 @@ class Perception:
     def _get_decoded_frame(self, camera_name):
         color_msg, depth_msg, info = self.cache.get_camera(camera_name)
         if color_msg is None or depth_msg is None or info is None:
-            # self.rospy.logwarn_throttle(2.0, "等待 %s RGB-D 数据...", camera_name)
+            self.rospy.logwarn_throttle(
+                2.0, "%s等待 %s RGB-D 数据...", LOG_PREFIX, camera_name)
             return None
         bgr = self._decode_color(color_msg)
         depth_m = self._decode_depth(depth_msg)
@@ -334,7 +335,7 @@ class Perception:
         data = self.np.frombuffer(bytes(msg.data), dtype=self.np.uint8)
         img = self.cv2.imdecode(data, self.cv2.IMREAD_COLOR)
         if img is None:
-            # self.rospy.logwarn_throttle(2.0, "RGB图像解码失败")
+            self.rospy.logwarn_throttle(2.0, "%sRGB图像解码失败", LOG_PREFIX)
             pass
         return img
 
@@ -347,7 +348,7 @@ class Perception:
         data = self.np.frombuffer(raw[offset:], dtype=self.np.uint8)
         depth = self.cv2.imdecode(data, self.cv2.IMREAD_UNCHANGED)
         if depth is None:
-            # self.rospy.logwarn_throttle(2.0, "深度图像解码失败")
+            self.rospy.logwarn_throttle(2.0, "%s深度图像解码失败", LOG_PREFIX)
             return None
         if depth.dtype == self.np.uint16:
             depth = depth.astype(self.np.float32) / 1000.0
@@ -619,7 +620,7 @@ class RobotControl:
             self.rospy.wait_for_service(name, timeout=timeout)
             return self.rospy.ServiceProxy(name, srv_type)
         except Exception as exc:
-            # self.rospy.logwarn("服务暂不可用 %s: %s", name, exc)
+            self.rospy.logwarn("%s服务暂不可用 %s: %s", LOG_PREFIX, name, exc)
             return None
 
     @staticmethod
@@ -663,11 +664,12 @@ class RobotControl:
         try:
             res = self.arm_mode_srv(req)
         except Exception as exc:
-            # self.rospy.logwarn("切换手臂控制模式失败: %s", exc)
+            self.rospy.logwarn("%s切换手臂控制模式失败: %s", LOG_PREFIX, exc)
             _log_failure(self.rospy, action)
             return False
         if not getattr(res, "result", False):
-            # self.rospy.logwarn("手臂控制模式未切换: %s", getattr(res, "message", ""))
+            self.rospy.logwarn(
+                "%s手臂控制模式未切换: %s", LOG_PREFIX, getattr(res, "message", ""))
             _log_failure(self.rospy, action)
             return False
         _log_success(self.rospy, action)
@@ -684,7 +686,7 @@ class RobotControl:
         action = "{}{}".format("关闭" if float(percent) >= 50.0 else "打开", side_name)
         _log_action(self.rospy, action)
         if self.claw_srv is None:
-            # self.rospy.logwarn("夹爪服务不可用，跳过夹爪命令")
+            self.rospy.logwarn("%s夹爪服务不可用，跳过夹爪命令", LOG_PREFIX)
             _log_failure(self.rospy, action)
             return False
         percent = max(0.0, min(100.0, float(percent)))
@@ -702,11 +704,12 @@ class RobotControl:
         try:
             res = self.claw_srv(req)
         except Exception as exc:
-            # self.rospy.logwarn("夹爪命令失败: %s", exc)
+            self.rospy.logwarn("%s夹爪命令失败: %s", LOG_PREFIX, exc)
             _log_failure(self.rospy, action)
             return False
         if not getattr(res, "success", False):
-            # self.rospy.logwarn("夹爪命令被拒绝: %s", getattr(res, "message", ""))
+            self.rospy.logwarn(
+                "%s夹爪命令被拒绝: %s", LOG_PREFIX, getattr(res, "message", ""))
             _log_failure(self.rospy, action)
             return False
         self.last_claw["left"] = left
@@ -718,7 +721,7 @@ class RobotControl:
         action = "发布手臂关节目标"
         _log_action(self.rospy, action)
         if len(arm_deg) != 14:
-            # self.rospy.logwarn("手臂目标长度错误: %d", len(arm_deg))
+            self.rospy.logwarn("%s手臂目标长度错误: %d", LOG_PREFIX, len(arm_deg))
             _log_failure(self.rospy, action)
             return False
         msg = self.kuavo_msgs.armTargetPoses()
@@ -742,15 +745,15 @@ class RobotControl:
         action = "移动{}末端".format(side_name)
         _log_action(self.rospy, action)
         if self.ik_srv is None:
-            # self.rospy.logwarn("IK服务不可用，无法移动末端")
+            self.rospy.logwarn("%sIK服务不可用，无法移动末端", LOG_PREFIX)
             _log_failure(self.rospy, action)
             return False
 
         safe_x, safe_y, safe_z, clamped = self._clamp_end_effector_target(side, x, y, z)
         if clamped:
             self.rospy.logwarn(
-                "%s目标超出保守工作空间，已从 [%.3f, %.3f, %.3f] 限制到 [%.3f, %.3f, %.3f]",
-                side_name, float(x), float(y), float(z), safe_x, safe_y, safe_z)
+                "%s%s目标超出保守工作空间，已从 [%.3f, %.3f, %.3f] 限制到 [%.3f, %.3f, %.3f]",
+                LOG_PREFIX, side_name, float(x), float(y), float(z), safe_x, safe_y, safe_z)
 
         req = self.kuavo_msgs.twoArmHandPoseCmd()
         req.frame = 2
@@ -775,19 +778,19 @@ class RobotControl:
         try:
             res = self.ik_srv(req)
         except Exception as exc:
-            self.rospy.logwarn("IK调用失败: %s", exc)
+            self.rospy.logwarn("%sIK调用失败: %s", LOG_PREFIX, exc)
             _log_failure(self.rospy, action)
             return False
         if not getattr(res, "success", False):
             reason = getattr(res, "error_reason", "")
             if reason:
-                self.rospy.logwarn("IK求解失败原因: %s", reason)
+                self.rospy.logwarn("%sIK求解失败原因: %s", LOG_PREFIX, reason)
             _log_failure(self.rospy, action)
             return False
 
         q_arm = list(getattr(res, "q_arm", []))
         if len(q_arm) != 14:
-            # self.rospy.logwarn("IK返回关节数异常: %d", len(q_arm))
+            self.rospy.logwarn("%sIK返回关节数异常: %d", LOG_PREFIX, len(q_arm))
             _log_failure(self.rospy, action)
             return False
         arm_deg = [math.degrees(value) for value in q_arm]
@@ -855,16 +858,16 @@ class TaskExecutor:
                 _log_action(self.rospy, refine_action)
                 refined = self.perception.refine_target(target, side)
                 if refined is not None:
-                    # self.rospy.loginfo("腕部相机复核成功: %s", refined.kind)
+                    self.rospy.loginfo("%s腕部相机复核成功: %s", LOG_PREFIX, refined.kind)
                     _log_success(self.rospy, refine_action)
                     attempt_target = refined
                 else:
-                    # self.rospy.loginfo("腕部复核不可用，使用头部相机估计")
+                    self.rospy.loginfo("%s腕部复核不可用，使用头部相机估计", LOG_PREFIX)
                     _log_failure(self.rospy, refine_action)
 
                 if self._run_pick_place_attempt(attempt_target, place, side):
                     return True
-                # self.rospy.logwarn("目标 %s 第 %d 次执行失败", target.kind, attempt)
+                self.rospy.logwarn("%s目标 %s 第 %d 次执行失败", LOG_PREFIX, target.kind, attempt)
                 side_name = "左手" if side == "left" else "右手"
                 _log_failure(self.rospy, "第{}次{}抓取放置".format(attempt, side_name))
                 self.control.open_claw(side)
@@ -881,7 +884,7 @@ class TaskExecutor:
         place_z = self._safe_z(place.z + 0.14)
         pre_place_z = self._safe_z(place_z + 0.12)
 
-        # self.rospy.loginfo("抓取 %s -> %s, side=%s", target.kind, place.kind, side)
+        self.rospy.loginfo("%s抓取 %s -> %s, side=%s", LOG_PREFIX, target.kind, place.kind, side)
         _log_action(self.rospy, action)
         if not self.control.open_claw(side):
             _log_failure(self.rospy, action)
@@ -902,7 +905,7 @@ class TaskExecutor:
             return False
         self.rospy.sleep(0.7)
         if not self._claw_has_feedback(side):
-            # self.rospy.logwarn("未确认夹爪到位，继续执行保守抬升")
+            self.rospy.logwarn("%s未确认夹爪到位，继续执行保守抬升", LOG_PREFIX)
             _log_failure(self.rospy, "确认夹爪到位")
 
         steps = [
@@ -962,8 +965,8 @@ class TaskExecutor:
             _log_success(self.rospy, action)
             return True
         self.rospy.logwarn(
-            "%s仍超出手臂前向工作空间: x=%.3f, limit=%.3f",
-            label, float(primary.x), x_max)
+            "%s%s仍超出手臂前向工作空间: x=%.3f, limit=%.3f",
+            LOG_PREFIX, label, float(primary.x), x_max)
         _log_failure(self.rospy, action)
         return False
 
@@ -1060,7 +1063,7 @@ class Scene1Task(BaseSceneTask):
         weighing_area = self._best(estimates, "weighing_area")
         parcels = self._all(estimates, "parcel", limit=4)
         if drop_box is None or not parcels:
-            # self.rospy.logerr("scene1 识别失败：缺少分拣箱或包裹")
+            self.rospy.logerr("%sscene1 识别失败：缺少分拣箱或包裹", LOG_PREFIX)
             _log_error(self.rospy, "识别scene1目标")
             return False
 
@@ -1099,7 +1102,7 @@ class Scene2Task(BaseSceneTask):
             "part_c": self._best(estimates, "bin_c"),
         }
         if any(target is None for target in bins.values()):
-            # self.rospy.logerr("scene2 识别失败：缺少一个或多个收纳盒")
+            self.rospy.logerr("%sscene2 识别失败：缺少一个或多个收纳盒", LOG_PREFIX)
             _log_error(self.rospy, "识别scene2收纳盒")
             return False
 
@@ -1107,7 +1110,7 @@ class Scene2Task(BaseSceneTask):
         for kind in ("part_a", "part_b", "part_c"):
             targets.extend(self._all(estimates, kind, limit=2))
         if not targets:
-            # self.rospy.logerr("scene2 识别失败：未找到零件")
+            self.rospy.logerr("%sscene2 识别失败：未找到零件", LOG_PREFIX)
             _log_error(self.rospy, "识别scene2零件")
             return False
 
@@ -1127,7 +1130,7 @@ class Scene3Task(BaseSceneTask):
         out_box = self._best(estimates, "out_box") or self._best(estimates, "drop_box")
         trays = self._all(estimates, "tray", limit=5)
         if out_box is None or not trays:
-            # self.rospy.logerr("scene3 识别失败：缺少出库箱或料盘")
+            self.rospy.logerr("%sscene3 识别失败：缺少出库箱或料盘", LOG_PREFIX)
             _log_error(self.rospy, "识别scene3目标")
             return False
 
@@ -1180,7 +1183,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
         import cv2
         import numpy as np
     except Exception as exc:
-        # rospy.logerr("缺少视觉依赖 OpenCV/NumPy，无法执行识别: %s", exc)
+        rospy.logerr("%s缺少视觉依赖 OpenCV/NumPy，无法执行识别: %s", LOG_PREFIX, exc)
         _log_error(rospy, "加载视觉依赖")
         return
 
@@ -1196,7 +1199,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
         changeArmCtrlModeRequest = kuavo_srv_types.changeArmCtrlModeRequest
         twoArmHandPoseCmdSrv = kuavo_srv_types.twoArmHandPoseCmdSrv
 
-    # rospy.loginfo("=== %s任务启动 ===", config["title"])
+    rospy.loginfo("%s=== %s任务启动 ===", LOG_PREFIX, config["title"])
     _log_action(rospy, config["title"])
 
     kuavo_types = KuavoTypes()
@@ -1210,10 +1213,10 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     if cache.wait_for_head_camera(timeout=8.0):
         _log_success(rospy, camera_action)
     else:
-        # rospy.logwarn("头部RGB-D尚未就绪，继续尝试任务流程")
+        rospy.logwarn("%s头部RGB-D尚未就绪，继续尝试任务流程", LOG_PREFIX)
         _log_failure(rospy, camera_action)
     control.prepare()
-    # rospy.loginfo("场景实例已初始化。")
+    rospy.loginfo("%s场景实例已初始化。", LOG_PREFIX)
     _log_success(rospy, "初始化场景实例")
 
     if scene == "scene1":
@@ -1225,10 +1228,10 @@ def run_scene(scene, seed, node_name=None, timeout=120,
 
     control.stop_base()
     if ok:
-        # rospy.loginfo("=== %s任务流程完成 ===", config["title"])
+        rospy.loginfo("%s=== %s任务流程完成 ===", LOG_PREFIX, config["title"])
         _log_success(rospy, config["title"])
     else:
-        # rospy.logwarn("=== %s任务流程未完成 ===", config["title"])
+        rospy.logwarn("%s=== %s任务流程未完成 ===", LOG_PREFIX, config["title"])
         _log_failure(rospy, config["title"])
 
 
