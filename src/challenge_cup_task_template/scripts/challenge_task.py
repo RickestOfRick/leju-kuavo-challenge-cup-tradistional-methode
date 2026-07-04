@@ -923,6 +923,24 @@ def _load_launcher():
     return ChallengeSimLauncher
 
 
+def _force_wall_time_after_roscore(launcher):
+    """Clear stale simulated-time params before rospy.init_node runs."""
+    original_wait = launcher._wait_for_roscore
+
+    def wrapped_wait(timeout):
+        original_wait(timeout)
+        try:
+            import xmlrpc.client
+            master_uri = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+            master = xmlrpc.client.ServerProxy(master_uri)
+            master.setParam("/challenge_task_template", "/use_sim_time", False)
+            print("[INFO] challenge_task: set /use_sim_time=false before init_node")
+        except Exception as exc:
+            print("[WARN] challenge_task: failed to set /use_sim_time=false: {}".format(exc))
+
+    launcher._wait_for_roscore = wrapped_wait
+
+
 def run_scene(scene, seed, node_name=None, timeout=120,
               time_limit=None, timer_gui=True):
     if scene not in SCENE_CONFIGS:
@@ -937,6 +955,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
         match_time_limit=time_limit,
         timer_gui=timer_gui,
     )
+    _force_wall_time_after_roscore(launcher)
     launcher.start(node_name=node_name or config["node_name"], timeout=timeout)
 
     import rospy
