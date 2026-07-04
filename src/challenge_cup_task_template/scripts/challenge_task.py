@@ -37,6 +37,23 @@ SCENE_CONFIGS = {
 ARM_JOINT_NAMES = ["arm_joint_{}".format(i) for i in range(1, 15)]
 BASE_FRAME = "base_link"
 LOG_PREFIX = "!!!!!"
+# RGB-D/TF 有时给出接近地面世界系的高度；IK 本地系里桌面高度通常接近 0。
+IK_WORLD_Z_THRESHOLD = 0.75
+IK_WORLD_TO_LOCAL_Z_OFFSET = -0.923783
+HAND_WORKSPACES = {
+    "left": {
+        "x": (0.18, 0.60),
+        "y": (0.04, 0.36),
+        "z": (-0.06, 0.60),
+        "park": (0.28, 0.24, 0.55),
+    },
+    "right": {
+        "x": (0.18, 0.60),
+        "y": (-0.36, -0.04),
+        "z": (-0.06, 0.60),
+        "park": (0.28, -0.24, 0.55),
+    },
+}
 
 
 def _log_action(rospy, action):
@@ -600,6 +617,22 @@ class RobotControl:
             # self.rospy.logwarn("服务暂不可用 %s: %s", name, exc)
             return None
 
+    @staticmethod
+    def _clamp(value, low, high):
+        return max(float(low), min(float(high), float(value)))
+
+    def _clamp_end_effector_target(self, side, x, y, z):
+        workspace = HAND_WORKSPACES[side]
+        safe_x = self._clamp(x, *workspace["x"])
+        safe_y = self._clamp(y, *workspace["y"])
+        safe_z = self._clamp(z, *workspace["z"])
+        changed = (
+            abs(safe_x - float(x)) > 1e-6
+            or abs(safe_y - float(y)) > 1e-6
+            or abs(safe_z - float(z)) > 1e-6
+        )
+        return safe_x, safe_y, safe_z, changed
+
     def prepare(self):
         action = "准备机器人"
         _log_action(self.rospy, action)
@@ -708,6 +741,12 @@ class RobotControl:
             _log_failure(self.rospy, action)
             return False
 
+        safe_x, safe_y, safe_z, clamped = self._clamp_end_effector_target(side, x, y, z)
+        if clamped:
+            self.rospy.logwarn(
+                "%s目标超出保守工作空间，已从 [%.3f, %.3f, %.3f] 限制到 [%.3f, %.3f, %.3f]",
+                side_name, float(x), float(y), float(z), safe_x, safe_y, safe_z)
+
         req = self.kuavo_msgs.twoArmHandPoseCmd()
         req.frame = 2
         req.use_custom_ik_param = True
@@ -716,21 +755,28 @@ class RobotControl:
 
         left_pose = req.hand_poses.left_pose
         right_pose = req.hand_poses.right_pose
-        self._fill_pose(left_pose, 0.28, 0.24, 0.92, yaw)
-        self._fill_pose(right_pose, 0.28, -0.24, 0.92, yaw)
+        q0_rad = [math.radians(value) for value in self.last_arm_deg]
+        self._fill_pose(left_pose, *HAND_WORKSPACES["left"]["park"],
+                        yaw=yaw, joint_angles=q0_rad[:7])
+        self._fill_pose(right_pose, *HAND_WORKSPACES["right"]["park"],
+                        yaw=yaw, joint_angles=q0_rad[7:14])
         if side == "left":
-            self._fill_pose(left_pose, x, y, z, yaw)
+            self._fill_pose(left_pose, safe_x, safe_y, safe_z, yaw,
+                            joint_angles=q0_rad[:7])
         else:
-            self._fill_pose(right_pose, x, y, z, yaw)
+            self._fill_pose(right_pose, safe_x, safe_y, safe_z, yaw,
+                            joint_angles=q0_rad[7:14])
 
         try:
             res = self.ik_srv(req)
         except Exception as exc:
-            # self.rospy.logwarn("IK调用失败: %s", exc)
+            self.rospy.logwarn("IK调用失败: %s", exc)
             _log_failure(self.rospy, action)
             return False
         if not getattr(res, "success", False):
-            # self.rospy.logwarn("IK求解失败: %s", getattr(res, "error_reason", ""))
+            reason = getattr(res, "error_reason", "")
+            if reason:
+                self.rospy.logwarn("IK求解失败原因: %s", reason)
             _log_failure(self.rospy, action)
             return False
 
@@ -758,11 +804,14 @@ class RobotControl:
         return params
 
     @staticmethod
-    def _fill_pose(pose, x, y, z, yaw):
+    def _fill_pose(pose, x, y, z, yaw, joint_angles=None):
         pose.pos_xyz = [float(x), float(y), float(z)]
         pose.quat_xyzw = [0.0, 1.0, 0.0, 0.0]
         pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
-        pose.joint_angles = [0.0] * 7
+        if joint_angles is None:
+            pose.joint_angles = [0.0] * 7
+        else:
+            pose.joint_angles = [float(value) for value in joint_angles]
 
     def stop_base(self):
         twist = self.geometry_msgs.Twist()
@@ -791,25 +840,29 @@ class TaskExecutor:
         self.cache = cache
 
     def execute_pick_place(self, target, place, max_attempts=2):
+        preferred_side = self._choose_side(target, place)
+        sides = [preferred_side, self._other_side(preferred_side)]
         for attempt in range(1, max_attempts + 1):
-            side = self._choose_side(target)
-            refine_action = "复核目标"
-            _log_action(self.rospy, refine_action)
-            refined = self.perception.refine_target(target, side)
-            if refined is not None:
-                # self.rospy.loginfo("腕部相机复核成功: %s", refined.kind)
-                _log_success(self.rospy, refine_action)
-                target = refined
-            else:
-                # self.rospy.loginfo("腕部复核不可用，使用头部相机估计")
-                _log_failure(self.rospy, refine_action)
+            for side in sides:
+                attempt_target = target
+                refine_action = "复核目标"
+                _log_action(self.rospy, refine_action)
+                refined = self.perception.refine_target(target, side)
+                if refined is not None:
+                    # self.rospy.loginfo("腕部相机复核成功: %s", refined.kind)
+                    _log_success(self.rospy, refine_action)
+                    attempt_target = refined
+                else:
+                    # self.rospy.loginfo("腕部复核不可用，使用头部相机估计")
+                    _log_failure(self.rospy, refine_action)
 
-            if self._run_pick_place_attempt(target, place, side):
-                return True
-            # self.rospy.logwarn("目标 %s 第 %d 次执行失败", target.kind, attempt)
-            _log_failure(self.rospy, "第{}次抓取放置".format(attempt))
-            self.control.open_claw(side)
-            self.control.publish_arm_degrees([0.0] * 14, duration=1.4)
+                if self._run_pick_place_attempt(attempt_target, place, side):
+                    return True
+                # self.rospy.logwarn("目标 %s 第 %d 次执行失败", target.kind, attempt)
+                side_name = "左手" if side == "left" else "右手"
+                _log_failure(self.rospy, "第{}次{}抓取放置".format(attempt, side_name))
+                self.control.open_claw(side)
+                self.control.publish_arm_degrees([0.0] * 14, duration=1.4)
         return False
 
     def _run_pick_place_attempt(self, target, place, side):
@@ -862,8 +915,39 @@ class TaskExecutor:
         _log_failure(self.rospy, action)
         return False
 
-    def _choose_side(self, target):
-        return "left" if target.y >= 0.05 else "right"
+    def _choose_side(self, target, place=None):
+        left_cost = self._workspace_cost("left", target, place)
+        right_cost = self._workspace_cost("right", target, place)
+        if left_cost < right_cost:
+            return "left"
+        if right_cost < left_cost:
+            return "right"
+        y_sum = float(target.y) + (float(place.y) if place is not None else 0.0)
+        return "left" if y_sum >= 0.0 else "right"
+
+    @staticmethod
+    def _other_side(side):
+        return "right" if side == "left" else "left"
+
+    @staticmethod
+    def _workspace_cost(side, *estimates):
+        workspace = HAND_WORKSPACES[side]
+        cost = 0.0
+        for estimate in estimates:
+            if estimate is None:
+                continue
+            for axis, value in (
+                ("x", estimate.x),
+                ("y", estimate.y),
+                ("z", TaskExecutor._safe_z(estimate.z)),
+            ):
+                low, high = workspace[axis]
+                value = float(value)
+                if value < low:
+                    cost += (low - value) ** 2
+                elif value > high:
+                    cost += (value - high) ** 2
+        return cost
 
     def _claw_has_feedback(self, side):
         state_msg = self.cache.get_claw_state()
@@ -876,7 +960,11 @@ class TaskExecutor:
 
     @staticmethod
     def _safe_z(z):
-        return max(0.52, min(1.45, float(z)))
+        z = float(z)
+        if z > IK_WORLD_Z_THRESHOLD:
+            z += IK_WORLD_TO_LOCAL_Z_OFFSET
+        z_min, z_max = HAND_WORKSPACES["left"]["z"]
+        return max(z_min, min(z_max, z))
 
 
 class BaseSceneTask:
