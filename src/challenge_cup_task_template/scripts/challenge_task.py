@@ -57,9 +57,27 @@ SAFE_LIFT_DZ_M = 0.18
 SAFE_PLACE_DZ_M = 0.12
 SAFE_MIN_Z_BASE_M = -0.14
 SAFE_MAX_Z_BASE_M = 0.85
+SCENE_SAFE_MAX_Z_BASE_M = {
+    "scene3": 1.30,
+}
 REACH_X_MIN_M = 0.12
 REACH_X_MAX_M = 0.88
 TARGET_WAIT_SEC = 8.0
+
+TARGET_BOUNDS_BASE = {
+    "default": {
+        "x_min": -0.20,
+        "x_max": 1.10,
+        "z_min": -0.25,
+        "z_max": 0.90,
+    },
+    "scene3": {
+        "x_min": -0.20,
+        "x_max": 1.20,
+        "z_min": -0.25,
+        "z_max": 1.35,
+    },
+}
 
 CAMERA_SPECS = {
     "head": {
@@ -619,10 +637,11 @@ class RobotBase:
     def move_hand_ik(self, arm: str, target_xyz_base: Sequence[float],
                      yaw_rad: float = 0.0, duration: float = 1.2,
                      label: str = "ik") -> bool:
+        z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
         target = [
             clamp(float(target_xyz_base[0]), -0.05, REACH_X_MAX_M),
             float(target_xyz_base[1]),
-            clamp(float(target_xyz_base[2]), SAFE_MIN_Z_BASE_M, SAFE_MAX_Z_BASE_M),
+            clamp(float(target_xyz_base[2]), SAFE_MIN_Z_BASE_M, z_max),
         ]
         quat = quat_down(yaw_rad if arm == "left" else yaw_rad + math.pi)
         try:
@@ -709,12 +728,14 @@ class RuleBasedPerception:
         while not self.rospy.is_shutdown() and time.time() - start < timeout_sec:
             ready = []
             for name, state in self.cameras.items():
-                if state["color_msg"] is not None and state["info_msg"] is not None:
+                if (state["color_msg"] is not None
+                        and state["depth_msg"] is not None
+                        and state["info_msg"] is not None):
                     ready.append(name)
             if ready:
                 log_stage(self.scene, "等待传感器", "可用相机=%s", ",".join(ready))
                 return True
-            self.rospy.loginfo_throttle(1.0, "[%s][等待传感器] 等待相机图像与 CameraInfo", self.scene)
+            self.rospy.loginfo_throttle(1.0, "[%s][等待传感器] 等待相机图像、深度与 CameraInfo", self.scene)
             rate.sleep()
         log_warn(self.scene, "等待传感器", "相机数据超时")
         return False
@@ -778,6 +799,14 @@ class RuleBasedPerception:
             if color is None:
                 continue
             depth = self._decode_depth(state.get("depth_msg"))
+            if depth is None:
+                self.rospy.loginfo_throttle(
+                    1.0,
+                    "[%s][%s] %s 深度图未就绪或解码失败，候选将缺少 base_link 坐标",
+                    self.scene,
+                    purpose,
+                    camera,
+                )
             targets.extend(self._detect_in_image(camera, color_msg, info_msg, color, depth, rules, purpose))
 
         targets = self._dedupe_targets(targets)
@@ -1197,10 +1226,11 @@ class Skills:
         )
 
     def _reachable_xyz(self, xyz: Sequence[float]) -> Tuple[float, float, float]:
+        z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
         return (
             clamp(float(xyz[0]), -0.05, REACH_X_MAX_M),
             float(xyz[1]),
-            clamp(float(xyz[2]), SAFE_MIN_Z_BASE_M, SAFE_MAX_Z_BASE_M),
+            clamp(float(xyz[2]), SAFE_MIN_Z_BASE_M, z_max),
         )
 
     def _close_percent(self, class_name: str) -> float:
@@ -1234,8 +1264,19 @@ class BaseSceneController:
 
     def detect_targets(self, class_names: Optional[Sequence[str]] = None,
                        max_targets: Optional[int] = None) -> List[PerceptionTarget]:
-        targets = self.perception.detect_targets(class_names=class_names, max_targets=max_targets)
-        targets = [target for target in targets if self._target_is_usable(target)]
+        raw_targets = self.perception.detect_targets(class_names=class_names, max_targets=None)
+        targets: List[PerceptionTarget] = []
+        rejected: List[Tuple[PerceptionTarget, str]] = []
+        for target in raw_targets:
+            reason = self._target_reject_reason(target)
+            if reason is None:
+                targets.append(target)
+            else:
+                rejected.append((target, reason))
+
+        self._log_rejected_targets(rejected)
+        if max_targets is not None:
+            targets = targets[:int(max_targets)]
         log_target_list(self.scene, "检测", targets)
         return targets
 
@@ -1270,14 +1311,46 @@ class BaseSceneController:
         )
 
     def _target_is_usable(self, target: PerceptionTarget) -> bool:
+        return self._target_reject_reason(target) is None
+
+    def _target_reject_reason(self, target: PerceptionTarget) -> Optional[str]:
         if target.position_base is None:
-            return False
+            depth = None
+            frame = None
+            if target.debug:
+                depth = target.debug.get("depth_m")
+                frame = target.debug.get("frame_id")
+            return "no base_link position depth={} frame={}".format(depth, frame)
         x, _y, z = target.position_base
-        if not (-0.20 <= x <= 1.10):
-            return False
-        if not (-0.25 <= z <= 0.90):
-            return False
-        return True
+        bounds = TARGET_BOUNDS_BASE.get(self.scene, TARGET_BOUNDS_BASE["default"])
+        if not (bounds["x_min"] <= x <= bounds["x_max"]):
+            return "x out of range {:.3f} not in [{:.2f},{:.2f}]".format(
+                float(x),
+                bounds["x_min"],
+                bounds["x_max"],
+            )
+        if not (bounds["z_min"] <= z <= bounds["z_max"]):
+            return "z out of range {:.3f} not in [{:.2f},{:.2f}]".format(
+                float(z),
+                bounds["z_min"],
+                bounds["z_max"],
+            )
+        return None
+
+    def _log_rejected_targets(self, rejected: Sequence[Tuple[PerceptionTarget, str]]) -> None:
+        for target, reason in list(rejected)[:4]:
+            log_warn(
+                self.scene,
+                "检测过滤",
+                "丢弃 class=%s cam=%s uv=%s base=%s reason=%s",
+                target.class_name,
+                target.camera,
+                target.center_uv,
+                _fmt_xyz(target.position_base),
+                reason,
+            )
+        if len(rejected) > 4:
+            log_warn(self.scene, "检测过滤", "另有 %d 个候选被过滤", len(rejected) - 4)
 
 
 class Scene1Controller(BaseSceneController):
@@ -1366,7 +1439,8 @@ class Scene2Controller(BaseSceneController):
 class Scene3Controller(BaseSceneController):
     def run(self) -> ActionResult:
         start = time.time()
-        self.wait_for_perception()
+        if not self.wait_for_perception():
+            return ActionResult(False, "scene3", "sensor not ready", duration_sec=time.time() - start)
         outbound_xyz = self.resolve_place("outbound_box")
 
         moved_to_rack = False
@@ -1378,13 +1452,21 @@ class Scene3Controller(BaseSceneController):
                 moved_to_rack = True
                 self.robot.rospy.sleep(0.5)
 
-            targets = self.detect_targets(class_names=["smt_tray"], max_targets=1)
+            targets = self.detect_targets(class_names=["smt_tray"], max_targets=None)
             if not targets:
                 log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
                 break
+            targets.sort(key=self._tray_sort_key)
             tray = targets[0]
             arm = self.skills.choose_arm(tray)
-            log_stage(self.scene, "流程", "料盘 #%02d 出库，arm=%s", index, arm)
+            log_stage(
+                self.scene,
+                "流程",
+                "料盘 #%02d 出库，arm=%s base=%s",
+                index,
+                arm,
+                _fmt_xyz(tray.position_base),
+            )
             pick_result = self.skills.pick(tray, arm=arm)
             if not pick_result.ok:
                 log_warn(self.scene, "失败", "料盘 #%02d 抓取失败: %s", index, pick_result.reason)
@@ -1399,6 +1481,11 @@ class Scene3Controller(BaseSceneController):
             return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
+
+    def _tray_sort_key(self, target: PerceptionTarget) -> Tuple[int, float, float, float]:
+        xyz = target.position_base or (99.0, 99.0, 99.0)
+        shelf_priority = 0 if float(xyz[2]) < 0.95 else 1
+        return (shelf_priority, abs(float(xyz[1])), float(xyz[0]), -float(target.confidence))
 
 
 # ---------------------------------------------------------------------------
