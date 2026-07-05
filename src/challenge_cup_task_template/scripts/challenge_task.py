@@ -59,6 +59,8 @@ BASE_APPROACH_MAX_DISTANCE = 0.85
 BASE_APPROACH_MIN_DISTANCE = 0.04
 BASE_APPROACH_SPEED = 0.16
 BASE_APPROACH_SETTLE = 0.25
+HEAD_LOOK_TARGET = [0.0, 20.0]
+HEAD_SETTLE_TIME = 0.8
 
 
 def _log_action(rospy, action):
@@ -170,6 +172,15 @@ class SensorCache:
         with self._lock:
             return self.claw_state
 
+    def wait_for_sensor_data(self, timeout=8.0):
+        deadline = time.time() + timeout
+        while not self.rospy.is_shutdown() and time.time() < deadline:
+            with self._lock:
+                if self.sensor_data is not None:
+                    return True
+            self.rospy.sleep(0.05)
+        return False
+
     def wait_for_head_camera(self, timeout=8.0):
         deadline = time.time() + timeout
         while not self.rospy.is_shutdown() and time.time() < deadline:
@@ -224,7 +235,7 @@ class Perception:
         self.cv2 = cv2
         self.np = np
 
-    def scan_scene(self, scene, passes=3):
+    def scan_scene(self, scene, passes=6):
         action = "识别{}".format(SCENE_CONFIGS.get(scene, {}).get("title", "场景"))
         _log_action(self.rospy, action)
         estimates = []
@@ -282,7 +293,7 @@ class Perception:
         estimates = []
         green = self._detect_colored_regions(
             hsv, depth_m, info, frame_id, "green_region", "green",
-            [((38, 65, 85), (95, 255, 255))], min_area=600, max_area=180000)
+            [((32, 35, 45), (105, 255, 255))], min_area=350, max_area=220000)
         estimates.extend(self._classify_green_regions(green, include_bins=True))
         estimates.extend(self._detect_parcels(bgr, hsv, depth_m, info, frame_id))
         return estimates
@@ -359,17 +370,18 @@ class Perception:
 
     def _detect_parcels(self, bgr, hsv, depth_m, info, frame_id):
         ranges = [
-            ((6, 35, 55), (35, 255, 255)),
-            ((85, 25, 70), (130, 190, 255)),
+            ((0, 18, 40), (42, 255, 255)),
+            ((75, 8, 45), (140, 230, 255)),
+            ((0, 0, 70), (45, 95, 230)),
         ]
         found = self._detect_colored_regions(
             hsv, depth_m, info, frame_id, "parcel", "parcel",
-            ranges, min_area=180, max_area=26000)
+            ranges, min_area=90, max_area=42000)
         parcels = []
         for est in found:
             long_side = max(est.size[0], est.size[1])
             short_side = min(est.size[0], est.size[1])
-            if 0.015 <= short_side <= 0.16 and 0.03 <= long_side <= 0.24:
+            if 0.010 <= short_side <= 0.20 and 0.025 <= long_side <= 0.30:
                 est.confidence = min(0.95, est.confidence + 0.08)
                 parcels.append(est)
         return parcels
@@ -466,6 +478,8 @@ class Perception:
             return None
 
         point_camera = self._pixel_to_camera(u, v, depth, info)
+        if point_camera is None:
+            return None
         point_base = self.cache.transform_point(point_camera, frame_id, BASE_FRAME)
         if point_base is None:
             point_base = point_camera
@@ -609,6 +623,7 @@ class RobotControl:
         self.cmd_vel_pub = rospy.Publisher("/cmd_vel", geometry_msgs.Twist, queue_size=10)
         self.arm_traj_pub = rospy.Publisher("/kuavo_arm_traj", sensor_msgs.JointState, queue_size=10)
         self.arm_target_pub = rospy.Publisher("/kuavo_arm_target_poses", kuavo_msgs.armTargetPoses, queue_size=10)
+        self.head_pub = rospy.Publisher("/robot_head_motion_data", kuavo_msgs.robotHeadMotionData, queue_size=10)
         self.claw_srv = self._connect_service("/control_robot_leju_claw", kuavo_msgs.controlLejuClaw, 5.0)
         self.arm_mode_srv = self._connect_service("/arm_traj_change_mode", kuavo_msgs.changeArmCtrlMode, 3.0)
         self.ik_srv = self._connect_service("/ik/two_arm_hand_pose_cmd_srv", kuavo_msgs.twoArmHandPoseCmdSrv, 6.0)
@@ -642,11 +657,12 @@ class RobotControl:
     def prepare(self):
         action = "准备机器人"
         _log_action(self.rospy, action)
+        head_ok = self.set_head_target(HEAD_LOOK_TARGET, settle=HEAD_SETTLE_TIME)
         mode_ok = self.set_arm_control_mode(2)
         left_ok = self.open_claw("left")
         right_ok = self.open_claw("right")
         arm_ok = self.publish_arm_degrees([0.0] * 14, duration=2.0)
-        ok = mode_ok and left_ok and right_ok and arm_ok
+        ok = head_ok and mode_ok and left_ok and right_ok and arm_ok
         if ok:
             _log_success(self.rospy, action)
         else:
@@ -668,10 +684,29 @@ class RobotControl:
             _log_failure(self.rospy, action)
             return False
         if not getattr(res, "result", False):
-            self.rospy.logwarn(
-                "%s手臂控制模式未切换: %s", LOG_PREFIX, getattr(res, "message", ""))
-            _log_failure(self.rospy, action)
-            return False
+            actual_mode = getattr(res, "mode", None)
+            if actual_mode != int(mode):
+                self.rospy.logwarn(
+                    "%s手臂控制模式未切换: mode=%s message=%s",
+                    LOG_PREFIX, actual_mode, getattr(res, "message", ""))
+                _log_failure(self.rospy, action)
+                return False
+        _log_success(self.rospy, action)
+        return True
+
+    def set_head_target(self, joint_data, settle=0.0):
+        action = "调整头部视角"
+        _log_action(self.rospy, action)
+        msg = self.kuavo_msgs.robotHeadMotionData()
+        msg.joint_data = [float(value) for value in joint_data]
+        for _ in range(5):
+            if self.rospy.is_shutdown():
+                _log_failure(self.rospy, action)
+                return False
+            self.head_pub.publish(msg)
+            self.rospy.sleep(0.1)
+        if settle > 0.0:
+            self.rospy.sleep(float(settle))
         _log_success(self.rospy, action)
         return True
 
@@ -1047,12 +1082,12 @@ class BaseSceneTask:
         candidates.sort(key=lambda est: (-est.confidence, abs(est.y), est.x))
         return candidates if limit is None else candidates[:limit]
 
-    def _rescan(self, scene, retries=3):
+    def _rescan(self, scene, retries=8):
         for _ in range(retries):
             estimates = self.perception.scan_scene(scene)
             if estimates:
                 return estimates
-            self.rospy.sleep(0.5)
+            self.rospy.sleep(1.0)
         return []
 
 
@@ -1190,6 +1225,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     class KuavoTypes:
         sensorsData = kuavo_msg_types.sensorsData
         lejuClawState = kuavo_msg_types.lejuClawState
+        robotHeadMotionData = kuavo_msg_types.robotHeadMotionData
         armTargetPoses = kuavo_msg_types.armTargetPoses
         ikSolveParam = kuavo_msg_types.ikSolveParam
         twoArmHandPoseCmd = kuavo_msg_types.twoArmHandPoseCmd
@@ -1216,6 +1252,14 @@ def run_scene(scene, seed, node_name=None, timeout=120,
         rospy.logwarn("%s头部RGB-D尚未就绪，继续尝试任务流程", LOG_PREFIX)
         _log_failure(rospy, camera_action)
     control.prepare()
+    sensor_action = "等待传感器数据稳定"
+    _log_action(rospy, sensor_action)
+    if cache.wait_for_sensor_data(timeout=8.0):
+        rospy.sleep(1.0)
+        _log_success(rospy, sensor_action)
+    else:
+        rospy.logwarn("%s未等到 /sensors_data_raw 更新，继续尝试任务流程", LOG_PREFIX)
+        _log_failure(rospy, sensor_action)
     rospy.loginfo("%s场景实例已初始化。", LOG_PREFIX)
     _log_success(rospy, "初始化场景实例")
 
