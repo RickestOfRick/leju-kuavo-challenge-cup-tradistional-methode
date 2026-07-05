@@ -103,6 +103,41 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --s
 | `--yolo-conf` | `0.45` | YOLO 检测置信度阈值。 |
 | `--yolo-imgsz` | `640` | YOLO 推理输入尺寸。 |
 
+## 场景二分拣实现
+
+场景二现在按“识别-定位-抓取-归档”链路执行：优先使用头部相机 YOLOv8 segmentation 识别三类零件；若没有权重或 `ultralytics` 不可用，会自动回退到 HSV 规则检测。两种路径都只使用 RGB-D、CameraInfo 和 TF 计算 `base_link` 下的三维位置，不读取仿真真值。
+
+类别映射：
+
+| 识别类别 | 兼容别名 | 目标箱 |
+| --- | --- | --- |
+| `part_type_a` | `pipe_fitting`, `steel_pipe_fasteners` | `sorting_bin_a` 蓝色箱 |
+| `part_type_b` | `pipe_clamp`, `t_junction` | `sorting_bin_b` 橙色箱 |
+| `part_type_c` | `screwdriver` | `sorting_bin_c` 紫色箱 |
+
+推荐权重路径：
+
+```text
+src/challenge_cup_task_template/models/yolo/best.pt
+```
+
+程序也会自动查找：
+
+```text
+models/yolo/best.pt
+models/yolo/yolov8n_seg_scene2_demo.pt
+src/challenge_cup_task_template/models/yolo/yolov8n_seg_scene2_demo.pt
+runs/**/weights/best.pt
+```
+
+运行示例：
+
+```bash
+rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3
+```
+
+执行前会尝试连续检测 6 个零件，并要求连续帧位置变化小于 3cm；如果视觉完全失败，才启用公开几何兜底点，便于调试 IK 和夹爪流程。
+
 ## 比赛计时
 
 默认不限制时长，只显示计时，便于调试。
