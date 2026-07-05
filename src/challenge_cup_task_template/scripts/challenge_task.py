@@ -61,6 +61,10 @@ BASE_APPROACH_SPEED = 0.16
 BASE_APPROACH_SETTLE = 0.25
 HEAD_LOOK_TARGET = [0.0, 20.0]
 HEAD_SETTLE_TIME = 0.8
+IK_MODE_POS_HARD_ORI_SOFT = 0x02
+TRANSIT_CLEARANCE_Z = 0.34
+OBJECT_CLEARANCE_MARGIN = 0.18
+OBSTACLE_XY_RADIUS = 0.16
 
 
 def _log_action(rospy, action):
@@ -627,6 +631,7 @@ class RobotControl:
         self.claw_srv = self._connect_service("/control_robot_leju_claw", kuavo_msgs.controlLejuClaw, 5.0)
         self.arm_mode_srv = self._connect_service("/arm_traj_change_mode", kuavo_msgs.changeArmCtrlMode, 3.0)
         self.ik_srv = self._connect_service("/ik/two_arm_hand_pose_cmd_srv", kuavo_msgs.twoArmHandPoseCmdSrv, 6.0)
+        self.fk_srv = self._connect_service("/ik/fk_srv", kuavo_msgs.fkSrv, 3.0)
         self.last_claw = {"left": 5.0, "right": 5.0}
         self.last_arm_deg = [0.0] * 14
 
@@ -785,6 +790,10 @@ class RobotControl:
             return False
 
         safe_x, safe_y, safe_z, clamped = self._clamp_end_effector_target(side, x, y, z)
+        self.rospy.loginfo(
+            "%s%s IK目标 raw=[%.3f, %.3f, %.3f] safe=[%.3f, %.3f, %.3f] yaw=%.3f",
+            LOG_PREFIX, side_name, float(x), float(y), float(z),
+            safe_x, safe_y, safe_z, float(yaw))
         if clamped:
             self.rospy.logwarn(
                 "%s%s目标超出保守工作空间，已从 [%.3f, %.3f, %.3f] 限制到 [%.3f, %.3f, %.3f]",
@@ -799,10 +808,15 @@ class RobotControl:
         left_pose = req.hand_poses.left_pose
         right_pose = req.hand_poses.right_pose
         q0_rad = [math.radians(value) for value in self.last_arm_deg]
-        self._fill_pose(left_pose, *HAND_WORKSPACES["left"]["park"],
-                        yaw=yaw, joint_angles=q0_rad[:7])
-        self._fill_pose(right_pose, *HAND_WORKSPACES["right"]["park"],
-                        yaw=yaw, joint_angles=q0_rad[7:14])
+        fk_poses = self._current_fk_poses(q0_rad)
+        if fk_poses is not None:
+            self._copy_pose(left_pose, fk_poses.left_pose, q0_rad[:7])
+            self._copy_pose(right_pose, fk_poses.right_pose, q0_rad[7:14])
+        else:
+            self._fill_pose(left_pose, *HAND_WORKSPACES["left"]["park"],
+                            yaw=yaw, joint_angles=q0_rad[:7])
+            self._fill_pose(right_pose, *HAND_WORKSPACES["right"]["park"],
+                            yaw=yaw, joint_angles=q0_rad[7:14])
         if side == "left":
             self._fill_pose(left_pose, safe_x, safe_y, safe_z, yaw,
                             joint_angles=q0_rad[:7])
@@ -835,15 +849,31 @@ class RobotControl:
         _log_failure(self.rospy, action)
         return False
 
+    def _current_fk_poses(self, q0_rad):
+        if self.fk_srv is None:
+            return None
+        try:
+            res = self.fk_srv(list(q0_rad))
+        except Exception as exc:
+            self.rospy.logwarn_throttle(
+                2.0, "%sFK调用失败，使用默认双手停放位姿: %s", LOG_PREFIX, exc)
+            return None
+        if not getattr(res, "success", False):
+            self.rospy.logwarn_throttle(
+                2.0, "%sFK求解失败，使用默认双手停放位姿", LOG_PREFIX)
+            return None
+        return res.hand_poses
+
     def _default_ik_param(self):
         params = self.kuavo_msgs.ikSolveParam()
         params.major_optimality_tol = 1e-3
         params.major_feasibility_tol = 1e-3
         params.minor_feasibility_tol = 1e-3
-        params.major_iterations_limit = 120
-        params.oritation_constraint_tol = 2e-3
-        params.pos_constraint_tol = 2e-3
+        params.major_iterations_limit = 500
+        params.oritation_constraint_tol = 1e-3
+        params.pos_constraint_tol = 1e-3
         params.pos_cost_weight = 0.0
+        params.constraint_mode = IK_MODE_POS_HARD_ORI_SOFT
         return params
 
     @staticmethod
@@ -855,6 +885,13 @@ class RobotControl:
             pose.joint_angles = [0.0] * 7
         else:
             pose.joint_angles = [float(value) for value in joint_angles]
+
+    @staticmethod
+    def _copy_pose(dst, src, joint_angles):
+        dst.pos_xyz = [float(value) for value in src.pos_xyz]
+        dst.quat_xyzw = [float(value) for value in src.quat_xyzw]
+        dst.elbow_pos_xyz = [float(value) for value in src.elbow_pos_xyz]
+        dst.joint_angles = [float(value) for value in joint_angles]
 
     def stop_base(self):
         twist = self.geometry_msgs.Twist()
@@ -882,6 +919,15 @@ class TaskExecutor:
         self.control = control
         self.cache = cache
         self.base_forward_offset = 0.0
+        self.scene_estimates = []
+
+    def set_scene_estimates(self, estimates):
+        self.scene_estimates = [replace(est) for est in estimates]
+        for est in self.scene_estimates:
+            self.rospy.loginfo(
+                "%s场景实物位置: %s/%s pos=(%.3f, %.3f, %.3f) size=(%.3f, %.3f, %.3f)",
+                LOG_PREFIX, est.kind, est.label, est.x, est.y, est.z,
+                est.size[0], est.size[1], est.size[2])
 
     def execute_pick_place(self, target, place, max_attempts=2):
         preferred_side = self._choose_side(target, place)
@@ -914,12 +960,15 @@ class TaskExecutor:
         place = self._estimate_in_current_base(place)
         action = "抓取{}并放置到{}".format(target.kind, place.kind)
         grasp_z = self._safe_z(target.z + 0.035)
-        pre_z = self._safe_z(grasp_z + 0.16)
-        lift_z = self._safe_z(grasp_z + 0.24)
+        pre_z = self._safe_z(max(grasp_z + 0.18, self._clearance_z_near(target, [target])))
+        lift_z = self._safe_z(max(grasp_z + 0.26, self._clearance_z_near(target, [target])))
         place_z = self._safe_z(place.z + 0.14)
-        pre_place_z = self._safe_z(place_z + 0.12)
+        pre_place_z = self._safe_z(max(place_z + 0.14, self._clearance_z_near(place, [place])))
 
-        self.rospy.loginfo("%s抓取 %s -> %s, side=%s", LOG_PREFIX, target.kind, place.kind, side)
+        self.rospy.loginfo(
+            "%s抓取 %s -> %s, side=%s target=(%.3f, %.3f, %.3f) place=(%.3f, %.3f, %.3f)",
+            LOG_PREFIX, target.kind, place.kind, side,
+            target.x, target.y, target.z, place.x, place.y, place.z)
         _log_action(self.rospy, action)
         if not self.control.open_claw(side):
             _log_failure(self.rospy, action)
@@ -928,6 +977,7 @@ class TaskExecutor:
             _log_failure(self.rospy, action)
             return False
         steps = [
+            self._side_transit_pose(side, target, pre_z, 1.6),
             (target.x, target.y, pre_z, target.yaw, 2.2),
             (target.x, target.y, grasp_z, target.yaw, 1.4),
         ]
@@ -943,9 +993,10 @@ class TaskExecutor:
             self.rospy.logwarn("%s未确认夹爪到位，继续执行保守抬升", LOG_PREFIX)
             _log_failure(self.rospy, "确认夹爪到位")
 
-        steps = [
-            (target.x, target.y, lift_z, target.yaw, 1.4),
-        ]
+        steps = self._avoidance_path(
+            side, (target.x, target.y, grasp_z, target.yaw),
+            (place.x, place.y, pre_place_z, place.yaw),
+            lift_z)
         for x, y, z, yaw, duration in steps:
             if not self.control.move_end_effector(side, x, y, z, yaw, duration):
                 _log_failure(self.rospy, action)
@@ -1005,12 +1056,75 @@ class TaskExecutor:
         _log_failure(self.rospy, action)
         return False
 
+    def _side_transit_pose(self, side, estimate, min_z, duration):
+        workspace = HAND_WORKSPACES[side]
+        side_y = workspace["park"][1]
+        x = max(workspace["x"][0], min(workspace["x"][1] - 0.04, float(estimate.x)))
+        z = self._safe_z(max(float(min_z), TRANSIT_CLEARANCE_Z))
+        return (x, side_y, z, estimate.yaw, duration)
+
+    def _avoidance_path(self, side, start, end, min_z):
+        sx, sy, sz, syaw = start
+        ex, ey, ez, eyaw = end
+        clearance_z = self._safe_z(max(min_z, TRANSIT_CLEARANCE_Z))
+        blockers = self._blocking_obstacles((sx, sy), (ex, ey))
+        if blockers:
+            max_obstacle_z = max(self._safe_z(ob.z + OBJECT_CLEARANCE_MARGIN) for ob in blockers)
+            clearance_z = self._safe_z(max(clearance_z, max_obstacle_z))
+            names = ", ".join("{}@({:.2f},{:.2f})".format(ob.kind, ob.x, ob.y) for ob in blockers[:4])
+            self.rospy.loginfo("%s避障路径: 绕开 %s, 高度 %.3f", LOG_PREFIX, names, clearance_z)
+        return [
+            (sx, sy, clearance_z, syaw, 1.2),
+            self._side_transit_pose(side, ObjectEstimate("mid", "transit", 0.0, ex, ey, ez, eyaw), clearance_z, 1.4),
+            (ex, ey, clearance_z, eyaw, 1.6),
+            (ex, ey, ez, eyaw, 1.2),
+        ]
+
+    def _blocking_obstacles(self, start_xy, end_xy):
+        blockers = []
+        for raw_obstacle in self.scene_estimates:
+            obstacle = self._estimate_in_current_base(raw_obstacle)
+            if obstacle.kind in ("weighing_area",):
+                continue
+            if self._distance_point_to_segment((obstacle.x, obstacle.y), start_xy, end_xy) <= OBSTACLE_XY_RADIUS:
+                blockers.append(obstacle)
+        return blockers
+
+    def _clearance_z_near(self, primary, ignored):
+        clearance = TRANSIT_CLEARANCE_Z
+        for raw_obstacle in self.scene_estimates:
+            obstacle = self._estimate_in_current_base(raw_obstacle)
+            if any(obstacle.distance_xy(item) < 0.05 for item in ignored):
+                continue
+            if primary.distance_xy(obstacle) <= OBSTACLE_XY_RADIUS:
+                clearance = max(clearance, self._safe_z(obstacle.z + OBJECT_CLEARANCE_MARGIN))
+        return clearance
+
+    @staticmethod
+    def _distance_point_to_segment(point, start, end):
+        px, py = point
+        sx, sy = start
+        ex, ey = end
+        dx = ex - sx
+        dy = ey - sy
+        denom = dx * dx + dy * dy
+        if denom <= 1e-9:
+            return math.hypot(px - sx, py - sy)
+        t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / denom))
+        cx = sx + t * dx
+        cy = sy + t * dy
+        return math.hypot(px - cx, py - cy)
+
     def _estimate_in_current_base(self, estimate):
         adjusted = replace(estimate)
         adjusted.x = float(adjusted.x) - self.base_forward_offset
         return adjusted
 
     def _choose_side(self, target, place=None):
+        if float(target.y) >= 0.03:
+            return "left"
+        if float(target.y) <= -0.03:
+            return "right"
         left_cost = self._workspace_cost("left", target, place)
         right_cost = self._workspace_cost("right", target, place)
         if left_cost < right_cost:
@@ -1094,6 +1208,7 @@ class BaseSceneTask:
 class Scene1Task(BaseSceneTask):
     def run(self):
         estimates = self._rescan("scene1")
+        self.executor.set_scene_estimates(estimates)
         drop_box = self._best(estimates, "drop_box")
         weighing_area = self._best(estimates, "weighing_area")
         parcels = self._all(estimates, "parcel", limit=4)
@@ -1131,6 +1246,7 @@ class Scene1Task(BaseSceneTask):
 class Scene2Task(BaseSceneTask):
     def run(self):
         estimates = self._rescan("scene2")
+        self.executor.set_scene_estimates(estimates)
         bins = {
             "part_a": self._best(estimates, "bin_a"),
             "part_b": self._best(estimates, "bin_b"),
@@ -1162,6 +1278,7 @@ class Scene2Task(BaseSceneTask):
 class Scene3Task(BaseSceneTask):
     def run(self):
         estimates = self._rescan("scene3")
+        self.executor.set_scene_estimates(estimates)
         out_box = self._best(estimates, "out_box") or self._best(estimates, "drop_box")
         trays = self._all(estimates, "tray", limit=5)
         if out_box is None or not trays:
@@ -1234,6 +1351,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
         changeArmCtrlMode = kuavo_srv_types.changeArmCtrlMode
         changeArmCtrlModeRequest = kuavo_srv_types.changeArmCtrlModeRequest
         twoArmHandPoseCmdSrv = kuavo_srv_types.twoArmHandPoseCmdSrv
+        fkSrv = kuavo_srv_types.fkSrv
 
     rospy.loginfo("%s=== %s任务启动 ===", LOG_PREFIX, config["title"])
     _log_action(rospy, config["title"])
