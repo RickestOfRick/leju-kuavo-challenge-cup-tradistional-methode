@@ -23,6 +23,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # ---------------------------------------------------------------------------
 
 BASE_FRAME = "base_link"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_SCENE1_YOLO_MODEL = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "models", "scene1_parcel.pt")
+)
+SCENE1_YOLO_CLASS_NAME = "parcel"
+SCENE1_YOLO_TARGET_BIN = "drop_box"
+SCENE1_YOLO_DEFAULT_CONF = 0.45
+SCENE1_YOLO_DEFAULT_IMGSZ = 640
+SCENE1_YOLO_CENTER_DEPTH_FRACTION = 0.45
 
 ARM_JOINT_NAMES = [
     "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
@@ -1108,6 +1117,333 @@ class RuleBasedPerception:
         return kept
 
 
+class YoloScene1Perception(RuleBasedPerception):
+    def __init__(self, scene: str, base_frame: str = BASE_FRAME,
+                 model_path: str = DEFAULT_SCENE1_YOLO_MODEL,
+                 device: str = "auto",
+                 conf: float = SCENE1_YOLO_DEFAULT_CONF,
+                 imgsz: int = SCENE1_YOLO_DEFAULT_IMGSZ,
+                 fallback_to_rules: bool = True):
+        super().__init__(scene=scene, base_frame=base_frame)
+        self.yolo_model_path = os.path.abspath(os.path.expanduser(model_path))
+        self.yolo_device = device
+        self.yolo_conf = float(conf)
+        self.yolo_imgsz = int(imgsz)
+        self.fallback_to_rules = bool(fallback_to_rules)
+        self._yolo_model = None
+        self._yolo_unavailable_reason: Optional[str] = None
+        self._yolo_unavailable_reported = False
+        self._yolo_ready_logged = False
+
+    def detect_targets(self, class_names: Optional[Sequence[str]] = None,
+                       cameras: Optional[Sequence[str]] = None,
+                       max_targets: Optional[int] = None) -> List[PerceptionTarget]:
+        wanted = set(class_names) if class_names is not None else None
+        if wanted is not None and SCENE1_YOLO_CLASS_NAME not in wanted:
+            return super().detect_targets(class_names=class_names, cameras=cameras, max_targets=max_targets)
+
+        if not self._ensure_yolo():
+            reason = self._yolo_unavailable_reason or "unknown"
+            if self.fallback_to_rules:
+                self._report_yolo_unavailable("warn", "YOLO 不可用，回退规则识别: %s", reason)
+                return super().detect_targets(class_names=class_names, cameras=cameras, max_targets=max_targets)
+            self._report_yolo_unavailable("error", "YOLO 不可用，强制 YOLO 模式返回空目标: %s", reason)
+            return []
+
+        try:
+            return self._detect_with_yolo(
+                cameras=cameras or self._default_cameras_for_targets(),
+                max_targets=max_targets,
+            )
+        except Exception as exc:
+            if self.fallback_to_rules:
+                log_warn(self.scene, "YOLO", "推理失败，回退规则识别: %s", exc)
+                return super().detect_targets(class_names=class_names, cameras=cameras, max_targets=max_targets)
+            log_error(self.scene, "YOLO", "推理失败，强制 YOLO 模式返回空目标: %s", exc)
+            return []
+
+    def _ensure_yolo(self) -> bool:
+        if self._yolo_model is not None:
+            return True
+        if self._yolo_unavailable_reason is not None:
+            return False
+        if not self._ensure_cv():
+            self._yolo_unavailable_reason = "cv2/numpy import failed"
+            return False
+        if not os.path.isfile(self.yolo_model_path):
+            self._yolo_unavailable_reason = "model not found: {}".format(self.yolo_model_path)
+            return False
+
+        try:
+            from ultralytics import YOLO
+
+            self._yolo_model = YOLO(self.yolo_model_path)
+            if not self._yolo_ready_logged:
+                log_stage(
+                    self.scene,
+                    "YOLO",
+                    "已加载模型 %s device=%s conf=%.2f imgsz=%d",
+                    self.yolo_model_path,
+                    self.yolo_device,
+                    self.yolo_conf,
+                    self.yolo_imgsz,
+                )
+                self._yolo_ready_logged = True
+            return True
+        except Exception as exc:
+            self._yolo_unavailable_reason = "ultralytics/model load failed: {}".format(exc)
+            self._yolo_model = None
+            return False
+
+    def _report_yolo_unavailable(self, level: str, message: str, *args: Any) -> None:
+        if self._yolo_unavailable_reported:
+            return
+        self._yolo_unavailable_reported = True
+        if level == "error":
+            log_error(self.scene, "YOLO", message, *args)
+        else:
+            log_warn(self.scene, "YOLO", message, *args)
+
+    def _detect_with_yolo(self, cameras: Sequence[str],
+                          max_targets: Optional[int]) -> List[PerceptionTarget]:
+        if not self._ensure_cv():
+            return []
+
+        targets: List[PerceptionTarget] = []
+        for camera in cameras:
+            state = self.cameras.get(camera)
+            if not state:
+                continue
+            color_msg = state.get("color_msg")
+            info_msg = state.get("info_msg")
+            if color_msg is None or info_msg is None:
+                self.rospy.loginfo_throttle(
+                    1.0,
+                    "[%s][YOLO] %s 未就绪 color=%s info=%s",
+                    self.scene,
+                    camera,
+                    color_msg is not None,
+                    info_msg is not None,
+                )
+                continue
+
+            color = self._decode_color(color_msg)
+            if color is None:
+                continue
+            depth = self._decode_depth(state.get("depth_msg"))
+            if depth is None:
+                self.rospy.loginfo_throttle(
+                    1.0,
+                    "[%s][YOLO] %s 深度图未就绪或解码失败，候选将缺少 base_link 坐标",
+                    self.scene,
+                    camera,
+                )
+
+            targets.extend(self._detect_yolo_in_image(camera, color_msg, info_msg, color, depth))
+
+        targets = self._dedupe_targets(targets)
+        targets.sort(key=lambda t: t.confidence, reverse=True)
+        if max_targets is not None:
+            targets = targets[:int(max_targets)]
+        log_stage(self.scene, "检测", "YOLO结果 %s=%d", SCENE1_YOLO_CLASS_NAME, len(targets))
+        return targets
+
+    def _detect_yolo_in_image(self, camera: str, color_msg: Any, info_msg: Any,
+                              color_bgr: Any, depth_m: Optional[Any]) -> List[PerceptionTarget]:
+        height, width = color_bgr.shape[:2]
+        kwargs = {
+            "source": color_bgr,
+            "conf": self.yolo_conf,
+            "imgsz": self.yolo_imgsz,
+            "verbose": False,
+        }
+        if self.yolo_device != "auto":
+            kwargs["device"] = self.yolo_device
+
+        results = self._yolo_model.predict(**kwargs)
+        found: List[PerceptionTarget] = []
+        raw_count = 0
+        kept_count = 0
+        for result in results:
+            names = self._normalized_yolo_names(
+                getattr(result, "names", None) or getattr(self._yolo_model, "names", None)
+            )
+            boxes = getattr(result, "boxes", None)
+            box_list = list(boxes) if boxes is not None else []
+            raw_count += len(box_list)
+            for box in box_list:
+                candidate = self._yolo_box_to_target(
+                    camera=camera,
+                    color_msg=color_msg,
+                    info_msg=info_msg,
+                    depth_m=depth_m,
+                    box=box,
+                    names=names,
+                    image_width=width,
+                    image_height=height,
+                )
+                if candidate is not None:
+                    kept_count += 1
+                    found.append(candidate)
+
+        self.rospy.loginfo_throttle(
+            1.0,
+            "[%s][YOLO] cam=%s raw_boxes=%d kept=%d",
+            self.scene,
+            camera,
+            raw_count,
+            kept_count,
+        )
+        return found
+
+    def _yolo_box_to_target(self, camera: str, color_msg: Any, info_msg: Any,
+                            depth_m: Optional[Any], box: Any,
+                            names: Dict[int, str], image_width: int,
+                            image_height: int) -> Optional[PerceptionTarget]:
+        xyxy = self._as_float_list(getattr(box, "xyxy", []))
+        if len(xyxy) < 4:
+            return None
+        x0 = int(clamp(min(xyxy[0], xyxy[2]), 0, image_width - 1))
+        y0 = int(clamp(min(xyxy[1], xyxy[3]), 0, image_height - 1))
+        x1 = int(clamp(max(xyxy[0], xyxy[2]), 0, image_width))
+        y1 = int(clamp(max(xyxy[1], xyxy[3]), 0, image_height))
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        class_id = int(round(self._as_float(getattr(box, "cls", 0.0))))
+        class_name = self._scene1_class_name_from_yolo(names, class_id)
+        if class_name is None:
+            return None
+
+        w = x1 - x0
+        h = y1 - y0
+        u = int(x0 + w * 0.5)
+        v = int(y0 + h * 0.5)
+        depth = self._median_depth_for_bbox_center(depth_m, image_width, image_height, x0, y0, w, h)
+        pos_camera = None
+        pos_base = None
+        if depth is not None:
+            pos_camera = self._pixel_to_camera(u, v, depth, info_msg)
+            pos_base = self._transform_camera_to_base(pos_camera, color_msg.header.frame_id, color_msg.header.stamp)
+
+        confidence = clamp(self._as_float(getattr(box, "conf", 0.0)), 0.0, 0.99)
+        raw_name = names.get(class_id, str(class_id))
+        return PerceptionTarget(
+            class_name=class_name,
+            confidence=confidence,
+            center_uv=(u, v),
+            position_base=pos_base,
+            position_camera=pos_camera,
+            camera=camera,
+            area_px=float(w * h),
+            bbox=(x0, y0, w, h),
+            yaw_rad=None,
+            target_bin=SCENE1_YOLO_TARGET_BIN,
+            timestamp=time.time(),
+            debug={
+                "source": "yolo",
+                "raw_class": raw_name,
+                "class_id": class_id,
+                "depth_m": depth,
+                "image_size": (image_width, image_height),
+                "frame_id": color_msg.header.frame_id,
+            },
+        )
+
+    def _scene1_class_name_from_yolo(self, names: Dict[int, str],
+                                     class_id: int) -> Optional[str]:
+        parcel_class_ids = [
+            item_id for item_id, name in names.items()
+            if SCENE1_YOLO_CLASS_NAME in str(name).lower()
+        ]
+        if parcel_class_ids:
+            return SCENE1_YOLO_CLASS_NAME if class_id in parcel_class_ids else None
+        if len(names) == 1:
+            return SCENE1_YOLO_CLASS_NAME
+        if not names and class_id == 0:
+            return SCENE1_YOLO_CLASS_NAME
+        return None
+
+    def _median_depth_for_bbox_center(self, depth_m: Optional[Any], image_width: int,
+                                      image_height: int, x: int, y: int,
+                                      w: int, h: int) -> Optional[float]:
+        if depth_m is None:
+            return None
+        dh, dw = depth_m.shape[:2]
+        if dh <= 0 or dw <= 0:
+            return None
+
+        frac = clamp(SCENE1_YOLO_CENTER_DEPTH_FRACTION, 0.10, 1.0)
+        sx = float(dw) / float(image_width)
+        sy = float(dh) / float(image_height)
+        cx0 = x + w * (0.5 - frac * 0.5)
+        cy0 = y + h * (0.5 - frac * 0.5)
+        cx1 = x + w * (0.5 + frac * 0.5)
+        cy1 = y + h * (0.5 + frac * 0.5)
+
+        depth = self._median_depth_for_scaled_roi(depth_m, cx0, cy0, cx1, cy1, sx, sy)
+        if depth is not None:
+            return depth
+        return self._median_depth_for_scaled_roi(depth_m, x, y, x + w, y + h, sx, sy)
+
+    def _median_depth_for_scaled_roi(self, depth_m: Any, x0: float, y0: float,
+                                     x1: float, y1: float, sx: float,
+                                     sy: float) -> Optional[float]:
+        dh, dw = depth_m.shape[:2]
+        dx0 = max(0, min(dw - 1, int(math.floor(x0 * sx))))
+        dy0 = max(0, min(dh - 1, int(math.floor(y0 * sy))))
+        dx1 = max(dx0 + 1, min(dw, int(math.ceil(x1 * sx))))
+        dy1 = max(dy0 + 1, min(dh, int(math.ceil(y1 * sy))))
+        roi_depth = depth_m[dy0:dy1, dx0:dx1]
+        if roi_depth.size <= 0:
+            return None
+        valid = roi_depth[
+            self.np.isfinite(roi_depth)
+            & (roi_depth > 0.05)
+            & (roi_depth < 5.0)
+        ]
+        if valid.size < 5:
+            return None
+        return float(self.np.median(valid))
+
+    def _normalized_yolo_names(self, names: Any) -> Dict[int, str]:
+        if isinstance(names, dict):
+            normalized: Dict[int, str] = {}
+            for key, value in names.items():
+                try:
+                    normalized[int(key)] = str(value)
+                except Exception:
+                    continue
+            return normalized
+        if isinstance(names, (list, tuple)):
+            return {idx: str(value) for idx, value in enumerate(names)}
+        return {}
+
+    def _as_float_list(self, value: Any) -> List[float]:
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            if hasattr(value, "numpy"):
+                value = value.numpy()
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+            while isinstance(value, (list, tuple)) and len(value) == 1:
+                value = value[0]
+            if isinstance(value, (list, tuple)):
+                return [float(item) for item in value]
+            return [float(value)]
+        except Exception:
+            return []
+
+    def _as_float(self, value: Any, default: float = 0.0) -> float:
+        values = self._as_float_list(value)
+        if not values:
+            return float(default)
+        return float(values[0])
+
+
 # ---------------------------------------------------------------------------
 # 导航层
 # ---------------------------------------------------------------------------
@@ -1518,8 +1854,29 @@ def build_controller(scene: str, robot: RobotBase, perception: RuleBasedPercepti
     raise ValueError("unknown scene: {}".format(scene))
 
 
+def build_perception(scene: str, scene1_perception: str,
+                     yolo_model: str, yolo_device: str,
+                     yolo_conf: float, yolo_imgsz: int) -> RuleBasedPerception:
+    if scene == "scene1" and scene1_perception != "rule":
+        return YoloScene1Perception(
+            scene=scene,
+            base_frame=BASE_FRAME,
+            model_path=yolo_model,
+            device=yolo_device,
+            conf=yolo_conf,
+            imgsz=yolo_imgsz,
+            fallback_to_rules=(scene1_perception == "auto"),
+        )
+    return RuleBasedPerception(scene=scene, base_frame=BASE_FRAME)
+
+
 def run_scene(scene, seed, node_name=None, timeout=120,
-              time_limit=None, timer_gui=True):
+              time_limit=None, timer_gui=True,
+              scene1_perception="auto",
+              yolo_model=DEFAULT_SCENE1_YOLO_MODEL,
+              yolo_device="auto",
+              yolo_conf=SCENE1_YOLO_DEFAULT_CONF,
+              yolo_imgsz=SCENE1_YOLO_DEFAULT_IMGSZ):
     if scene not in SCENE_CONFIGS:
         raise ValueError("unknown scene: {}".format(scene))
 
@@ -1547,7 +1904,14 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     rospy.loginfo("场景实例已初始化。")
 
     robot = RobotBase(cmd_vel_pub=cmd_vel_pub, arm_traj_pub=arm_traj_pub, scene=scene)
-    perception = RuleBasedPerception(scene=scene, base_frame=BASE_FRAME)
+    perception = build_perception(
+        scene=scene,
+        scene1_perception=scene1_perception,
+        yolo_model=yolo_model,
+        yolo_device=yolo_device,
+        yolo_conf=yolo_conf,
+        yolo_imgsz=yolo_imgsz,
+    )
     navigation = Navigation(robot)
     skills = Skills(scene=scene, robot=robot, navigation=navigation)
     controller = build_controller(scene, robot, perception, navigation, skills)
@@ -1581,6 +1945,16 @@ def main():
                         help="比赛时长，单位秒；默认读取 CHALLENGE_TIME_LIMIT，未设置则不限时")
     parser.add_argument("--no-timer-gui", action="store_true",
                         help="不弹出计时器窗口，仅保留后台计时日志")
+    parser.add_argument("--scene1-perception", choices=["auto", "rule", "yolo"], default="auto",
+                        help="场景一包裹识别后端：auto 优先 YOLO，rule 强制规则，yolo 强制 YOLO")
+    parser.add_argument("--yolo-model", default=DEFAULT_SCENE1_YOLO_MODEL,
+                        help="场景一 YOLO .pt 模型路径")
+    parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0"], default="auto",
+                        help="YOLO 推理设备；auto 由 ultralytics 自动选择")
+    parser.add_argument("--yolo-conf", type=float, default=SCENE1_YOLO_DEFAULT_CONF,
+                        help="YOLO 检测置信度阈值")
+    parser.add_argument("--yolo-imgsz", type=int, default=SCENE1_YOLO_DEFAULT_IMGSZ,
+                        help="YOLO 推理输入尺寸")
     args = parser.parse_args()
 
     run_scene(
@@ -1590,6 +1964,11 @@ def main():
         timeout=args.timeout,
         time_limit=args.time_limit,
         timer_gui=not args.no_timer_gui,
+        scene1_perception=args.scene1_perception,
+        yolo_model=args.yolo_model,
+        yolo_device=args.yolo_device,
+        yolo_conf=args.yolo_conf,
+        yolo_imgsz=args.yolo_imgsz,
     )
 
 

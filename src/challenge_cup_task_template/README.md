@@ -54,6 +54,55 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 
 `--seed` 用于本地生成不同场景实例。正式评测 seed 由组委会指定，选手不应依赖某个固定 seed 或硬编码物体位置。
 
+## 场景一 YOLO 识别
+
+场景一支持用内嵌 YOLO 推理识别快递包裹。YOLO 只负责输出包裹检测框，三维位置仍由相机深度图、CameraInfo 和 TF 转换得到，不读取仿真真值或禁用接口。
+
+默认权重路径：
+
+```text
+src/challenge_cup_task_template/models/scene1_parcel.pt
+```
+
+权重文件需参赛队自行训练或提供，模板中不包含 `.pt` 模型。模型建议至少包含一个包裹类别；如果类别名中包含 `parcel`，程序只接受该类别；如果模型只有一个类别，程序会将其统一映射为 `parcel`。
+
+在官方 Docker 容器中安装依赖：
+
+```bash
+cd /root/kuavo_ws
+python3 -m pip install ultralytics==8.0.196
+python3 -c "import torch, ultralytics; print(torch.__version__, torch.cuda.is_available(), ultralytics.__version__)"
+```
+
+运行示例：
+
+```bash
+# 自动模式：有模型且 ultralytics 可用时使用 YOLO，否则回退规则识别
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception auto
+
+# 强制 YOLO；模型或依赖不可用时会直接报错并返回无目标
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception yolo
+
+# 指定自定义模型和 GPU
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception yolo --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/scene1_parcel.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
+
+# 无 GPU 或调试 CPU 路径
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception yolo --yolo-device cpu
+
+# 完全使用原 HSV 规则识别
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception rule
+```
+
+可用参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--scene1-perception` | `auto` | `auto` 优先 YOLO 并可回退；`yolo` 强制 YOLO；`rule` 强制规则识别。 |
+| `--yolo-model` | `src/challenge_cup_task_template/models/scene1_parcel.pt` | YOLO `.pt` 权重路径。 |
+| `--yolo-device` | `auto` | 可选 `auto`、`cpu`、`cuda`、`cuda:0`。 |
+| `--yolo-conf` | `0.45` | YOLO 检测置信度阈值。 |
+| `--yolo-imgsz` | `640` | YOLO 推理输入尺寸。 |
+
 ## 比赛计时
 
 默认不限制时长，只显示计时，便于调试。
