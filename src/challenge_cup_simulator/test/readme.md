@@ -19,7 +19,7 @@ LeTools-Learning 具体使用说明请进入 LeTools-Learning文档网站 查看
 
 - 任务二仿真数据集：[https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled/scene2_Parts_Sorting](https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled/scene2_Parts_Sorting)  
 数据集机器人头部初始姿态：  
-任务一：`HEAD_ANGLE = [0.0, 30.0]`   
+任务一：`HEAD_ANGLE = [0.0, 20.0]`   
 任务二：`HEAD_ANGLE = [0.0, 20.0]`  
 
 - （openlet社区真机参考案例）基于 Pi05 VLA 的玩偶分拣实战：从数据采集到实机推理：[https://openlet.openatom.tech/explore/journalism/detail/584219818870312960](https://openlet.openatom.tech/explore/journalism/detail/584219818870312960)
