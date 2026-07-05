@@ -11,8 +11,18 @@
 import argparse
 import math
 import os
+import struct
 import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+
+# ---------------------------------------------------------------------------
+# 全局配置与常量区
+# ---------------------------------------------------------------------------
+
+BASE_FRAME = "base_link"
 
 ARM_JOINT_NAMES = [
     "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
@@ -21,41 +31,209 @@ ARM_JOINT_NAMES = [
     "r_hand_yaw", "r_hand_pitch", "r_hand_roll",
 ]
 
-HOME_ARM_DEG = [20, 20, 0, -35, 0, 0, 0, 20, -20, 0, -35, 0, 0, 0]
+HOME_ARM_DEG = [
+    20, 0, 0, -30, 0, 0, 0,
+    20, 0, 0, -30, 0, 0, 0,
+]
 
-# 这些坐标来自公开场景配置，后续可由相机/点云识别结果覆盖。
-SCENE_TASKS = {
-    "scene1": {
-        "weigh": [-0.17, -0.56, 0.90],
-        "drop": [0.10, 0.29, 1.05],
-        "objects": [
-            {"name": "parcel_1", "pick": [-0.26, -0.31, 0.90], "arm": "right"},
-            {"name": "parcel_2", "pick": [-0.26, -0.09, 0.90], "arm": "right"},
-            {"name": "parcel_3", "pick": [-0.11, -0.31, 0.90], "arm": "right"},
-            {"name": "parcel_4", "pick": [-0.11, -0.09, 0.90], "arm": "right"},
-        ],
+WORK_ARM_DEG = [
+    30, 10, 10, -110, -55, 0, 0,
+    30, -10, -10, -110, 55, 0, 0,
+]
+
+SIDE_LIFT_ARM_DEG = [
+    20, 65, 0, -40, 0, 0, 0,
+    20, -65, 0, -40, 0, 0, 0,
+]
+
+ARM_MODE_EXTERNAL_CONTROL = 2
+ARM_MODE_AUTO_SWING = 1
+ARM_TRAJ_HZ = 50.0
+CLAW_OPEN_PERCENT = 5.0
+CLAW_CLOSE_PERCENT = 88.0
+
+SAFE_PRE_GRASP_DZ_M = 0.14
+SAFE_LIFT_DZ_M = 0.18
+SAFE_PLACE_DZ_M = 0.12
+SAFE_MIN_Z_BASE_M = -0.14
+SAFE_MAX_Z_BASE_M = 0.85
+REACH_X_MIN_M = 0.12
+REACH_X_MAX_M = 0.88
+TARGET_WAIT_SEC = 8.0
+
+CAMERA_SPECS = {
+    "head": {
+        "label": "头部相机",
+        "color": "/cam_h/color/image_raw/compressed",
+        "depth": "/cam_h/depth/image_raw/compressedDepth",
+        "info": "/cam_h/color/camera_info",
     },
-    "scene2": {
-        "bins": {
-            "part_type_a": [-0.04, -0.43, 0.96],
-            "part_type_b": [-0.04, 0.00, 0.96],
-        },
-        "objects": [
-            {"name": "part_type_a_1", "pick": [-0.28, -0.35, 0.87], "arm": "right", "type": "part_type_a"},
-            {"name": "part_type_a_2", "pick": [-0.28, -0.25, 0.87], "arm": "right", "type": "part_type_a"},
-            {"name": "part_type_b_1", "pick": [-0.28, -0.07, 0.89], "arm": "right", "type": "part_type_b"},
-            {"name": "part_type_b_2", "pick": [-0.28, 0.03, 0.89], "arm": "left", "type": "part_type_b"},
-        ],
+    "left_wrist": {
+        "label": "左腕相机",
+        "color": "/cam_l/color/image_raw/compressed",
+        "depth": "/cam_l/depth/image_rect_raw/compressedDepth",
+        "info": "/cam_l/color/camera_info",
     },
-    "scene3": {
-        "outbound": [-2.39, 0.00, 1.05],
-        "objects": [
-            {"name": "smt_tray_lower", "pick": [0.983, 0.15, 0.78], "arm": "left"},
-            {"name": "smt_tray_upper", "pick": [0.983, 0.25, 1.18], "arm": "left"},
-        ],
+    "right_wrist": {
+        "label": "右腕相机",
+        "color": "/cam_r/color/image_raw/compressed",
+        "depth": "/cam_r/depth/image_rect_raw/compressedDepth",
+        "info": "/cam_r/color/camera_info",
     },
 }
 
+# HSV 规则阈值使用公开材质颜色做基线。阈值保守放宽，实际筛选还会叠加面积、
+# 长宽比、深度有效性和去重。
+TARGET_RULES = {
+    "scene1": [
+        {
+            "class_name": "parcel",
+            "target_bin": "drop_box",
+            "hsv_ranges": [
+                ((5, 35, 80), (35, 255, 255)),      # brown/yellow/orange parcel
+                ((88, 15, 115), (128, 120, 255)),   # pale blue parcel
+            ],
+            "min_area_px": 120,
+            "max_area_px": 35000,
+            "min_aspect": 0.25,
+            "max_aspect": 4.2,
+            "min_extent": 0.22,
+        },
+    ],
+    "scene2": [
+        {
+            "class_name": "part_type_a",
+            "target_bin": "sorting_bin_a",
+            "hsv_ranges": [((0, 0, 115), (180, 65, 255))],
+            "min_area_px": 70,
+            "max_area_px": 18000,
+            "min_aspect": 0.18,
+            "max_aspect": 5.0,
+            "min_extent": 0.12,
+        },
+        {
+            "class_name": "part_type_b",
+            "target_bin": "sorting_bin_b",
+            "hsv_ranges": [((0, 0, 0), (180, 90, 85))],
+            "min_area_px": 70,
+            "max_area_px": 18000,
+            "min_aspect": 0.18,
+            "max_aspect": 5.0,
+            "min_extent": 0.12,
+        },
+        {
+            "class_name": "part_type_c",
+            "target_bin": "sorting_bin_c",
+            "hsv_ranges": [
+                ((0, 80, 60), (12, 255, 255)),
+                ((170, 80, 60), (179, 255, 255)),
+            ],
+            "min_area_px": 45,
+            "max_area_px": 14000,
+            "min_aspect": 0.12,
+            "max_aspect": 8.0,
+            "min_extent": 0.08,
+        },
+    ],
+    "scene3": [
+        {
+            "class_name": "smt_tray",
+            "target_bin": "outbound_box",
+            "hsv_ranges": [((0, 0, 105), (180, 70, 235))],
+            "min_area_px": 140,
+            "max_area_px": 42000,
+            "min_aspect": 0.18,
+            "max_aspect": 6.5,
+            "min_extent": 0.10,
+        },
+    ],
+}
+
+BIN_RULES = {
+    "scene1": [
+        {
+            "class_name": "weighing_area",
+            "hsv_ranges": [((45, 60, 60), (90, 255, 255))],
+            "min_area_px": 400,
+            "max_area_px": 50000,
+            "min_aspect": 0.35,
+            "max_aspect": 3.0,
+            "min_extent": 0.25,
+        },
+        {
+            "class_name": "drop_box",
+            "hsv_ranges": [((45, 45, 45), (95, 255, 255))],
+            "min_area_px": 500,
+            "max_area_px": 90000,
+            "min_aspect": 0.35,
+            "max_aspect": 4.0,
+            "min_extent": 0.20,
+        },
+    ],
+    "scene2": [
+        {
+            "class_name": "sorting_bin_a",
+            "hsv_ranges": [((95, 80, 55), (130, 255, 255))],
+            "min_area_px": 400,
+            "max_area_px": 90000,
+            "min_aspect": 0.35,
+            "max_aspect": 4.0,
+            "min_extent": 0.20,
+        },
+        {
+            "class_name": "sorting_bin_b",
+            "hsv_ranges": [((6, 80, 70), (28, 255, 255))],
+            "min_area_px": 400,
+            "max_area_px": 90000,
+            "min_aspect": 0.35,
+            "max_aspect": 4.0,
+            "min_extent": 0.20,
+        },
+        {
+            "class_name": "sorting_bin_c",
+            "hsv_ranges": [((130, 45, 50), (165, 255, 255))],
+            "min_area_px": 400,
+            "max_area_px": 90000,
+            "min_aspect": 0.35,
+            "max_aspect": 4.0,
+            "min_extent": 0.20,
+        },
+    ],
+    "scene3": [
+        {
+            "class_name": "outbound_box",
+            "hsv_ranges": [((45, 45, 45), (95, 255, 255))],
+            "min_area_px": 500,
+            "max_area_px": 90000,
+            "min_aspect": 0.35,
+            "max_aspect": 4.0,
+            "min_extent": 0.20,
+        },
+    ],
+}
+
+# 放置目标优先由规则感知更新；这些点只作为感知失败时的保守兜底，坐标系为
+# base_link，来源于公开场景几何与样例控制脚本的人工标定量级。
+PLACE_TARGETS_BASE = {
+    "scene1": {
+        "weighing_area": (0.42, -0.56, 0.12),
+        "drop_box": (0.62, 0.30, 0.20),
+    },
+    "scene2": {
+        "sorting_bin_a": (0.56, -0.43, 0.18),
+        "sorting_bin_b": (0.56, 0.00, 0.18),
+        "sorting_bin_c": (0.56, 0.43, 0.18),
+    },
+    "scene3": {
+        "outbound_box": (0.58, 0.00, 0.22),
+    },
+}
+
+SCENE_TARGET_LIMIT = {
+    "scene1": 4,
+    "scene2": 6,
+    "scene3": 5,
+}
 
 SCENE_CONFIGS = {
     "scene1": {
@@ -73,13 +251,1159 @@ SCENE_CONFIGS = {
 }
 
 
-def _quat_down(yaw=0.0):
-    # 末端朝下的抓取姿态，按 yaw 做桌面内旋转。
-    half_yaw = yaw * 0.5
+# ---------------------------------------------------------------------------
+# 调试输出工具区
+# ---------------------------------------------------------------------------
+
+
+def log_stage(scene: str, stage: str, message: str, *args: Any) -> None:
+    import rospy
+
+    rospy.loginfo("[%s][%s] " + message, scene, stage, *args)
+
+
+def log_warn(scene: str, stage: str, message: str, *args: Any) -> None:
+    import rospy
+
+    rospy.logwarn("[%s][%s] " + message, scene, stage, *args)
+
+
+def log_error(scene: str, stage: str, message: str, *args: Any) -> None:
+    import rospy
+
+    rospy.logerr("[%s][%s] " + message, scene, stage, *args)
+
+
+def _fmt_xyz(xyz: Optional[Sequence[float]]) -> str:
+    if xyz is None:
+        return "None"
+    return "({:.3f},{:.3f},{:.3f})m".format(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+
+def log_target_list(scene: str, stage: str, targets: Sequence["PerceptionTarget"],
+                    max_items: int = 8) -> None:
+    import rospy
+
+    rospy.loginfo("[%s][%s] targets=%d", scene, stage, len(targets))
+    for i, target in enumerate(list(targets)[:max_items]):
+        rospy.loginfo(
+            "[%s][%s][#%02d] class=%s conf=%.2f cam=%s uv=%s base=%s bin=%s area=%.0f",
+            scene,
+            stage,
+            i + 1,
+            target.class_name,
+            target.confidence,
+            target.camera,
+            target.center_uv,
+            _fmt_xyz(target.position_base),
+            target.target_bin,
+            target.area_px,
+        )
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def smoothstep(t: float) -> float:
+    t = clamp(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def distance3(a: Sequence[float], b: Sequence[float]) -> float:
+    return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))
+
+
+def quat_down(yaw_rad: float = 0.0) -> List[float]:
+    # 末端近似朝下；yaw 用于在桌面平面内调整夹爪方向。
+    half_yaw = yaw_rad * 0.5
     half_pitch = -math.pi * 0.25
     cy, sy = math.cos(half_yaw), math.sin(half_yaw)
     cp, sp = math.cos(half_pitch), math.sin(half_pitch)
     return [sy * sp, cy * sp, sy * cp, cy * cp]
+
+
+# ---------------------------------------------------------------------------
+# 轻量数据结构区
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PerceptionTarget:
+    class_name: str
+    confidence: float
+    center_uv: Optional[Tuple[int, int]]
+    position_base: Optional[Tuple[float, float, float]]
+    position_camera: Optional[Tuple[float, float, float]]
+    camera: str
+    area_px: float
+    bbox: Optional[Tuple[int, int, int, int]] = None
+    yaw_rad: Optional[float] = None
+    target_bin: Optional[str] = None
+    timestamp: float = 0.0
+    debug: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ActionResult:
+    ok: bool
+    stage: str
+    reason: str = ""
+    target: Optional[PerceptionTarget] = None
+    duration_sec: float = 0.0
+    retry_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# 底层 ROS/硬件适配层
+# ---------------------------------------------------------------------------
+
+
+class RobotBase:
+    def __init__(self, cmd_vel_pub: Any, arm_traj_pub: Any, scene: str):
+        import rospy
+        from kuavo_msgs.msg import lejuClawCommand, lejuClawState, sensorsData
+
+        self.rospy = rospy
+        self.scene = scene
+        self.cmd_vel_pub = cmd_vel_pub
+        self.arm_traj_pub = arm_traj_pub
+        self.claw_cmd_pub = rospy.Publisher("/leju_claw_command", lejuClawCommand, queue_size=10)
+        self.current_arm_rad = [0.0] * 14
+        self.last_arm_deg = list(HOME_ARM_DEG)
+        self.claw_state = None
+        self._sensor_seen = False
+
+        rospy.Subscriber("/sensors_data_raw", sensorsData, self._sensor_cb, queue_size=1)
+        rospy.Subscriber("/leju_claw_state", lejuClawState, self._claw_state_cb, queue_size=1)
+
+    def _sensor_cb(self, msg: Any) -> None:
+        joint_q = list(getattr(getattr(msg, "joint_data", None), "joint_q", []))
+        if len(joint_q) >= 26:
+            self.current_arm_rad = [float(v) for v in joint_q[12:26]]
+            self._sensor_seen = True
+
+    def _claw_state_cb(self, msg: Any) -> None:
+        self.claw_state = msg
+
+    def wait_for_joint_state(self, timeout_sec: float = 4.0) -> bool:
+        start = time.time()
+        rate = self.rospy.Rate(20)
+        while not self.rospy.is_shutdown() and time.time() - start < timeout_sec:
+            if self._sensor_seen:
+                return True
+            self.rospy.loginfo_throttle(1.0, "[%s][初始化] 等待 /sensors_data_raw", self.scene)
+            rate.sleep()
+        log_warn(self.scene, "初始化", "未等到手臂关节状态，后续使用上一条关节目标作为 IK 初值")
+        return False
+
+    def current_arm_deg(self) -> List[float]:
+        if not self._sensor_seen:
+            return list(self.last_arm_deg)
+        return [math.degrees(float(v)) for v in self.current_arm_rad]
+
+    def prepare(self) -> None:
+        log_stage(self.scene, "初始化", "切换手臂外部控制、打开夹爪、进入工作预备姿态")
+        self.wait_for_joint_state(timeout_sec=3.0)
+        self.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL)
+        self.open_claw("both")
+        self.move_arm_deg(SIDE_LIFT_ARM_DEG, duration=1.3)
+        self.move_arm_deg(WORK_ARM_DEG, duration=1.5)
+
+    def finish(self) -> None:
+        log_stage(self.scene, "结束", "停止底盘并回到安全手臂姿态")
+        self.stop_base(duration=0.4)
+        self.move_arm_deg(SIDE_LIFT_ARM_DEG, duration=1.0)
+        self.move_arm_deg(HOME_ARM_DEG, duration=1.2)
+        self.open_claw("both")
+        self.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
+
+    def set_arm_mode(self, mode: int, warn_only: bool = True) -> bool:
+        from kuavo_msgs.srv import changeArmCtrlMode, changeArmCtrlModeRequest
+
+        service_names = ["/arm_traj_change_mode", "/humanoid_change_arm_ctrl_mode"]
+        for service_name in service_names:
+            try:
+                self.rospy.wait_for_service(service_name, timeout=1.5)
+                proxy = self.rospy.ServiceProxy(service_name, changeArmCtrlMode)
+                req = changeArmCtrlModeRequest()
+                req.control_mode = int(mode)
+                res = proxy(req)
+                if hasattr(res, "result") and not res.result:
+                    raise RuntimeError(getattr(res, "message", "service returned false"))
+                log_stage(self.scene, "手臂模式", "%s -> mode=%d", service_name, mode)
+                return True
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if warn_only:
+            log_warn(self.scene, "手臂模式", "切换模式失败，继续尝试直接发轨迹: %s", last_exc)
+            return False
+        raise RuntimeError("set_arm_mode failed: {}".format(last_exc))
+
+    def move_arm_deg(self, target_deg: Sequence[float], duration: float = 1.0) -> None:
+        from sensor_msgs.msg import JointState
+
+        target = [float(v) for v in target_deg]
+        if len(target) != 14:
+            raise ValueError("arm target expects 14 joints, got {}".format(len(target)))
+
+        start = self.current_arm_deg()
+        if len(start) != 14:
+            start = list(self.last_arm_deg)
+        steps = max(2, int(max(duration, 0.1) * ARM_TRAJ_HZ))
+        rate = self.rospy.Rate(ARM_TRAJ_HZ)
+        msg = JointState()
+        msg.name = list(ARM_JOINT_NAMES)
+        msg.velocity = [0.0] * 14
+        msg.effort = [0.0] * 14
+        for i in range(steps + 1):
+            if self.rospy.is_shutdown():
+                break
+            alpha = smoothstep(float(i) / float(steps))
+            msg.header.stamp = self.rospy.Time.now()
+            msg.position = [start[j] + (target[j] - start[j]) * alpha for j in range(14)]
+            self.arm_traj_pub.publish(msg)
+            rate.sleep()
+        self.last_arm_deg = target
+
+    def send_single_arm_deg(self, arm: str, active_deg: Sequence[float],
+                            duration: float = 1.0) -> None:
+        target = list(self.current_arm_deg())
+        if len(target) != 14:
+            target = list(self.last_arm_deg)
+        values = [float(v) for v in active_deg]
+        if len(values) != 7:
+            raise ValueError("single arm target expects 7 joints")
+        if arm == "left":
+            target[:7] = values
+        elif arm == "right":
+            target[7:] = values
+        else:
+            raise ValueError("unknown arm: {}".format(arm))
+        self.move_arm_deg(target, duration=duration)
+
+    def stop_base(self, duration: float = 0.3) -> None:
+        from geometry_msgs.msg import Twist
+
+        msg = Twist()
+        end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
+        rate = self.rospy.Rate(20)
+        while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
+            self.cmd_vel_pub.publish(msg)
+            rate.sleep()
+
+    def drive_for(self, linear_x: float = 0.0, linear_y: float = 0.0,
+                  angular_z: float = 0.0, duration: float = 1.0) -> None:
+        from geometry_msgs.msg import Twist
+
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.linear.y = float(linear_y)
+        msg.angular.z = float(angular_z)
+        end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
+        rate = self.rospy.Rate(20)
+        while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
+            self.cmd_vel_pub.publish(msg)
+            rate.sleep()
+        self.stop_base(duration=0.25)
+
+    def open_claw(self, arm: str) -> bool:
+        return self.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=0.45)
+
+    def close_claw(self, arm: str, percent: float = CLAW_CLOSE_PERCENT) -> bool:
+        return self.set_claw(arm, percent, settle_sec=0.65)
+
+    def set_claw(self, arm: str, percent: float, settle_sec: float = 0.2) -> bool:
+        from kuavo_msgs.msg import endEffectorData, lejuClawCommand
+        from kuavo_msgs.srv import controlLejuClaw, controlLejuClawRequest
+
+        names, positions = self._claw_targets(arm, percent)
+        data = endEffectorData()
+        data.name = names
+        data.position = positions
+        data.velocity = [70.0] * len(names)
+        data.effort = [1.5] * len(names)
+
+        ok = False
+        try:
+            self.rospy.wait_for_service("/control_robot_leju_claw", timeout=1.5)
+            req = controlLejuClawRequest()
+            req.data = data
+            res = self.rospy.ServiceProxy("/control_robot_leju_claw", controlLejuClaw)(req)
+            ok = bool(getattr(res, "success", True))
+            if not ok:
+                log_warn(self.scene, "夹爪", "服务拒绝命令: %s", getattr(res, "message", ""))
+        except Exception as exc:
+            log_warn(self.scene, "夹爪", "服务调用失败，改用话题兜底: %s", exc)
+
+        if not ok:
+            msg = lejuClawCommand()
+            msg.header.stamp = self.rospy.Time.now()
+            msg.data = data
+            self.claw_cmd_pub.publish(msg)
+            ok = True
+
+        self.rospy.sleep(float(settle_sec))
+        return ok
+
+    def _claw_targets(self, arm: str, percent: float) -> Tuple[List[str], List[float]]:
+        percent = clamp(percent, 0.0, 100.0)
+        if arm == "left":
+            return ["left_claw"], [percent]
+        if arm == "right":
+            return ["right_claw"], [percent]
+        if arm == "both":
+            return ["left_claw", "right_claw"], [percent, percent]
+        raise ValueError("unknown arm: {}".format(arm))
+
+    def solve_ik(self, arm: str, target_xyz_base: Sequence[float],
+                 quat_xyzw: Optional[Sequence[float]] = None,
+                 constraint_mode: int = 2) -> List[float]:
+        from kuavo_msgs.msg import ikSolveParam, twoArmHandPoseCmd
+        from kuavo_msgs.srv import fkSrv, twoArmHandPoseCmdSrv
+
+        current = list(self.current_arm_rad)
+        if len(current) != 14 or not self._sensor_seen:
+            current = [math.radians(v) for v in self.last_arm_deg]
+
+        self.rospy.wait_for_service("/ik/fk_srv", timeout=2.0)
+        fk = self.rospy.ServiceProxy("/ik/fk_srv", fkSrv)(current).hand_poses
+
+        req = twoArmHandPoseCmd()
+        req.use_custom_ik_param = True
+        req.joint_angles_as_q0 = True
+        req.frame = 0
+        req.ik_param = ikSolveParam()
+        req.ik_param.major_optimality_tol = 1e-3
+        req.ik_param.major_feasibility_tol = 1e-3
+        req.ik_param.minor_feasibility_tol = 1e-3
+        req.ik_param.major_iterations_limit = 90
+        req.ik_param.oritation_constraint_tol = 2e-2
+        req.ik_param.pos_constraint_tol = 2e-3
+        req.ik_param.pos_cost_weight = 1.0
+        req.ik_param.constraint_mode = int(constraint_mode)
+
+        req.hand_poses.left_pose.joint_angles = list(current[:7])
+        req.hand_poses.right_pose.joint_angles = list(current[7:])
+        req.hand_poses.left_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
+        req.hand_poses.right_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
+        req.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
+        req.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
+        req.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
+        req.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
+
+        yaw = 0.0 if arm == "left" else math.pi
+        quat = list(quat_xyzw) if quat_xyzw is not None else quat_down(yaw)
+        if arm == "left":
+            req.hand_poses.left_pose.pos_xyz = [float(v) for v in target_xyz_base]
+            req.hand_poses.left_pose.quat_xyzw = quat
+        elif arm == "right":
+            req.hand_poses.right_pose.pos_xyz = [float(v) for v in target_xyz_base]
+            req.hand_poses.right_pose.quat_xyzw = quat
+        else:
+            raise ValueError("unknown arm: {}".format(arm))
+
+        self.rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=2.0)
+        res = self.rospy.ServiceProxy("/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)(req)
+        if not getattr(res, "success", False):
+            raise RuntimeError(getattr(res, "error_reason", "IK service returned false"))
+
+        q_arm = list(getattr(res, "q_arm", []))
+        if len(q_arm) < 14:
+            q_arm = list(res.hand_poses.left_pose.joint_angles) + list(res.hand_poses.right_pose.joint_angles)
+        if len(q_arm) < 14:
+            raise RuntimeError("IK response did not contain 14 arm joints")
+        return [math.degrees(float(v)) for v in q_arm[:14]]
+
+    def move_hand_ik(self, arm: str, target_xyz_base: Sequence[float],
+                     yaw_rad: float = 0.0, duration: float = 1.2,
+                     label: str = "ik") -> bool:
+        target = [
+            clamp(float(target_xyz_base[0]), -0.05, REACH_X_MAX_M),
+            float(target_xyz_base[1]),
+            clamp(float(target_xyz_base[2]), SAFE_MIN_Z_BASE_M, SAFE_MAX_Z_BASE_M),
+        ]
+        quat = quat_down(yaw_rad if arm == "left" else yaw_rad + math.pi)
+        try:
+            q_deg = self.solve_ik(arm, target, quat_xyzw=quat, constraint_mode=2)
+            self.move_arm_deg(q_deg, duration=duration)
+            return True
+        except Exception as exc:
+            log_warn(self.scene, "IK", "%s 失败，使用关节空间兜底: %s target=%s", label, exc, _fmt_xyz(target))
+            self.move_arm_deg(self._fallback_pose(arm, target), duration=duration)
+            return False
+
+    def _fallback_pose(self, arm: str, target_xyz_base: Sequence[float]) -> List[float]:
+        pose = list(self.current_arm_deg())
+        if len(pose) != 14:
+            pose = list(self.last_arm_deg)
+        x = clamp(float(target_xyz_base[0]), 0.18, 0.75)
+        y = float(target_xyz_base[1])
+        z = float(target_xyz_base[2])
+        reach = clamp((0.38 - x) * 90.0 + (0.18 - z) * 70.0, -35.0, 35.0)
+        side = clamp(y * 85.0, -35.0, 35.0)
+        if arm == "left":
+            pose[:7] = [30 + reach, 18 - side, 8, -95, -45, 0, 0]
+        else:
+            pose[7:] = [30 + reach, -18 - side, -8, -95, 45, 0, 0]
+        return pose
+
+
+# ---------------------------------------------------------------------------
+# 感知层：规则检测、深度投影和 TF 变换
+# ---------------------------------------------------------------------------
+
+
+class RuleBasedPerception:
+    def __init__(self, scene: str, base_frame: str = BASE_FRAME):
+        import rospy
+        import tf2_ros
+        from sensor_msgs.msg import CameraInfo, CompressedImage
+
+        self.rospy = rospy
+        self.scene = scene
+        self.base_frame = base_frame
+        self.cv2 = None
+        self.np = None
+        self._cv_import_failed = False
+        self.tf_buffer = tf2_ros.Buffer(rospy.Duration(30.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self.cameras: Dict[str, Dict[str, Any]] = {}
+
+        for name, spec in CAMERA_SPECS.items():
+            state = {"color_msg": None, "depth_msg": None, "info_msg": None}
+            self.cameras[name] = state
+            rospy.Subscriber(spec["color"], CompressedImage,
+                             self._make_store_cb(name, "color_msg"), queue_size=1)
+            rospy.Subscriber(spec["depth"], CompressedImage,
+                             self._make_store_cb(name, "depth_msg"), queue_size=1)
+            rospy.Subscriber(spec["info"], CameraInfo,
+                             self._make_store_cb(name, "info_msg"), queue_size=1)
+
+    def _make_store_cb(self, camera_name: str, key: str):
+        def cb(msg: Any) -> None:
+            self.cameras[camera_name][key] = msg
+        return cb
+
+    def _ensure_cv(self) -> bool:
+        if self.cv2 is not None and self.np is not None:
+            return True
+        if self._cv_import_failed:
+            return False
+        try:
+            import cv2
+            import numpy as np
+
+            self.cv2 = cv2
+            self.np = np
+            return True
+        except Exception as exc:
+            self._cv_import_failed = True
+            log_error(self.scene, "感知", "无法导入 cv2/numpy，规则识别不可用: %s", exc)
+            return False
+
+    def wait_ready(self, timeout_sec: float = TARGET_WAIT_SEC) -> bool:
+        start = time.time()
+        rate = self.rospy.Rate(20)
+        while not self.rospy.is_shutdown() and time.time() - start < timeout_sec:
+            ready = []
+            for name, state in self.cameras.items():
+                if state["color_msg"] is not None and state["info_msg"] is not None:
+                    ready.append(name)
+            if ready:
+                log_stage(self.scene, "等待传感器", "可用相机=%s", ",".join(ready))
+                return True
+            self.rospy.loginfo_throttle(1.0, "[%s][等待传感器] 等待相机图像与 CameraInfo", self.scene)
+            rate.sleep()
+        log_warn(self.scene, "等待传感器", "相机数据超时")
+        return False
+
+    def detect_targets(self, class_names: Optional[Sequence[str]] = None,
+                       cameras: Optional[Sequence[str]] = None,
+                       max_targets: Optional[int] = None) -> List[PerceptionTarget]:
+        rules = list(TARGET_RULES.get(self.scene, []))
+        if class_names is not None:
+            wanted = set(class_names)
+            rules = [rule for rule in rules if rule["class_name"] in wanted]
+        return self._detect_with_rules(
+            rules=rules,
+            cameras=cameras or self._default_cameras_for_targets(),
+            max_targets=max_targets,
+            purpose="检测",
+        )
+
+    def detect_bins(self, bin_names: Optional[Sequence[str]] = None) -> List[PerceptionTarget]:
+        rules = list(BIN_RULES.get(self.scene, []))
+        if bin_names is not None:
+            wanted = set(bin_names)
+            rules = [rule for rule in rules if rule["class_name"] in wanted]
+        return self._detect_with_rules(
+            rules=rules,
+            cameras=["head"],
+            max_targets=None,
+            purpose="目标区",
+        )
+
+    def _default_cameras_for_targets(self) -> List[str]:
+        if self.scene == "scene3":
+            return ["head", "left_wrist", "right_wrist"]
+        return ["head", "left_wrist", "right_wrist"]
+
+    def _detect_with_rules(self, rules: Sequence[Dict[str, Any]], cameras: Sequence[str],
+                           max_targets: Optional[int], purpose: str) -> List[PerceptionTarget]:
+        if not rules or not self._ensure_cv():
+            return []
+
+        targets: List[PerceptionTarget] = []
+        for camera in cameras:
+            state = self.cameras.get(camera)
+            if not state:
+                continue
+            color_msg = state.get("color_msg")
+            info_msg = state.get("info_msg")
+            if color_msg is None or info_msg is None:
+                self.rospy.loginfo_throttle(
+                    1.0,
+                    "[%s][%s] %s 未就绪 color=%s info=%s",
+                    self.scene,
+                    purpose,
+                    camera,
+                    color_msg is not None,
+                    info_msg is not None,
+                )
+                continue
+
+            color = self._decode_color(color_msg)
+            if color is None:
+                continue
+            depth = self._decode_depth(state.get("depth_msg"))
+            targets.extend(self._detect_in_image(camera, color_msg, info_msg, color, depth, rules, purpose))
+
+        targets = self._dedupe_targets(targets)
+        targets.sort(key=lambda t: t.confidence, reverse=True)
+        if max_targets is not None:
+            targets = targets[:int(max_targets)]
+        debug_summary = " ".join(
+            "{}={}".format(rule["class_name"], sum(1 for t in targets if t.class_name == rule["class_name"]))
+            for rule in rules
+        )
+        log_stage(self.scene, purpose, "规则结果 %s", debug_summary or "empty")
+        return targets
+
+    def _decode_color(self, msg: Any) -> Optional[Any]:
+        try:
+            data = self.np.frombuffer(msg.data, dtype=self.np.uint8)
+            return self.cv2.imdecode(data, self.cv2.IMREAD_COLOR)
+        except Exception as exc:
+            log_warn(self.scene, "感知", "RGB 解码失败: %s", exc)
+            return None
+
+    def _decode_depth(self, msg: Any) -> Optional[Any]:
+        if msg is None:
+            return None
+        try:
+            raw_bytes = bytes(msg.data)
+            raw = self.np.frombuffer(raw_bytes, dtype=self.np.uint8)
+            header = None
+            if len(raw_bytes) >= 12:
+                try:
+                    header = struct.unpack("iff", raw_bytes[:12])
+                except struct.error:
+                    header = None
+            offsets = [12, 16, 0]
+            for offset in offsets:
+                if len(raw) <= offset:
+                    continue
+                decoded = self.cv2.imdecode(raw[offset:], self.cv2.IMREAD_UNCHANGED)
+                if decoded is None:
+                    continue
+                depth = decoded.astype(self.np.float32)
+                if offset in (12, 16) and header is not None and int(header[0]) == 0:
+                    depth_quant_a = float(header[1])
+                    depth_quant_b = float(header[2])
+                    valid = depth > 0.0
+                    converted = self.np.zeros_like(depth, dtype=self.np.float32)
+                    converted[valid] = depth_quant_a / (depth[valid] - depth_quant_b)
+                    depth = converted
+                elif decoded.dtype == self.np.uint16 or self.np.nanmax(depth) > 20.0:
+                    depth *= 0.001
+                return depth
+        except Exception as exc:
+            log_warn(self.scene, "感知", "深度解码失败: %s", exc)
+        return None
+
+    def _detect_in_image(self, camera: str, color_msg: Any, info_msg: Any,
+                         color_bgr: Any, depth_m: Optional[Any],
+                         rules: Sequence[Dict[str, Any]], purpose: str) -> List[PerceptionTarget]:
+        hsv = self.cv2.cvtColor(color_bgr, self.cv2.COLOR_BGR2HSV)
+        height, width = color_bgr.shape[:2]
+        found: List[PerceptionTarget] = []
+
+        for rule in rules:
+            mask = self._mask_for_rule(hsv, rule)
+            mask = self._apply_workspace_roi(mask, purpose)
+            contours = self._find_contours(mask)
+            raw_count = len(contours)
+            kept_count = 0
+            for contour in contours:
+                candidate = self._contour_to_target(
+                    camera=camera,
+                    color_msg=color_msg,
+                    info_msg=info_msg,
+                    depth_m=depth_m,
+                    mask=mask,
+                    contour=contour,
+                    rule=rule,
+                    image_width=width,
+                    image_height=height,
+                )
+                if candidate is not None:
+                    kept_count += 1
+                    found.append(candidate)
+            self.rospy.loginfo_throttle(
+                1.0,
+                "[%s][%s] cam=%s class=%s raw_contours=%d kept=%d",
+                self.scene,
+                purpose,
+                camera,
+                rule["class_name"],
+                raw_count,
+                kept_count,
+            )
+        return found
+
+    def _mask_for_rule(self, hsv: Any, rule: Dict[str, Any]) -> Any:
+        mask = self.np.zeros(hsv.shape[:2], dtype=self.np.uint8)
+        for lower, upper in rule.get("hsv_ranges", []):
+            lo = self.np.array(lower, dtype=self.np.uint8)
+            hi = self.np.array(upper, dtype=self.np.uint8)
+            mask = self.cv2.bitwise_or(mask, self.cv2.inRange(hsv, lo, hi))
+        kernel = self.np.ones((5, 5), dtype=self.np.uint8)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, kernel)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel)
+        return mask
+
+    def _apply_workspace_roi(self, mask: Any, purpose: str) -> Any:
+        h, w = mask.shape[:2]
+        roi = self.np.zeros_like(mask)
+        top = int(h * 0.12)
+        bottom = int(h * 0.96)
+        left = int(w * 0.08)
+        right = int(w * 0.92)
+        if self.scene == "scene3" and purpose == "检测":
+            top = int(h * 0.05)
+            bottom = int(h * 0.98)
+        roi[top:bottom, left:right] = 255
+        return self.cv2.bitwise_and(mask, roi)
+
+    def _find_contours(self, mask: Any) -> List[Any]:
+        result = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        contours = result[0] if len(result) == 2 else result[1]
+        return list(contours)
+
+    def _contour_to_target(self, camera: str, color_msg: Any, info_msg: Any,
+                           depth_m: Optional[Any], mask: Any, contour: Any,
+                           rule: Dict[str, Any], image_width: int,
+                           image_height: int) -> Optional[PerceptionTarget]:
+        area = float(self.cv2.contourArea(contour))
+        if area < float(rule.get("min_area_px", 0)) or area > float(rule.get("max_area_px", 1e9)):
+            return None
+        x, y, w, h = self.cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            return None
+        aspect = float(w) / float(h)
+        if aspect < float(rule.get("min_aspect", 0.0)) or aspect > float(rule.get("max_aspect", 999.0)):
+            return None
+        extent = area / float(max(1, w * h))
+        if extent < float(rule.get("min_extent", 0.0)):
+            return None
+
+        moments = self.cv2.moments(contour)
+        if abs(moments["m00"]) > 1e-6:
+            u = int(moments["m10"] / moments["m00"])
+            v = int(moments["m01"] / moments["m00"])
+        else:
+            u = int(x + w * 0.5)
+            v = int(y + h * 0.5)
+
+        depth = self._median_depth_for_contour(depth_m, mask, x, y, w, h)
+        pos_camera = None
+        pos_base = None
+        if depth is not None:
+            pos_camera = self._pixel_to_camera(u, v, depth, info_msg)
+            pos_base = self._transform_camera_to_base(pos_camera, color_msg.header.frame_id, color_msg.header.stamp)
+
+        yaw_rad = self._contour_yaw(contour)
+        confidence = self._confidence(area, image_width, image_height, depth, extent)
+        return PerceptionTarget(
+            class_name=rule["class_name"],
+            confidence=confidence,
+            center_uv=(u, v),
+            position_base=pos_base,
+            position_camera=pos_camera,
+            camera=camera,
+            area_px=area,
+            bbox=(int(x), int(y), int(w), int(h)),
+            yaw_rad=yaw_rad,
+            target_bin=rule.get("target_bin"),
+            timestamp=time.time(),
+            debug={
+                "aspect": aspect,
+                "extent": extent,
+                "depth_m": depth,
+                "image_size": (image_width, image_height),
+                "frame_id": color_msg.header.frame_id,
+            },
+        )
+
+    def _median_depth_for_contour(self, depth_m: Optional[Any], mask: Any,
+                                  x: int, y: int, w: int, h: int) -> Optional[float]:
+        if depth_m is None:
+            return None
+        dh, dw = depth_m.shape[:2]
+        if dh <= 0 or dw <= 0:
+            return None
+        sx = float(dw) / float(mask.shape[1])
+        sy = float(dh) / float(mask.shape[0])
+        dx0 = clamp(int(x * sx), 0, dw - 1)
+        dy0 = clamp(int(y * sy), 0, dh - 1)
+        dx1 = clamp(int((x + w) * sx), 0, dw)
+        dy1 = clamp(int((y + h) * sy), 0, dh)
+        if dx1 <= dx0 or dy1 <= dy0:
+            return None
+
+        roi_depth = depth_m[int(dy0):int(dy1), int(dx0):int(dx1)]
+        roi_mask = mask[y:y + h, x:x + w]
+        if roi_mask.shape[:2] != roi_depth.shape[:2]:
+            roi_mask = self.cv2.resize(roi_mask, (roi_depth.shape[1], roi_depth.shape[0]),
+                                       interpolation=self.cv2.INTER_NEAREST)
+        valid = roi_depth[(roi_mask > 0) & self.np.isfinite(roi_depth) & (roi_depth > 0.05) & (roi_depth < 5.0)]
+        if valid.size < 5:
+            valid = roi_depth[self.np.isfinite(roi_depth) & (roi_depth > 0.05) & (roi_depth < 5.0)]
+        if valid.size < 5:
+            return None
+        return float(self.np.median(valid))
+
+    def _pixel_to_camera(self, u: int, v: int, depth: float, info_msg: Any) -> Tuple[float, float, float]:
+        k = list(info_msg.K)
+        fx = float(k[0]) if abs(float(k[0])) > 1e-6 else 1.0
+        fy = float(k[4]) if abs(float(k[4])) > 1e-6 else fx
+        cx = float(k[2])
+        cy = float(k[5])
+        z = float(depth)
+        x = (float(u) - cx) * z / fx
+        y = (float(v) - cy) * z / fy
+        return (x, y, z)
+
+    def _transform_camera_to_base(self, point_camera: Tuple[float, float, float],
+                                  source_frame: str, stamp: Any) -> Optional[Tuple[float, float, float]]:
+        if not source_frame:
+            return None
+        try:
+            from geometry_msgs.msg import PointStamped
+            import tf2_geometry_msgs  # noqa: F401
+
+            ps = PointStamped()
+            ps.header.frame_id = source_frame
+            ps.header.stamp = stamp
+            ps.point.x, ps.point.y, ps.point.z = point_camera
+            out = self.tf_buffer.transform(ps, self.base_frame, self.rospy.Duration(0.15))
+            return (float(out.point.x), float(out.point.y), float(out.point.z))
+        except Exception as first_exc:
+            try:
+                import tf.transformations as tft
+
+                transform = self.tf_buffer.lookup_transform(
+                    self.base_frame,
+                    source_frame,
+                    self.rospy.Time(0),
+                    self.rospy.Duration(0.15),
+                )
+                tr = transform.transform.translation
+                q = transform.transform.rotation
+                mat = tft.quaternion_matrix([q.x, q.y, q.z, q.w])
+                mat[0, 3] = tr.x
+                mat[1, 3] = tr.y
+                mat[2, 3] = tr.z
+                point = self.np.array([point_camera[0], point_camera[1], point_camera[2], 1.0])
+                out = mat.dot(point)
+                return (float(out[0]), float(out[1]), float(out[2]))
+            except Exception as exc:
+                last_exc = exc
+            self.rospy.logwarn_throttle(
+                1.0,
+                "[%s][TF] %s -> %s 失败: %s / %s",
+                self.scene,
+                source_frame,
+                self.base_frame,
+                first_exc,
+                last_exc,
+            )
+            return None
+
+    def _contour_yaw(self, contour: Any) -> float:
+        rect = self.cv2.minAreaRect(contour)
+        (w, h) = rect[1]
+        angle = float(rect[2])
+        if w < h:
+            angle += 90.0
+        return math.radians(angle)
+
+    def _confidence(self, area: float, width: int, height: int,
+                    depth: Optional[float], extent: float) -> float:
+        area_score = clamp(area / float(width * height) * 80.0, 0.0, 0.55)
+        depth_score = 0.30 if depth is not None else 0.10
+        extent_score = clamp(extent, 0.0, 0.25)
+        return clamp(area_score + depth_score + extent_score, 0.05, 0.99)
+
+    def _dedupe_targets(self, targets: Sequence[PerceptionTarget]) -> List[PerceptionTarget]:
+        kept: List[PerceptionTarget] = []
+        for target in sorted(targets, key=lambda t: t.confidence, reverse=True):
+            duplicate = False
+            for old in kept:
+                if target.class_name != old.class_name:
+                    continue
+                if target.position_base is not None and old.position_base is not None:
+                    if distance3(target.position_base, old.position_base) < 0.055:
+                        duplicate = True
+                        break
+                elif target.camera == old.camera and target.center_uv and old.center_uv:
+                    du = target.center_uv[0] - old.center_uv[0]
+                    dv = target.center_uv[1] - old.center_uv[1]
+                    if math.sqrt(du * du + dv * dv) < 45.0:
+                        duplicate = True
+                        break
+            if not duplicate:
+                kept.append(target)
+        return kept
+
+
+# ---------------------------------------------------------------------------
+# 导航层
+# ---------------------------------------------------------------------------
+
+
+class Navigation:
+    def __init__(self, robot: RobotBase):
+        self.robot = robot
+        self.scene = robot.scene
+
+    def drive_for(self, linear_x: float = 0.0, linear_y: float = 0.0,
+                  angular_z: float = 0.0, duration: float = 1.0,
+                  label: str = "drive") -> None:
+        log_stage(
+            self.scene,
+            "导航",
+            "%s vx=%.2f vy=%.2f wz=%.2f duration=%.1fs",
+            label,
+            linear_x,
+            linear_y,
+            angular_z,
+            duration,
+        )
+        self.robot.drive_for(linear_x=linear_x, linear_y=linear_y,
+                             angular_z=angular_z, duration=duration)
+
+    def fine_align_to_image_target(self, target: PerceptionTarget) -> None:
+        if not target.center_uv:
+            return
+        image_size = target.debug.get("image_size") if target.debug else None
+        if not image_size:
+            return
+        width = float(image_size[0])
+        error = (float(target.center_uv[0]) - width * 0.5) / max(width * 0.5, 1.0)
+        if abs(error) < 0.10:
+            return
+        angular = -clamp(error * 0.18, -0.12, 0.12)
+        self.drive_for(angular_z=angular, duration=0.35, label="fine_align")
+
+
+# ---------------------------------------------------------------------------
+# 操作/技能层
+# ---------------------------------------------------------------------------
+
+
+class Skills:
+    def __init__(self, scene: str, robot: RobotBase, navigation: Navigation):
+        self.scene = scene
+        self.robot = robot
+        self.navigation = navigation
+
+    def choose_arm(self, target: PerceptionTarget) -> str:
+        if target.position_base is None:
+            return "right"
+        return "left" if float(target.position_base[1]) >= 0.05 else "right"
+
+    def pick(self, target: PerceptionTarget, arm: Optional[str] = None) -> ActionResult:
+        start = time.time()
+        if target.position_base is None:
+            reason = "target has no base_link position"
+            log_warn(self.scene, "抓取", "%s class=%s", reason, target.class_name)
+            return ActionResult(False, "pick", reason, target, time.time() - start)
+
+        arm = arm or self.choose_arm(target)
+        xyz = self._reachable_xyz(target.position_base)
+        yaw = float(target.yaw_rad or 0.0)
+        pre = (xyz[0], xyz[1], xyz[2] + SAFE_PRE_GRASP_DZ_M)
+        grasp = (xyz[0], xyz[1], xyz[2])
+        lift = (xyz[0], xyz[1], xyz[2] + SAFE_LIFT_DZ_M)
+
+        log_stage(
+            self.scene,
+            "抓取",
+            "class=%s arm=%s pre=%s grasp=%s yaw=%.1fdeg",
+            target.class_name,
+            arm,
+            _fmt_xyz(pre),
+            _fmt_xyz(grasp),
+            math.degrees(yaw),
+        )
+        self.navigation.fine_align_to_image_target(target)
+        self.robot.open_claw(arm)
+        self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
+        ik_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
+        self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
+        self.robot.move_hand_ik(arm, lift, yaw_rad=yaw, duration=1.0, label="lift")
+        reason = "" if ik_ok else "IK fallback used"
+        return ActionResult(True, "pick", reason, target, time.time() - start)
+
+    def place(self, arm: str, place_xyz_base: Sequence[float],
+              label: str = "place") -> ActionResult:
+        start = time.time()
+        place = self._reachable_xyz(place_xyz_base)
+        pre = (place[0], place[1], place[2] + SAFE_PLACE_DZ_M)
+        retreat = (place[0], place[1], place[2] + SAFE_LIFT_DZ_M)
+        log_stage(self.scene, "放置", "arm=%s label=%s place=%s", arm, label, _fmt_xyz(place))
+        self.robot.move_hand_ik(arm, pre, duration=1.1, label=label + "_pre")
+        self.robot.move_hand_ik(arm, place, duration=0.9, label=label)
+        self.robot.open_claw(arm)
+        self.robot.move_hand_ik(arm, retreat, duration=0.9, label=label + "_retreat")
+        return ActionResult(True, "place", "", None, time.time() - start)
+
+    def pick_and_place(self, target: PerceptionTarget, place_xyz_base: Sequence[float],
+                       arm: Optional[str] = None, label: str = "pick_place") -> ActionResult:
+        arm = arm or self.choose_arm(target)
+        pick_result = self.pick(target, arm=arm)
+        if not pick_result.ok:
+            return pick_result
+        place_result = self.place(arm, place_xyz_base, label=label)
+        return ActionResult(
+            place_result.ok,
+            "pick_place",
+            place_result.reason,
+            target,
+            pick_result.duration_sec + place_result.duration_sec,
+        )
+
+    def _reachable_xyz(self, xyz: Sequence[float]) -> Tuple[float, float, float]:
+        return (
+            clamp(float(xyz[0]), -0.05, REACH_X_MAX_M),
+            float(xyz[1]),
+            clamp(float(xyz[2]), SAFE_MIN_Z_BASE_M, SAFE_MAX_Z_BASE_M),
+        )
+
+    def _close_percent(self, class_name: str) -> float:
+        if class_name == "smt_tray":
+            return 72.0
+        if class_name == "part_type_c":
+            return 82.0
+        return CLAW_CLOSE_PERCENT
+
+
+# ---------------------------------------------------------------------------
+# 场景任务控制层
+# ---------------------------------------------------------------------------
+
+
+class BaseSceneController:
+    def __init__(self, scene: str, robot: RobotBase, perception: RuleBasedPerception,
+                 navigation: Navigation, skills: Skills):
+        self.scene = scene
+        self.robot = robot
+        self.perception = perception
+        self.navigation = navigation
+        self.skills = skills
+
+    def run(self) -> ActionResult:
+        raise NotImplementedError
+
+    def wait_for_perception(self) -> bool:
+        log_stage(self.scene, "等待传感器", "等待相机与 TF")
+        return self.perception.wait_ready(timeout_sec=TARGET_WAIT_SEC)
+
+    def detect_targets(self, class_names: Optional[Sequence[str]] = None,
+                       max_targets: Optional[int] = None) -> List[PerceptionTarget]:
+        targets = self.perception.detect_targets(class_names=class_names, max_targets=max_targets)
+        targets = [target for target in targets if self._target_is_usable(target)]
+        log_target_list(self.scene, "检测", targets)
+        return targets
+
+    def resolve_place(self, name: str) -> Tuple[float, float, float]:
+        detected = self.perception.detect_bins(bin_names=[name])
+        detected = [item for item in detected if item.position_base is not None]
+        if detected:
+            best = sorted(detected, key=lambda item: item.confidence, reverse=True)[0]
+            xyz = best.position_base
+            assert xyz is not None
+            place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
+            log_stage(self.scene, "目标区", "%s 使用规则检测位置 %s", name, _fmt_xyz(place))
+            return place
+
+        place = PLACE_TARGETS_BASE[self.scene][name]
+        log_warn(self.scene, "目标区", "%s 未检测到，使用公开几何兜底 %s", name, _fmt_xyz(place))
+        return place
+
+    def make_target_at(self, class_name: str, xyz_base: Sequence[float],
+                       target_bin: Optional[str] = None) -> PerceptionTarget:
+        return PerceptionTarget(
+            class_name=class_name,
+            confidence=0.15,
+            center_uv=None,
+            position_base=(float(xyz_base[0]), float(xyz_base[1]), float(xyz_base[2])),
+            position_camera=None,
+            camera="fallback",
+            area_px=0.0,
+            target_bin=target_bin,
+            timestamp=time.time(),
+            debug={"source": "nominal_place_regrasp"},
+        )
+
+    def _target_is_usable(self, target: PerceptionTarget) -> bool:
+        if target.position_base is None:
+            return False
+        x, _y, z = target.position_base
+        if not (-0.20 <= x <= 1.10):
+            return False
+        if not (-0.25 <= z <= 0.90):
+            return False
+        return True
+
+
+class Scene1Controller(BaseSceneController):
+    def run(self) -> ActionResult:
+        start = time.time()
+        self.wait_for_perception()
+        weigh_xyz = self.resolve_place("weighing_area")
+        drop_xyz = self.resolve_place("drop_box")
+
+        targets = self.detect_targets(class_names=["parcel"], max_targets=SCENE_TARGET_LIMIT["scene1"])
+        if not targets:
+            reason = "no parcel detected"
+            log_error(self.scene, "失败", reason)
+            return ActionResult(False, "scene1", reason, duration_sec=time.time() - start)
+
+        targets.sort(key=lambda t: (t.position_base[1], t.position_base[0]) if t.position_base else (0.0, 0.0))
+        for index, parcel in enumerate(targets, start=1):
+            log_stage(self.scene, "流程", "快递 #%02d 抓取 -> 称重 -> 入箱", index)
+            arm = self.skills.choose_arm(parcel)
+            result = self.skills.pick_and_place(parcel, weigh_xyz, arm=arm, label="parcel{}_to_weigh".format(index))
+            if not result.ok:
+                log_warn(self.scene, "失败", "快递 #%02d 称重放置失败: %s", index, result.reason)
+                continue
+            self.robot.rospy.sleep(0.7)
+            regrasp_xyz = (weigh_xyz[0], weigh_xyz[1], weigh_xyz[2] - 0.04)
+            weighed = self.make_target_at("parcel", regrasp_xyz, target_bin="drop_box")
+            result = self.skills.pick_and_place(weighed, drop_xyz, arm=arm, label="parcel{}_to_box".format(index))
+            if not result.ok:
+                log_warn(self.scene, "失败", "快递 #%02d 入箱失败: %s", index, result.reason)
+
+        return ActionResult(True, "scene1", "done", duration_sec=time.time() - start)
+
+
+class Scene2Controller(BaseSceneController):
+    PART_TO_BIN = {
+        "part_type_a": "sorting_bin_a",
+        "part_type_b": "sorting_bin_b",
+        "part_type_c": "sorting_bin_c",
+    }
+    CLASS_ORDER = {"part_type_b": 0, "part_type_a": 1, "part_type_c": 2}
+
+    def run(self) -> ActionResult:
+        start = time.time()
+        self.wait_for_perception()
+        bin_places = {name: self.resolve_place(name) for name in ["sorting_bin_a", "sorting_bin_b", "sorting_bin_c"]}
+
+        targets = self.detect_targets(
+            class_names=["part_type_a", "part_type_b", "part_type_c"],
+            max_targets=SCENE_TARGET_LIMIT["scene2"],
+        )
+        if not targets:
+            reason = "no part detected"
+            log_error(self.scene, "失败", reason)
+            return ActionResult(False, "scene2", reason, duration_sec=time.time() - start)
+
+        targets.sort(key=self._part_sort_key)
+        for index, part in enumerate(targets, start=1):
+            bin_name = self.PART_TO_BIN.get(part.class_name)
+            if not bin_name:
+                log_warn(self.scene, "分拣", "未知类别 %s，跳过", part.class_name)
+                continue
+            log_stage(
+                self.scene,
+                "流程",
+                "零件 #%02d class=%s -> %s",
+                index,
+                part.class_name,
+                bin_name,
+            )
+            result = self.skills.pick_and_place(
+                part,
+                bin_places[bin_name],
+                arm=self.skills.choose_arm(part),
+                label="{}_to_{}".format(part.class_name, bin_name),
+            )
+            if not result.ok:
+                log_warn(self.scene, "失败", "零件 #%02d 分拣失败: %s", index, result.reason)
+
+        return ActionResult(True, "scene2", "done", duration_sec=time.time() - start)
+
+    def _part_sort_key(self, target: PerceptionTarget) -> Tuple[int, float, float]:
+        xyz = target.position_base or (0.0, 0.0, 0.0)
+        return (self.CLASS_ORDER.get(target.class_name, 99), abs(float(xyz[1])), float(xyz[0]))
+
+
+class Scene3Controller(BaseSceneController):
+    def run(self) -> ActionResult:
+        start = time.time()
+        self.wait_for_perception()
+        outbound_xyz = self.resolve_place("outbound_box")
+
+        moved_to_rack = False
+        completed = 0
+        max_trays = SCENE_TARGET_LIMIT["scene3"]
+        for index in range(1, max_trays + 1):
+            if not moved_to_rack:
+                self.navigation.drive_for(linear_x=0.16, duration=3.2, label="approach_smt_rack")
+                moved_to_rack = True
+                self.robot.rospy.sleep(0.5)
+
+            targets = self.detect_targets(class_names=["smt_tray"], max_targets=1)
+            if not targets:
+                log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
+                break
+            tray = targets[0]
+            arm = self.skills.choose_arm(tray)
+            log_stage(self.scene, "流程", "料盘 #%02d 出库，arm=%s", index, arm)
+            pick_result = self.skills.pick(tray, arm=arm)
+            if not pick_result.ok:
+                log_warn(self.scene, "失败", "料盘 #%02d 抓取失败: %s", index, pick_result.reason)
+                break
+
+            self.navigation.drive_for(linear_x=-0.16, duration=3.4, label="return_to_outbound_box")
+            moved_to_rack = False
+            self.skills.place(arm, outbound_xyz, label="tray{}_outbound".format(index))
+            completed += 1
+
+        if completed == 0:
+            return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
+        return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
+                            duration_sec=time.time() - start)
+
+
+# ---------------------------------------------------------------------------
+# 系统入口与装配层
+# ---------------------------------------------------------------------------
 
 
 def _load_launcher():
@@ -96,234 +1420,15 @@ def _load_launcher():
     return ChallengeSimLauncher
 
 
-class ChallengeTaskController:
-    def __init__(self, cmd_vel_pub, arm_traj_pub):
-        import rospy
-
-        self.rospy = rospy
-        self.cmd_vel_pub = cmd_vel_pub
-        self.arm_traj_pub = arm_traj_pub
-        self.current_arm_rad = [0.0] * 14
-        rospy.Subscriber("/sensors_data_raw", self._sensors_type(), self._sensor_cb, queue_size=1)
-
-    def _sensors_type(self):
-        from kuavo_msgs.msg import sensorsData
-        return sensorsData
-
-    def _sensor_cb(self, msg):
-        joint_q = list(getattr(getattr(msg, "joint_data", None), "joint_q", []))
-        if len(joint_q) >= 26:
-            self.current_arm_rad = joint_q[12:26]
-
-    def prepare(self):
-        self._set_arm_mode(2)
-        self.open_claw("both")
-        self.move_arm_deg(HOME_ARM_DEG, duration=2.0)
-
-    def finish(self):
-        self.move_arm_deg(HOME_ARM_DEG, duration=1.5)
-        self.stop_base(1.0)
-
-    def _set_arm_mode(self, mode):
-        try:
-            from kuavo_msgs.srv import changeArmCtrlMode
-            self.rospy.wait_for_service("/humanoid_change_arm_ctrl_mode", timeout=3.0)
-            self.rospy.ServiceProxy("/humanoid_change_arm_ctrl_mode", changeArmCtrlMode)(mode)
-        except Exception as exc:
-            self.rospy.logwarn("切换手臂外部控制模式失败，继续尝试直接发手臂轨迹: %s", exc)
-
-    def move_arm_deg(self, positions, duration=1.0):
-        from sensor_msgs.msg import JointState
-
-        msg = JointState()
-        msg.name = list(ARM_JOINT_NAMES)
-        msg.position = [float(v) for v in positions]
-        msg.velocity = [0.0] * 14
-        msg.effort = [0.0] * 14
-        end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
-        rate = self.rospy.Rate(30)
-        while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
-            msg.header.stamp = self.rospy.Time.now()
-            self.arm_traj_pub.publish(msg)
-            rate.sleep()
-
-    def stop_base(self, duration=0.4):
-        from geometry_msgs.msg import Twist
-
-        msg = Twist()
-        end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
-        rate = self.rospy.Rate(20)
-        while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
-            self.cmd_vel_pub.publish(msg)
-            rate.sleep()
-
-    def drive_for(self, linear_x=0.0, linear_y=0.0, angular_z=0.0, duration=1.0):
-        from geometry_msgs.msg import Twist
-
-        msg = Twist()
-        msg.linear.x = float(linear_x)
-        msg.linear.y = float(linear_y)
-        msg.angular.z = float(angular_z)
-        end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
-        rate = self.rospy.Rate(20)
-        while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
-            self.cmd_vel_pub.publish(msg)
-            rate.sleep()
-        self.stop_base(0.5)
-
-    def open_claw(self, arm):
-        self._set_claw(arm, 0)
-        self.rospy.sleep(0.8)
-
-    def close_claw(self, arm):
-        self._set_claw(arm, 78)
-        self.rospy.sleep(1.0)
-
-    def _set_claw(self, arm, position):
-        try:
-            from kuavo_msgs.msg import endEffectorData
-            from kuavo_msgs.srv import controlLejuClaw
-
-            names = ["left_claw", "right_claw"]
-            if arm == "left":
-                positions = [position, 0]
-            elif arm == "right":
-                positions = [0, position]
-            else:
-                positions = [position, position]
-            data = endEffectorData()
-            data.name = names
-            data.position = [float(v) for v in positions]
-            data.velocity = [60.0, 60.0]
-            data.effort = [1.5, 1.5]
-            self.rospy.wait_for_service("/control_robot_leju_claw", timeout=3.0)
-            result = self.rospy.ServiceProxy("/control_robot_leju_claw", controlLejuClaw)(data)
-            if hasattr(result, "success") and not result.success:
-                self.rospy.logwarn("夹爪命令被拒绝: %s", getattr(result, "message", ""))
-        except Exception as exc:
-            self.rospy.logwarn("夹爪控制失败: %s", exc)
-
-    def pick_and_place(self, item, place_xyz, waypoint_xyz=None):
-        name = item["name"]
-        arm = item.get("arm") or ("left" if item["pick"][1] >= 0.0 else "right")
-        pick_xyz = item["pick"]
-        self.rospy.loginfo("执行 %s: 抓取 %s -> 放置 %s", name, pick_xyz, place_xyz)
-        self.open_claw(arm)
-        self._move_hand(arm, self._above(pick_xyz, 0.14), label=name + "_pre_pick")
-        self._move_hand(arm, pick_xyz, label=name + "_pick")
-        self.close_claw(arm)
-        self._move_hand(arm, self._above(pick_xyz, 0.16), label=name + "_lift")
-        if waypoint_xyz is not None:
-            self._move_hand(arm, waypoint_xyz, label=name + "_waypoint")
-        self._move_hand(arm, self._above(place_xyz, 0.12), label=name + "_pre_place")
-        self._move_hand(arm, place_xyz, label=name + "_place")
-        self.open_claw(arm)
-        self._move_hand(arm, self._above(place_xyz, 0.16), label=name + "_retreat")
-
-    def _above(self, xyz, dz):
-        return [float(xyz[0]), float(xyz[1]), float(xyz[2]) + float(dz)]
-
-    def _move_hand(self, arm, target_xyz, label):
-        try:
-            target_deg = self._solve_ik(arm, target_xyz)
-            self.move_arm_deg(target_deg, duration=1.6)
-        except Exception as exc:
-            self.rospy.logwarn("%s IK 失败，使用预置关节兜底: %s", label, exc)
-            self.move_arm_deg(self._fallback_pose(arm, target_xyz), duration=1.2)
-
-    def _solve_ik(self, arm, target_xyz):
-        from kuavo_msgs.msg import ikSolveParam, twoArmHandPoseCmd
-        from kuavo_msgs.srv import fkSrv, twoArmHandPoseCmdSrv
-
-        current = list(self.current_arm_rad)
-        self.rospy.wait_for_service("/ik/fk_srv", timeout=2.0)
-        fk = self.rospy.ServiceProxy("/ik/fk_srv", fkSrv)(current).hand_poses
-        req = twoArmHandPoseCmd()
-        req.use_custom_ik_param = True
-        req.joint_angles_as_q0 = True
-        req.ik_param = ikSolveParam()
-        req.ik_param.major_optimality_tol = 1e-3
-        req.ik_param.major_feasibility_tol = 1e-3
-        req.ik_param.minor_feasibility_tol = 1e-3
-        req.ik_param.major_iterations_limit = 80
-        req.ik_param.oritation_constraint_tol = 1e-2
-        req.ik_param.pos_constraint_tol = 1e-3
-        req.ik_param.pos_cost_weight = 1.0
-        req.ik_param.constraint_mode = 0
-        req.hand_poses.left_pose.joint_angles = current[:7]
-        req.hand_poses.right_pose.joint_angles = current[7:]
-        req.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
-        req.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
-        req.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
-        req.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
-
-        quat = _quat_down(0.0 if arm == "left" else math.pi)
-        if arm == "left":
-            req.hand_poses.left_pose.pos_xyz = list(target_xyz)
-            req.hand_poses.left_pose.quat_xyzw = quat
-        else:
-            req.hand_poses.right_pose.pos_xyz = list(target_xyz)
-            req.hand_poses.right_pose.quat_xyzw = quat
-
-        self.rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=2.0)
-        res = self.rospy.ServiceProxy("/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)(req)
-        if not getattr(res, "success", False):
-            raise RuntimeError(getattr(res, "error_reason", "IK service returned false"))
-        q_arm = list(res.q_arm) if hasattr(res, "q_arm") else []
-        if len(q_arm) < 14:
-            q_arm = list(res.hand_poses.left_pose.joint_angles) + list(res.hand_poses.right_pose.joint_angles)
-        if len(q_arm) < 14:
-            raise RuntimeError("IK response did not contain 14 arm joints")
-        return [math.degrees(float(v)) for v in q_arm[:14]]
-
-    def _fallback_pose(self, arm, target_xyz):
-        pose = list(HOME_ARM_DEG)
-        y = float(target_xyz[1])
-        z = float(target_xyz[2])
-        reach = max(-45.0, min(35.0, (0.95 - z) * 140.0))
-        side = max(-35.0, min(35.0, y * 70.0))
-        if arm == "left":
-            pose[:7] = [30 + reach, 20 - side, 0, -65, 0, -20, 0]
-        else:
-            pose[7:] = [30 + reach, -20 - side, 0, -65, 0, -20, 0]
-        return pose
-
-
-def execute_scene_task(scene, controller):
+def build_controller(scene: str, robot: RobotBase, perception: RuleBasedPerception,
+                     navigation: Navigation, skills: Skills) -> BaseSceneController:
     if scene == "scene1":
-        cfg = SCENE_TASKS["scene1"]
-        for item in cfg["objects"]:
-            controller.pick_and_place(item, cfg["weigh"])
-            controller.rospy.sleep(1.0)
-            weighed = dict(item)
-            weighed["pick"] = list(cfg["weigh"])
-            controller.pick_and_place(weighed, cfg["drop"])
-        return
-
+        return Scene1Controller(scene, robot, perception, navigation, skills)
     if scene == "scene2":
-        cfg = SCENE_TASKS["scene2"]
-        for item in cfg["objects"]:
-            controller.pick_and_place(item, cfg["bins"][item["type"]])
-        return
-
+        return Scene2Controller(scene, robot, perception, navigation, skills)
     if scene == "scene3":
-        cfg = SCENE_TASKS["scene3"]
-        for item in cfg["objects"]:
-            arm = item["arm"]
-            pick_xyz = item["pick"]
-            controller.drive_for(linear_x=0.18, duration=4.5)
-            controller.open_claw(arm)
-            controller._move_hand(arm, controller._above(pick_xyz, 0.12), label=item["name"] + "_pre_pick")
-            controller._move_hand(arm, pick_xyz, label=item["name"] + "_pick")
-            controller.close_claw(arm)
-            controller._move_hand(arm, controller._above(pick_xyz, 0.18), label=item["name"] + "_lift")
-            controller.drive_for(linear_x=-0.18, duration=7.0)
-            controller._move_hand(arm, controller._above(cfg["outbound"], 0.12), label=item["name"] + "_pre_place")
-            controller._move_hand(arm, cfg["outbound"], label=item["name"] + "_place")
-            controller.open_claw(arm)
-            controller._move_hand(arm, controller._above(cfg["outbound"], 0.18), label=item["name"] + "_retreat")
-            controller.drive_for(linear_x=0.18, duration=2.5)
-        return
+        return Scene3Controller(scene, robot, perception, navigation, skills)
+    raise ValueError("unknown scene: {}".format(scene))
 
 
 def run_scene(scene, seed, node_name=None, timeout=120,
@@ -354,12 +1459,25 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     rospy.sleep(1.0)
     rospy.loginfo("场景实例已初始化。")
 
-    controller = ChallengeTaskController(cmd_vel_pub, arm_traj_pub)
-    controller.prepare()
-    execute_scene_task(scene, controller)
-    controller.finish()
+    robot = RobotBase(cmd_vel_pub=cmd_vel_pub, arm_traj_pub=arm_traj_pub, scene=scene)
+    perception = RuleBasedPerception(scene=scene, base_frame=BASE_FRAME)
+    navigation = Navigation(robot)
+    skills = Skills(scene=scene, robot=robot, navigation=navigation)
+    controller = build_controller(scene, robot, perception, navigation, skills)
 
-    rospy.spin()
+    result = ActionResult(False, "run_scene", "not started")
+    try:
+        robot.prepare()
+        result = controller.run()
+        if result.ok:
+            rospy.loginfo("[%s][完成] %s duration=%.1fs", scene, result.reason, result.duration_sec)
+        else:
+            rospy.logwarn("[%s][未完成] stage=%s reason=%s duration=%.1fs",
+                          scene, result.stage, result.reason, result.duration_sec)
+    finally:
+        robot.finish()
+        rospy.sleep(0.3)
+    return result
 
 
 def main():
