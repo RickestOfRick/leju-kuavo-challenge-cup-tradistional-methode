@@ -65,6 +65,19 @@ IK_MODE_POS_HARD_ORI_SOFT = 0x02
 TRANSIT_CLEARANCE_Z = 0.34
 OBJECT_CLEARANCE_MARGIN = 0.18
 OBSTACLE_XY_RADIUS = 0.16
+MANIPULATION_Z_DEFAULTS = {
+    "parcel": -0.035,
+    "tray": -0.035,
+    "part_a": -0.035,
+    "part_b": -0.035,
+    "part_c": -0.035,
+    "drop_box": 0.02,
+    "out_box": 0.02,
+    "bin_a": 0.02,
+    "bin_b": 0.02,
+    "bin_c": 0.02,
+    "weighing_area": -0.045,
+}
 
 
 def _log_action(rospy, action):
@@ -809,14 +822,10 @@ class RobotControl:
         right_pose = req.hand_poses.right_pose
         q0_rad = [math.radians(value) for value in self.last_arm_deg]
         fk_poses = self._current_fk_poses(q0_rad)
-        if fk_poses is not None:
-            self._copy_pose(left_pose, fk_poses.left_pose, q0_rad[:7])
-            self._copy_pose(right_pose, fk_poses.right_pose, q0_rad[7:14])
-        else:
-            self._fill_pose(left_pose, *HAND_WORKSPACES["left"]["park"],
-                            yaw=yaw, joint_angles=q0_rad[:7])
-            self._fill_pose(right_pose, *HAND_WORKSPACES["right"]["park"],
-                            yaw=yaw, joint_angles=q0_rad[7:14])
+        self._set_passive_pose(left_pose, fk_poses.left_pose if fk_poses else None,
+                               "left", q0_rad[:7], yaw)
+        self._set_passive_pose(right_pose, fk_poses.right_pose if fk_poses else None,
+                               "right", q0_rad[7:14], yaw)
         if side == "left":
             self._fill_pose(left_pose, safe_x, safe_y, safe_z, yaw,
                             joint_angles=q0_rad[:7])
@@ -863,6 +872,30 @@ class RobotControl:
                 2.0, "%sFK求解失败，使用默认双手停放位姿", LOG_PREFIX)
             return None
         return res.hand_poses
+
+    def _set_passive_pose(self, pose, fk_pose, side, joint_angles, yaw):
+        if fk_pose is not None and self._pose_in_workspace(side, fk_pose.pos_xyz):
+            self._copy_pose(pose, fk_pose, joint_angles)
+            return
+        if fk_pose is not None:
+            self.rospy.logwarn_throttle(
+                2.0,
+                "%s%s非操作手当前FK位姿超出IK工作空间 pos=[%.3f, %.3f, %.3f]，改用安全停放位姿",
+                LOG_PREFIX,
+                "左" if side == "left" else "右",
+                float(fk_pose.pos_xyz[0]), float(fk_pose.pos_xyz[1]), float(fk_pose.pos_xyz[2]))
+        self._fill_pose(pose, *HAND_WORKSPACES[side]["park"],
+                        yaw=yaw, joint_angles=joint_angles)
+
+    @staticmethod
+    def _pose_in_workspace(side, pos_xyz):
+        workspace = HAND_WORKSPACES[side]
+        x, y, z = [float(value) for value in pos_xyz]
+        return (
+            workspace["x"][0] <= x <= workspace["x"][1]
+            and workspace["y"][0] <= y <= workspace["y"][1]
+            and workspace["z"][0] <= z <= workspace["z"][1]
+        )
 
     def _default_ik_param(self):
         params = self.kuavo_msgs.ikSolveParam()
@@ -944,7 +977,6 @@ class TaskExecutor:
                     attempt_target = refined
                 else:
                     self.rospy.loginfo("%s腕部复核不可用，使用头部相机估计", LOG_PREFIX)
-                    _log_failure(self.rospy, refine_action)
 
                 if self._run_pick_place_attempt(attempt_target, place, side):
                     return True
@@ -958,6 +990,8 @@ class TaskExecutor:
     def _run_pick_place_attempt(self, target, place, side):
         target = self._estimate_in_current_base(target)
         place = self._estimate_in_current_base(place)
+        target = self._normalize_manipulation_estimate(target, side, "抓取")
+        place = self._normalize_manipulation_estimate(place, side, "放置")
         action = "抓取{}并放置到{}".format(target.kind, place.kind)
         grasp_z = self._safe_z(target.z + 0.035)
         pre_z = self._safe_z(max(grasp_z + 0.18, self._clearance_z_near(target, [target])))
@@ -1118,6 +1152,25 @@ class TaskExecutor:
     def _estimate_in_current_base(self, estimate):
         adjusted = replace(estimate)
         adjusted.x = float(adjusted.x) - self.base_forward_offset
+        return adjusted
+
+    def _normalize_manipulation_estimate(self, estimate, side, purpose):
+        adjusted = replace(estimate)
+        raw_z = float(adjusted.z)
+        if raw_z < -0.30 or raw_z > 0.70:
+            adjusted.z = MANIPULATION_Z_DEFAULTS.get(adjusted.kind, -0.035)
+            self.rospy.logwarn(
+                "%s%s目标 %s 的高度 %.3f 超出IK本地范围，按可操作高度 %.3f 处理",
+                LOG_PREFIX, purpose, adjusted.kind, raw_z, adjusted.z)
+        if purpose == "放置":
+            workspace = HAND_WORKSPACES[side]
+            raw_y = float(adjusted.y)
+            adjusted.y = max(workspace["y"][0], min(workspace["y"][1], raw_y))
+            if abs(adjusted.y - raw_y) > 1e-6:
+                self.rospy.logwarn(
+                    "%s放置目标 %s 横向 %.3f 超出%s手可达范围，放到可达边缘 %.3f",
+                    LOG_PREFIX, adjusted.kind, raw_y,
+                    "左" if side == "left" else "右", adjusted.y)
         return adjusted
 
     def _choose_side(self, target, place=None):
