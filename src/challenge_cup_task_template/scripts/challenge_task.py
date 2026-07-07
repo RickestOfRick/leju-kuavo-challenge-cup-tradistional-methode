@@ -2521,7 +2521,7 @@ def main():
                         help="场景一识别后端：auto/yolo 均使用 YOLO，不再支持规则识别")
     parser.add_argument("--yolo-model", default=None,
                         help="YOLO .pt 模型路径；未指定时按 scene 选择默认权重")
-    parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0"], default="auto",
+    parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0", "cuda:1"], default="auto",
                         help="YOLO 推理设备；auto 由 ultralytics 自动选择")
     parser.add_argument("--yolo-conf", type=float, default=SCENE1_YOLO_DEFAULT_CONF,
                         help="YOLO 检测置信度阈值")
