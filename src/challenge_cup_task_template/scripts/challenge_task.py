@@ -128,8 +128,17 @@ SCENE3_WRIST_OBSERVE_DZ_M = 0.20
 SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
+# 场景三不考速度，料盘抓取留出更长稳定时间，避免夹爪/手臂半程动作被重试打断。
+SCENE3_CLAW_OPEN_SETTLE_SEC = 0.80
+SCENE3_PRE_GRASP_DURATION_SEC = 2.40
+SCENE3_GRASP_DURATION_SEC = 2.20
+SCENE3_GRASP_DWELL_SEC = 0.60
+SCENE3_CLAW_CLOSE_SETTLE_SEC = 1.60
+SCENE3_POST_CLOSE_SETTLE_SEC = 0.80
+SCENE3_LIFT_DURATION_SEC = 2.00
+SCENE3_LIFT_SETTLE_SEC = 0.50
 SCENE3_PICK_RETRY = 10
-SCENE3_PICK_RETRY_SETTLE_SEC = 0.25
+SCENE3_PICK_RETRY_SETTLE_SEC = 1.20
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
 
@@ -624,6 +633,25 @@ class RobotBase:
             self.arm_traj_pub.publish(msg)
             rate.sleep()
         self.last_arm_deg = target
+
+    def hold_arm(self, duration: float, label: str = "hold") -> None:
+        from sensor_msgs.msg import JointState
+
+        if duration <= 0.0:
+            return
+        self.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL)
+        target = list(self.last_arm_deg)
+        msg = JointState()
+        msg.name = list(ARM_JOINT_NAMES)
+        msg.velocity = [0.0] * 14
+        msg.effort = [0.0] * 14
+        msg.position = target
+        end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
+        rate = self.rospy.Rate(ARM_TRAJ_HZ)
+        while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
+            msg.header.stamp = self.rospy.Time.now()
+            self.arm_traj_pub.publish(msg)
+            rate.sleep()
 
     def send_single_arm_deg(self, arm: str, active_deg: Sequence[float],
                             duration: float = 1.0) -> None:
@@ -2026,6 +2054,10 @@ class Skills:
         pre = (xyz[0], xyz[1], xyz[2] + SAFE_PRE_GRASP_DZ_M)
         grasp = (xyz[0], xyz[1], xyz[2])
         lift = (xyz[0], xyz[1], xyz[2] + SAFE_LIFT_DZ_M)
+        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        pre_duration = SCENE3_PRE_GRASP_DURATION_SEC if scene3_tray else 1.2
+        grasp_duration = SCENE3_GRASP_DURATION_SEC if scene3_tray else 1.0
+        lift_duration = SCENE3_LIFT_DURATION_SEC if scene3_tray else 1.0
 
         log_stage(
             self.scene,
@@ -2037,16 +2069,40 @@ class Skills:
             _fmt_xyz(grasp),
             math.degrees(yaw),
         )
+        if scene3_tray:
+            log_stage(
+                self.scene,
+                "抓取",
+                "场景三保守时序: pre=%.1fs grasp=%.1fs dwell=%.1fs close=%.1fs post=%.1fs lift=%.1fs",
+                pre_duration,
+                grasp_duration,
+                SCENE3_GRASP_DWELL_SEC,
+                SCENE3_CLAW_CLOSE_SETTLE_SEC,
+                SCENE3_POST_CLOSE_SETTLE_SEC,
+                lift_duration,
+            )
         self.navigation.fine_align_to_image_target(target)
-        self.robot.open_claw(arm)
-        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
-        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
-        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        if scene3_tray:
+            self.robot.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=SCENE3_CLAW_OPEN_SETTLE_SEC)
+        else:
+            self.robot.open_claw(arm)
+        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=pre_duration, label="pre_grasp")
+        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=grasp_duration, label="grasp")
         if not grasp_ok:
             reason = "grasp IK failed"
             log_warn(self.scene, "抓取", "%s，不闭爪，重新检测后再试", reason)
             return ActionResult(False, "pick", reason, target, time.time() - start)
-        self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
+        if scene3_tray:
+            self.robot.hold_arm(SCENE3_GRASP_DWELL_SEC, label="tray_grasp_dwell")
+            self.robot.set_claw(
+                arm,
+                self._close_percent(target.class_name),
+                settle_sec=0.0,
+            )
+            self.robot.hold_arm(SCENE3_CLAW_CLOSE_SETTLE_SEC, label="tray_claw_close")
+            self.robot.hold_arm(SCENE3_POST_CLOSE_SETTLE_SEC, label="tray_post_close")
+        else:
+            self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
         lift_targets = [lift]
         if scene3_tray:
             lift_targets = [
@@ -2071,10 +2127,12 @@ class Skills:
                 arm,
                 lift_target,
                 yaw_rad=yaw,
-                duration=1.0,
+                duration=lift_duration,
                 label="lift#{}".format(lift_attempt),
             )
             if lift_ok:
+                if scene3_tray:
+                    self.robot.hold_arm(SCENE3_LIFT_SETTLE_SEC, label="tray_lift_settle")
                 break
         if scene3_tray and not lift_ok:
             reason = "lift IK failed"
