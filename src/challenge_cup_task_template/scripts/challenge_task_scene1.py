@@ -370,7 +370,7 @@ class Hardware(object):
         self._srv_cache = {}
         self._arm_mode = None
         self._claw_cmd = {"left": CLAW_OPEN, "right": CLAW_OPEN}
-        self.locked_left_pose = None
+        self.locked_left_joints = None
 
     def _service(self, name, srv_type, timeout=2.0):
         proxy = self._srv_cache.get(name)
@@ -526,13 +526,8 @@ class Hardware(object):
         cmd.hand_poses.right_pose.joint_angles = cur[7:14]
         cmd.hand_poses.left_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
         cmd.hand_poses.right_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
-        if side == "right" and self.locked_left_pose is not None:
-            left_pos, left_quat = self.locked_left_pose
-            cmd.hand_poses.left_pose.pos_xyz = list(left_pos)
-            cmd.hand_poses.left_pose.quat_xyzw = list(left_quat)
-        else:
-            cmd.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
-            cmd.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
+        cmd.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
+        cmd.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
         cmd.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
         cmd.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
         target = cmd.hand_poses.left_pose if side == "left" else cmd.hand_poses.right_pose
@@ -548,11 +543,14 @@ class Hardware(object):
             return None
         lj = list(res.hand_poses.left_pose.joint_angles)
         rj = list(res.hand_poses.right_pose.joint_angles)
+        left_hold = self.locked_left_joints if (
+            side == "right" and self.locked_left_joints is not None
+        ) else cur[0:7]
         if len(lj) == 7 and len(rj) == 7:
-            return (lj + cur[7:14]) if side == "left" else (cur[0:7] + rj)
+            return (lj + cur[7:14]) if side == "left" else (list(left_hold) + rj)
         if len(res.q_arm) >= 14:
             solved = list(res.q_arm[:14])
-            return (solved[0:7] + cur[7:14]) if side == "left" else (cur[0:7] + solved[7:14])
+            return (solved[0:7] + cur[7:14]) if side == "left" else (list(left_hold) + solved[7:14])
         self.rospy.logwarn("IK 返回未含 14 关节")
         return None
 
@@ -614,9 +612,8 @@ class Hardware(object):
         self.interp_publish(start_deg, target_deg, move_time=move_time)
         return True
 
-    def lock_left_pose(self, pos_ik, first_ypr, second_ypr=None):
-        self.locked_left_pose = (tuple(float(v) for v in pos_ik),
-                                 tuple(quat_from_ypr(first_ypr, second_ypr)))
+    def lock_current_left_joints(self):
+        self.locked_left_joints = list(self.current_arm_rad()[0:7])
 
     def gripper(self, close, side="both", vel=50.0, effort=1.0):
         if self.claw_srv is None:
@@ -816,12 +813,8 @@ class Manipulation(object):
                 max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
             self.rospy.logwarn("prepare_left_box_station: 左手箱上方固定站位失败")
             return False
-        self.hw.lock_left_pose(
-            LEFT_BOX_STATION_IK,
-            LEFT_BOX_STATION_FIRST_YPR_DEG,
-            LEFT_BOX_STATION_SECOND_YPR_DEG,
-        )
-        self.rospy.loginfo("左手已固定在箱子上方，后续只开合夹爪")
+        self.hw.lock_current_left_joints()
+        self.rospy.loginfo("左手已固定在箱子上方关节位，后续右手动作保持左臂关节不变")
         return True
 
     def scan_locate_all(self, color_names):
@@ -892,6 +885,10 @@ class Manipulation(object):
             return False
         wx, wy, wz = WEIGH_RELEASE_IK
         first, second = WEIGH_RELEASE_FIRST_YPR_DEG, WEIGH_RELEASE_SECOND_YPR_DEG
+        self.rospy.loginfo(
+            "place_weigh: 右手移动到桌面称重区 transit=(%.3f, %.3f, %.3f) release=(%.3f, %.3f, %.3f)",
+            wx, wy, WEIGH_TRANSIT_IK_Z, wx, wy, wz,
+        )
         if not self.hw.move_eef_to(side, (wx, wy, WEIGH_TRANSIT_IK_Z), first, second):
             self.rospy.logwarn("place_weigh: 移到称重上方 IK 无解")
             return False
@@ -908,6 +905,10 @@ class Manipulation(object):
             return False
         rx, ry, rz = WEIGH_REGRASP_IK
         first, second = WEIGH_REGRASP_FIRST_YPR_DEG, WEIGH_REGRASP_SECOND_YPR_DEG
+        self.rospy.loginfo(
+            "regrasp: 右手从称重区二次夹取 approach=(%.3f, %.3f, %.3f) grasp=(%.3f, %.3f, %.3f)",
+            rx, ry, WEIGH_RELEASE_IK[2], rx, ry, rz,
+        )
         self.hw.move_eef_to(side, (rx, ry, WEIGH_RELEASE_IK[2]), first, second)
         if not self.hw.move_eef_to(side, (rx, ry, rz), first, second):
             self.rospy.logwarn("regrasp: 下降到二次夹起点 IK 无解")
@@ -923,6 +924,10 @@ class Manipulation(object):
         self.hw.gripper(close=False, side="left")
         r_first, r_second = RIGHT_HANDOFF_TO_LEFT_FIRST_YPR_DEG, RIGHT_HANDOFF_TO_LEFT_SECOND_YPR_DEG
         hx, hy, hz = RIGHT_BOX_HANDOFF_IK
+        self.rospy.loginfo(
+            "handoff: 称重完成后右手送到固定左手附近 transit=(%.3f, %.3f, %.3f) handoff=(%.3f, %.3f, %.3f)",
+            hx, hy, RIGHT_BOX_HANDOFF_TRANSIT_IK_Z, hx, hy, hz,
+        )
         self.hw.move_eef_to("right", (hx, hy, RIGHT_BOX_HANDOFF_TRANSIT_IK_Z), r_first, r_second)
         if not self.hw.move_eef_to("right", (hx, hy, hz), r_first, r_second):
             self.rospy.logwarn("handoff: 右手到交接点 IK 无解")
@@ -974,12 +979,15 @@ def run_scene1(rospy, manip):
             if not picked:
                 rospy.logwarn("[scene1] %s 抓取失败，保留到下一轮重扫", color)
                 continue
+            rospy.loginfo("[scene1] %s 已抓取，开始移动到桌面称重区", color)
             if not manip.place_weigh(side="right"):
                 rospy.logwarn("[scene1] %s 称重放置失败，保留到下一轮重扫", color)
                 continue
+            rospy.loginfo("[scene1] %s 已放到称重区，开始二次夹取", color)
             if not manip.regrasp(side="right"):
                 rospy.logwarn("[scene1] %s 二次夹起失败，保留到下一轮重扫", color)
                 continue
+            rospy.loginfo("[scene1] %s 称重区二次夹起完成，开始交接给固定左手", color)
             if not manip.handoff_to_left():
                 rospy.logwarn("[scene1] %s 交接失败，保留到下一轮重扫", color)
                 continue
