@@ -1087,6 +1087,7 @@ class RuleBasedPerception:
         if msg is None:
             return None
         try:
+            format_text = str(getattr(msg, "format", "") or "")
             raw_bytes = bytes(msg.data)
             raw = self.np.frombuffer(raw_bytes, dtype=self.np.uint8)
             header = None
@@ -1103,14 +1104,19 @@ class RuleBasedPerception:
                 if decoded is None:
                     continue
                 depth = decoded.astype(self.np.float32)
-                if offset in (12, 16) and header is not None and int(header[0]) == 0:
+                if "16UC1" in format_text or decoded.dtype == self.np.uint16:
+                    depth *= 0.001
+                elif (offset in (12, 16)
+                        and header is not None
+                        and int(header[0]) == 0
+                        and abs(float(header[1])) > 1e-6):
                     depth_quant_a = float(header[1])
                     depth_quant_b = float(header[2])
                     valid = depth > 0.0
                     converted = self.np.zeros_like(depth, dtype=self.np.float32)
                     converted[valid] = depth_quant_a / (depth[valid] - depth_quant_b)
                     depth = converted
-                elif decoded.dtype == self.np.uint16 or self.np.nanmax(depth) > 20.0:
+                elif self.np.nanmax(depth) > 20.0:
                     depth *= 0.001
                 return depth
         except Exception as exc:
