@@ -79,6 +79,12 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "plastic tray": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
+SCENE3_APPROACH_TARGET_X_M = 0.72
+SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
+SCENE3_APPROACH_SPEED_MPS = 0.16
+SCENE3_APPROACH_MIN_DURATION_SEC = 1.0
+SCENE3_APPROACH_MAX_DURATION_SEC = 5.0
+SCENE3_APPROACH_RETRY = 4
 
 ARM_JOINT_NAMES = [
     "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
@@ -133,7 +139,7 @@ TARGET_BOUNDS_BASE = {
     },
     "scene3": {
         "x_min": -0.20,
-        "x_max": 1.20,
+        "x_max": 0.95,
         "z_min": -0.25,
         "z_max": 1.35,
     },
@@ -465,6 +471,7 @@ class RobotBase:
         self.last_arm_deg = list(HOME_ARM_DEG)
         self.claw_state = None
         self._sensor_seen = False
+        self._arm_mode: Optional[int] = None
 
         rospy.Subscriber("/sensors_data_raw", sensorsData, self._sensor_cb, queue_size=1)
         rospy.Subscriber("/leju_claw_state", lejuClawState, self._claw_state_cb, queue_size=1)
@@ -495,8 +502,13 @@ class RobotBase:
         return [math.degrees(float(v)) for v in self.current_arm_rad]
 
     def prepare(self) -> None:
-        log_stage(self.scene, "初始化", "切换手臂外部控制、打开夹爪、进入工作预备姿态")
+        log_stage(self.scene, "初始化", "等待传感器、打开夹爪、准备任务姿态")
         self.wait_for_joint_state(timeout_sec=3.0)
+        if self.scene == "scene3":
+            self.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
+            self.open_claw("both")
+            log_stage(self.scene, "初始化", "场景三导航阶段保持自动摆臂，抓取前再切换外部控制")
+            return
         self.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL)
         self.open_claw("both")
         self.move_arm_deg(SIDE_LIFT_ARM_DEG, duration=1.3)
@@ -513,6 +525,8 @@ class RobotBase:
     def set_arm_mode(self, mode: int, warn_only: bool = True) -> bool:
         from kuavo_msgs.srv import changeArmCtrlMode, changeArmCtrlModeRequest
 
+        if self._arm_mode == int(mode):
+            return True
         service_names = ["/arm_traj_change_mode", "/humanoid_change_arm_ctrl_mode"]
         for service_name in service_names:
             try:
@@ -523,6 +537,7 @@ class RobotBase:
                 res = proxy(req)
                 if hasattr(res, "result") and not res.result:
                     raise RuntimeError(getattr(res, "message", "service returned false"))
+                self._arm_mode = int(mode)
                 log_stage(self.scene, "手臂模式", "%s -> mode=%d", service_name, mode)
                 return True
             except Exception as exc:
@@ -536,6 +551,7 @@ class RobotBase:
     def move_arm_deg(self, target_deg: Sequence[float], duration: float = 1.0) -> None:
         from sensor_msgs.msg import JointState
 
+        self.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL)
         target = [float(v) for v in target_deg]
         if len(target) != 14:
             raise ValueError("arm target expects 14 joints, got {}".format(len(target)))
@@ -588,15 +604,26 @@ class RobotBase:
     def drive_for(self, linear_x: float = 0.0, linear_y: float = 0.0,
                   angular_z: float = 0.0, duration: float = 1.0) -> None:
         from geometry_msgs.msg import Twist
+        from sensor_msgs.msg import JointState
 
         msg = Twist()
         msg.linear.x = float(linear_x)
         msg.linear.y = float(linear_y)
         msg.angular.z = float(angular_z)
+        arm_hold_msg = None
+        if self._arm_mode == ARM_MODE_EXTERNAL_CONTROL:
+            arm_hold_msg = JointState()
+            arm_hold_msg.name = list(ARM_JOINT_NAMES)
+            arm_hold_msg.velocity = [0.0] * 14
+            arm_hold_msg.effort = [0.0] * 14
+            arm_hold_msg.position = list(self.last_arm_deg)
         end = self.rospy.Time.now() + self.rospy.Duration(float(duration))
         rate = self.rospy.Rate(20)
         while not self.rospy.is_shutdown() and self.rospy.Time.now() < end:
             self.cmd_vel_pub.publish(msg)
+            if arm_hold_msg is not None:
+                arm_hold_msg.header.stamp = self.rospy.Time.now()
+                self.arm_traj_pub.publish(arm_hold_msg)
             rate.sleep()
         self.stop_base(duration=0.25)
 
@@ -2334,16 +2361,12 @@ class Scene3Controller(BaseSceneController):
                 moved_to_rack = True
                 self.robot.rospy.sleep(0.5)
 
-            targets = self.detect_targets(class_names=["smt_tray"], max_targets=None)
+            targets = self.detect_reachable_trays(completed_shelves)
             if not targets:
                 log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
                 break
             targets.sort(key=self._tray_sort_key)
-            candidates = [target for target in targets if self._tray_shelf(target) not in completed_shelves]
-            if not candidates:
-                log_warn(self.scene, "检测", "剩余候选均来自已完成层级，结束出库循环")
-                break
-            tray = candidates[0]
+            tray = targets[0]
             shelf = self._tray_shelf(tray)
             arm = self.skills.choose_arm(tray)
             log_stage(
@@ -2370,6 +2393,64 @@ class Scene3Controller(BaseSceneController):
             return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
+
+    def detect_reachable_trays(self, completed_shelves: set) -> List[PerceptionTarget]:
+        for attempt in range(1, SCENE3_APPROACH_RETRY + 1):
+            raw_targets = self.perception.detect_targets(class_names=["smt_tray"], max_targets=None)
+            raw_targets = [
+                target for target in raw_targets
+                if self._tray_shelf(target) not in completed_shelves
+            ]
+            log_target_list(self.scene, "检测", raw_targets)
+
+            reachable: List[PerceptionTarget] = []
+            rejected: List[Tuple[PerceptionTarget, str]] = []
+            far_targets: List[PerceptionTarget] = []
+            for target in raw_targets:
+                reason = self._target_reject_reason(target)
+                if reason is None:
+                    reachable.append(target)
+                    continue
+                rejected.append((target, reason))
+                if self._target_is_far_but_approachable(target, reason):
+                    far_targets.append(target)
+
+            self._log_rejected_targets(rejected)
+            if reachable:
+                return reachable
+            if not far_targets:
+                return []
+
+            far_targets.sort(key=lambda item: float(item.position_base[0]) if item.position_base else 99.0)
+            target = far_targets[0]
+            assert target.position_base is not None
+            x = float(target.position_base[0])
+            duration = clamp(
+                (x - SCENE3_APPROACH_TARGET_X_M) / SCENE3_APPROACH_SPEED_MPS,
+                SCENE3_APPROACH_MIN_DURATION_SEC,
+                SCENE3_APPROACH_MAX_DURATION_SEC,
+            )
+            log_stage(
+                self.scene,
+                "导航",
+                "第 %d 次检测到料盘仍偏远 base=%s，继续靠近 %.1fs 后重试",
+                attempt,
+                _fmt_xyz(target.position_base),
+                duration,
+            )
+            self.navigation.drive_for(
+                linear_x=SCENE3_APPROACH_SPEED_MPS,
+                duration=duration,
+                label="approach_visible_tray",
+            )
+            self.robot.rospy.sleep(0.35)
+        return []
+
+    def _target_is_far_but_approachable(self, target: PerceptionTarget, reason: str) -> bool:
+        if target.position_base is None or "x out of range" not in reason:
+            return False
+        x = float(target.position_base[0])
+        return TARGET_BOUNDS_BASE["scene3"]["x_max"] < x <= SCENE3_APPROACH_MAX_DETECT_X_M
 
     def _tray_sort_key(self, target: PerceptionTarget) -> Tuple[int, float, float, float]:
         xyz = target.position_base or (99.0, 99.0, 99.0)
