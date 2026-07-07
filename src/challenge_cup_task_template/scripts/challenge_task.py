@@ -81,10 +81,14 @@ SCENE3_YOLO_CLASS_ALIASES = {
 SCENE3_SHELF_SPLIT_Z_M = 0.95
 SCENE3_INITIAL_APPROACH_DURATION_SEC = 1.2
 SCENE3_APPROACH_TARGET_X_M = 0.72
+SCENE3_GRASP_WINDOW_X_MIN_M = 0.66
+SCENE3_GRASP_WINDOW_X_MAX_M = 0.78
 SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
 SCENE3_APPROACH_SPEED_MPS = 0.16
+SCENE3_APPROACH_BACKOFF_SPEED_MPS = 0.12
 SCENE3_APPROACH_MIN_DURATION_SEC = 0.35
 SCENE3_APPROACH_MAX_DURATION_SEC = 0.80
+SCENE3_APPROACH_BACKOFF_MAX_DURATION_SEC = 0.75
 SCENE3_APPROACH_SETTLE_SEC = 0.10
 SCENE3_APPROACH_RETRY = 48
 SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
@@ -2505,6 +2509,7 @@ class Scene3Controller(BaseSceneController):
 
     def detect_reachable_trays(self, completed_positions: Sequence[Tuple[float, float, float]]) -> List[PerceptionTarget]:
         miss_count = 0
+        last_visible_x: Optional[float] = None
         for attempt in range(1, SCENE3_APPROACH_RETRY + 1):
             raw_targets = self.perception.detect_targets(
                 class_names=["smt_tray"],
@@ -2515,6 +2520,13 @@ class Scene3Controller(BaseSceneController):
                 target for target in raw_targets
                 if not self._is_near_completed_position(target, completed_positions)
             ]
+            visible_xs = [
+                float(target.position_base[0])
+                for target in raw_targets
+                if target.position_base is not None
+            ]
+            if visible_xs:
+                last_visible_x = min(visible_xs)
             log_target_list(self.scene, "检测", raw_targets)
 
             reachable: List[PerceptionTarget] = []
@@ -2531,6 +2543,28 @@ class Scene3Controller(BaseSceneController):
 
             self._log_rejected_targets(rejected)
             if reachable:
+                ready_targets = self._trays_in_grasp_window(reachable)
+                if ready_targets:
+                    return ready_targets
+                adjustment = self._distance_adjustment_for_trays(reachable)
+                if adjustment is not None:
+                    linear_x, duration, action, target = adjustment
+                    log_stage(
+                        self.scene,
+                        "导航",
+                        "第 %d 次料盘距离未在抓取窗口 base=%s，%s %.2fs 后重检",
+                        attempt,
+                        _fmt_xyz(target.position_base),
+                        action,
+                        duration,
+                    )
+                    self.navigation.drive_for(
+                        linear_x=linear_x,
+                        duration=duration,
+                        label="approach_adjust_tray_distance",
+                    )
+                    self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+                    continue
                 return reachable
             if not far_targets:
                 miss_count += 1
@@ -2542,6 +2576,36 @@ class Scene3Controller(BaseSceneController):
                         miss_count,
                     )
                     return []
+                if last_visible_x is not None and last_visible_x < SCENE3_GRASP_WINDOW_X_MIN_M:
+                    duration = clamp(
+                        (SCENE3_APPROACH_TARGET_X_M - last_visible_x) / SCENE3_APPROACH_BACKOFF_SPEED_MPS,
+                        SCENE3_APPROACH_MIN_DURATION_SEC,
+                        SCENE3_APPROACH_BACKOFF_MAX_DURATION_SEC,
+                    )
+                    log_stage(
+                        self.scene,
+                        "导航",
+                        "最近一次料盘 x=%.3fm 已过近，后退 %.2fs 后继续检测",
+                        last_visible_x,
+                        duration,
+                    )
+                    self.navigation.drive_for(
+                        linear_x=-SCENE3_APPROACH_BACKOFF_SPEED_MPS,
+                        duration=duration,
+                        label="approach_backoff_last_visible",
+                    )
+                    self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+                    last_visible_x = SCENE3_APPROACH_TARGET_X_M
+                    continue
+                if last_visible_x is not None and last_visible_x <= SCENE3_GRASP_WINDOW_X_MAX_M + 0.08:
+                    log_stage(
+                        self.scene,
+                        "导航",
+                        "最近一次料盘 x=%.3fm 已接近抓取窗口，暂停前进并重检",
+                        last_visible_x,
+                    )
+                    self.robot.rospy.sleep(0.25)
+                    continue
                 log_stage(
                     self.scene,
                     "导航",
@@ -2582,6 +2646,42 @@ class Scene3Controller(BaseSceneController):
             )
             self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
         return []
+
+    def _trays_in_grasp_window(self, targets: Sequence[PerceptionTarget]) -> List[PerceptionTarget]:
+        return [
+            target for target in targets
+            if target.position_base is not None
+            and SCENE3_GRASP_WINDOW_X_MIN_M <= float(target.position_base[0]) <= SCENE3_GRASP_WINDOW_X_MAX_M
+        ]
+
+    def _distance_adjustment_for_trays(
+        self,
+        targets: Sequence[PerceptionTarget],
+    ) -> Optional[Tuple[float, float, str, PerceptionTarget]]:
+        valid = [target for target in targets if target.position_base is not None]
+        if not valid:
+            return None
+        target = min(
+            valid,
+            key=lambda item: abs(float(item.position_base[0]) - SCENE3_APPROACH_TARGET_X_M),
+        )
+        assert target.position_base is not None
+        x = float(target.position_base[0])
+        if x < SCENE3_GRASP_WINDOW_X_MIN_M:
+            duration = clamp(
+                (SCENE3_APPROACH_TARGET_X_M - x) / SCENE3_APPROACH_BACKOFF_SPEED_MPS,
+                SCENE3_APPROACH_MIN_DURATION_SEC,
+                SCENE3_APPROACH_BACKOFF_MAX_DURATION_SEC,
+            )
+            return (-SCENE3_APPROACH_BACKOFF_SPEED_MPS, duration, "后退", target)
+        if x > SCENE3_GRASP_WINDOW_X_MAX_M:
+            duration = clamp(
+                (x - SCENE3_APPROACH_TARGET_X_M) / SCENE3_APPROACH_SPEED_MPS,
+                SCENE3_APPROACH_MIN_DURATION_SEC,
+                SCENE3_APPROACH_MAX_DURATION_SEC,
+            )
+            return (SCENE3_APPROACH_SPEED_MPS, duration, "前进", target)
+        return None
 
     def _target_is_far_but_approachable(self, target: PerceptionTarget, reason: str) -> bool:
         if target.position_base is None or "x out of range" not in reason:
