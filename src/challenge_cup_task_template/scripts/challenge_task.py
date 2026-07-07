@@ -112,12 +112,12 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "tray on shelf": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
-SCENE3_INITIAL_APPROACH_DURATION_SEC = 1.2
-SCENE3_APPROACH_TARGET_X_M = 0.82
+SCENE3_INITIAL_APPROACH_DURATION_SEC = 0.85
+SCENE3_APPROACH_TARGET_X_M = 0.90
 SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
 SCENE3_APPROACH_SPEED_MPS = 0.16
 SCENE3_APPROACH_MIN_DURATION_SEC = 0.20
-SCENE3_APPROACH_MAX_DURATION_SEC = 0.80
+SCENE3_APPROACH_MAX_DURATION_SEC = 0.60
 SCENE3_APPROACH_SETTLE_SEC = 0.10
 SCENE3_APPROACH_RETRY = 48
 SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
@@ -194,6 +194,9 @@ SCENE_SAFE_MAX_Z_BASE_M = {
 }
 REACH_X_MIN_M = 0.12
 REACH_X_MAX_M = 0.88
+SCENE_REACH_X_MAX_M = {
+    "scene3": 0.94,
+}
 TARGET_WAIT_SEC = 8.0
 SCENE2_STABLE_TARGET_COUNT = 6
 SCENE2_STABLE_FRAMES = 2
@@ -209,7 +212,7 @@ TARGET_BOUNDS_BASE = {
     },
     "scene3": {
         "x_min": -0.20,
-        "x_max": 0.82,
+        "x_max": 0.90,
         "z_min": -0.25,
         "z_max": 1.35,
     },
@@ -460,6 +463,10 @@ def scene3_insert_clearance_dz(z_base: float) -> float:
 
 def arm_side_sign(arm: str) -> float:
     return 1.0 if arm == "left" else -1.0
+
+
+def reach_x_max_for_scene(scene: str) -> float:
+    return SCENE_REACH_X_MAX_M.get(scene, REACH_X_MAX_M)
 
 
 def log_target_list(scene: str, stage: str, targets: Sequence["PerceptionTarget"],
@@ -843,8 +850,9 @@ class RobotBase:
                      label: str = "ik") -> bool:
         z_min = SCENE_SAFE_MIN_Z_BASE_M.get(self.scene, SAFE_MIN_Z_BASE_M)
         z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
+        x_max = reach_x_max_for_scene(self.scene)
         target = [
-            clamp(float(target_xyz_base[0]), -0.05, REACH_X_MAX_M),
+            clamp(float(target_xyz_base[0]), -0.05, x_max),
             float(target_xyz_base[1]),
             clamp(float(target_xyz_base[2]), z_min, z_max),
         ]
@@ -2268,8 +2276,9 @@ class Skills:
     def _reachable_xyz(self, xyz: Sequence[float]) -> Tuple[float, float, float]:
         z_min = SCENE_SAFE_MIN_Z_BASE_M.get(self.scene, SAFE_MIN_Z_BASE_M)
         z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
+        x_max = reach_x_max_for_scene(self.scene)
         return (
-            clamp(float(xyz[0]), -0.05, REACH_X_MAX_M),
+            clamp(float(xyz[0]), -0.05, x_max),
             float(xyz[1]),
             clamp(float(xyz[2]), z_min, z_max),
         )
