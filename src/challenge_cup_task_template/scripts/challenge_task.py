@@ -95,6 +95,8 @@ SCENE3_WRIST_OBSERVE_DZ_M = 0.20
 SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
+SCENE3_LIFT_RETRY = 3
+SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
 
 ARM_JOINT_NAMES = [
     "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
@@ -2019,15 +2021,46 @@ class Skills:
         self.robot.open_claw(arm)
         pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
         grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
-        if self.scene == "scene3" and target.class_name == "smt_tray" and not grasp_ok:
-            reason = "grasp IK failed"
-            log_warn(self.scene, "抓取", "%s，放弃本次料盘完成判定", reason)
-            return ActionResult(False, "pick", reason, target, time.time() - start)
+        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        if scene3_tray and not grasp_ok:
+            log_warn(
+                self.scene,
+                "抓取",
+                "grasp IK failed，但关节空间兜底已执行；继续闭爪并尝试抬升",
+            )
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
-        lift_ok = self.robot.move_hand_ik(arm, lift, yaw_rad=yaw, duration=1.0, label="lift")
-        if self.scene == "scene3" and target.class_name == "smt_tray" and not lift_ok:
-            reason = "lift IK failed"
-            log_warn(self.scene, "抓取", "%s，料盘可能未被抬起", reason)
+        lift_targets = [lift]
+        if scene3_tray:
+            lift_targets = [
+                (
+                    xyz[0] - SCENE3_LIFT_RETRY_BACKOFF_X_M * index,
+                    xyz[1],
+                    xyz[2] + SAFE_LIFT_DZ_M,
+                )
+                for index in range(SCENE3_LIFT_RETRY)
+            ]
+        lift_ok = False
+        for lift_attempt, lift_target in enumerate(lift_targets, start=1):
+            log_stage(
+                self.scene,
+                "抓取",
+                "lift attempt #%d/%d target=%s",
+                lift_attempt,
+                len(lift_targets),
+                _fmt_xyz(lift_target),
+            )
+            lift_ok = self.robot.move_hand_ik(
+                arm,
+                lift_target,
+                yaw_rad=yaw,
+                duration=1.0,
+                label="lift#{}".format(lift_attempt),
+            )
+            if lift_ok:
+                break
+        if scene3_tray and not lift_ok:
+            reason = "lift IK failed" if grasp_ok else "grasp/lift IK failed"
+            log_warn(self.scene, "抓取", "%s，已尝试 %d 次抬升，料盘可能未被抬起", reason, len(lift_targets))
             return ActionResult(False, "pick", reason, target, time.time() - start)
         ik_ok = pre_ok and grasp_ok and lift_ok
         reason = "" if ik_ok else "IK fallback used"
@@ -2506,6 +2539,7 @@ class Scene3Controller(BaseSceneController):
     def detect_reachable_trays(self, completed_positions: Sequence[Tuple[float, float, float]]) -> List[PerceptionTarget]:
         miss_count = 0
         attempt = 0
+        approach_count = 0
         while not self.robot.rospy.is_shutdown() and attempt < SCENE3_APPROACH_RETRY:
             attempt += 1
             raw_targets = self.perception.detect_targets(
@@ -2544,11 +2578,13 @@ class Scene3Controller(BaseSceneController):
                         miss_count,
                     )
                     return []
+                approach_count += 1
                 log_stage(
                     self.scene,
                     "导航",
-                    "第 %d 次未得到可抓/远处料盘候选，短步靠近 %.2fs 后继续检测",
+                    "检测尝试 #%d 未得到可抓/远处料盘候选，接近尝试 #%d 短步靠近 %.2fs 后继续检测",
                     attempt,
+                    approach_count,
                     SCENE3_APPROACH_SEARCH_DURATION_SEC,
                 )
                 self.navigation.drive_for(
@@ -2558,7 +2594,7 @@ class Scene3Controller(BaseSceneController):
                 )
                 self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
                 attempt = 0
-                log_stage(self.scene, "导航", "短步靠近完成，重置检测尝试次数")
+                log_stage(self.scene, "导航", "接近尝试 #%d 完成，重置检测尝试次数", approach_count)
                 continue
 
             miss_count = 0
@@ -2571,12 +2607,14 @@ class Scene3Controller(BaseSceneController):
                 SCENE3_APPROACH_MIN_DURATION_SEC,
                 SCENE3_APPROACH_MAX_DURATION_SEC,
             )
+            approach_count += 1
             log_stage(
                 self.scene,
                 "导航",
-                "第 %d 次检测到料盘仍偏远 base=%s，预估靠近 %.2fs 后重试",
+                "检测尝试 #%d 发现料盘仍偏远 base=%s，接近尝试 #%d 预估靠近 %.2fs 后重试",
                 attempt,
                 _fmt_xyz(target.position_base),
+                approach_count,
                 duration,
             )
             self.navigation.drive_for(
@@ -2586,7 +2624,7 @@ class Scene3Controller(BaseSceneController):
             )
             self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
             attempt = 0
-            log_stage(self.scene, "导航", "预估靠近完成，重置检测尝试次数")
+            log_stage(self.scene, "导航", "接近尝试 #%d 完成，重置检测尝试次数", approach_count)
         return []
 
     def _target_is_far_but_approachable(self, target: PerceptionTarget, reason: str) -> bool:
