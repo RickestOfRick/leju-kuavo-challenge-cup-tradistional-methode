@@ -701,6 +701,39 @@ class RobotBase:
             raise ValueError("unknown arm: {}".format(arm))
         self.move_arm_deg(target, duration=duration)
 
+    def single_arm_target_from_ik(self, arm: str, q_deg: Sequence[float]) -> List[float]:
+        solved = [float(v) for v in q_deg]
+        if len(solved) != 14:
+            raise ValueError("IK target expects 14 joints, got {}".format(len(solved)))
+
+        target = list(self.current_arm_deg())
+        if len(target) != 14:
+            target = list(self.last_arm_deg)
+        if len(target) != 14:
+            target = list(HOME_ARM_DEG)
+
+        if arm == "left":
+            active = slice(0, 7)
+            inactive = range(7, 14)
+        elif arm == "right":
+            active = slice(7, 14)
+            inactive = range(0, 7)
+        else:
+            raise ValueError("unknown arm: {}".format(arm))
+
+        inactive_delta = max(abs(solved[i] - target[i]) for i in inactive)
+        if inactive_delta > 2.0:
+            log_stage(
+                self.scene,
+                "IK",
+                "%s IK 返回中非目标手最大变化 %.1fdeg，已冻结非目标手，仅执行 %s 手",
+                arm,
+                inactive_delta,
+                "左" if arm == "left" else "右",
+            )
+        target[active] = solved[active]
+        return target
+
     def stop_base(self, duration: float = 0.3) -> None:
         from geometry_msgs.msg import Twist
 
@@ -859,6 +892,7 @@ class RobotBase:
         quat = quat_down(yaw_rad if arm == "left" else yaw_rad + math.pi)
         try:
             q_deg = self.solve_ik(arm, target, quat_xyzw=quat, constraint_mode=2)
+            q_deg = self.single_arm_target_from_ik(arm, q_deg)
             self.move_arm_deg(q_deg, duration=duration)
             return True
         except Exception as exc:
@@ -2071,8 +2105,20 @@ class Skills:
 
     def choose_arm(self, target: PerceptionTarget) -> str:
         if target.position_base is None:
+            log_warn(self.scene, "选臂", "class=%s 无 base_link 坐标，默认使用右手", target.class_name)
             return "right"
-        return "left" if float(target.position_base[1]) >= 0.05 else "right"
+        y_base = float(target.position_base[1])
+        arm = "left" if y_base >= 0.0 else "right"
+        log_stage(
+            self.scene,
+            "选臂",
+            "class=%s base_y=%.3fm -> 目标在机器人%s侧，使用%s手",
+            target.class_name,
+            y_base,
+            "左" if arm == "left" else "右",
+            "左" if arm == "left" else "右",
+        )
+        return arm
 
     def pick(self, target: PerceptionTarget, arm: Optional[str] = None) -> ActionResult:
         start = time.time()
