@@ -1,32 +1,34 @@
-# kuavo_learning_studio 使用说明
+# LeTools-Learning 使用说明
 
 `collect_scene1_dataset` 包含比赛任务一（快递分拣交接）的数据采集脚本，详细使用说明看路径内 README。
-`collect_scene2_dataset` 包含比赛任务二的数据采集脚本，详细使用说明看路径内 README。
+`collect_scene2_dataset` 包含比赛任务二（零件分拣）的数据采集脚本，详细使用说明看路径内 README。
 
-kuavo_learning_studio具体使用说明请进入kuavo_learning_studio 文档网站查看。
+LeTools-Learning 具体使用说明请进入 LeTools-Learning文档网站 查看。
 
 ## 相关链接
 
-- kuavo_learning_studio 仓库：[https://github.com/LejuRobotics/kuavo_learning_studio](https://github.com/LejuRobotics/kuavo_learning_studio)
+- LeTools-Learning 仓库：[https://github.com/LejuRobotics/LeTools-Learning](https://github.com/LejuRobotics/LeTools-Learning)
 
-![kuavo_learning_studio](image/kuavo_learning_studio.jpg)
+![LeTools-Learning](image/LeTools-Learning.jpg)
 
-- kuavo_learning_studio 文档网站：[https://huangrc1110.github.io/kuavo_docs/docs.html#get_started/intro.md](https://huangrc1110.github.io/kuavo_docs/docs.html#get_started/intro.md)
+- LeTools-Learning 文档网站：[https://www.letools.lejurobot.com/index.html](https://www.letools.lejurobot.com/index.html)
 
-![kuavo_learning_studio_docs](image/kuavo_learning_studio_docs.jpg)
+![LeTools-Learning_docs](image/LeTools-Learning_docs.jpg)
 
-- 任务二仿真数据集：[https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled](https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled)  
-数据集机器人初始姿态：  
-手臂角度：`JOINT_ANGLE = [30, 10, 10, -120, -60, 0, 0, 30, -10, -10, -120, 60, 0, 0]`  
-头部角度：`HEAD_ANGLE = [0.0, 20.0]`  
+- 任务一仿真数据集：[https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled/scene1_Package_Weighing](https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled/scene1_Package_Weighing) 
 
-![scene2_dataset](image/scene2_dataset.jpg)
+- 任务二仿真数据集：[https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled/scene2_Parts_Sorting](https://www.modelscope.cn/datasets/lejurobot/let_research_dataset/tree/master/rosbag/sim/Unlabelled/scene2_Parts_Sorting)  
+数据集机器人头部初始姿态：  
+任务一：`HEAD_ANGLE = [0.0, 20.0]`   
+任务二：`HEAD_ANGLE = [0.0, 20.0]`  
 
 - （openlet社区真机参考案例）基于 Pi05 VLA 的玩偶分拣实战：从数据采集到实机推理：[https://openlet.openatom.tech/explore/journalism/detail/584219818870312960](https://openlet.openatom.tech/explore/journalism/detail/584219818870312960)
 
 ![Sorting_Dolls](image/Sorting_Dolls.jpg)
 
 ## 注意事项
+
+想使用Docker部署模型工具链环境的可以参考 [how_to_use_docker.md](how_to_use_docker.md)
 
 ### 数据转换
 
