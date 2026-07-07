@@ -111,9 +111,9 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "tray_on_shelf": SCENE3_YOLO_CLASS_NAME,
     "tray on shelf": SCENE3_YOLO_CLASS_NAME,
 }
-SCENE3_SHELF_SPLIT_Z_M = 0.95
+SCENE3_SHELF_SPLIT_Z_M = 0.22
 SCENE3_INITIAL_APPROACH_DURATION_SEC = 1.2
-SCENE3_APPROACH_TARGET_X_M = 0.82
+SCENE3_APPROACH_TARGET_X_M = 0.60
 SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
 SCENE3_APPROACH_SPEED_MPS = 0.16
 SCENE3_APPROACH_MIN_DURATION_SEC = 0.20
@@ -124,9 +124,22 @@ SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
 SCENE3_APPROACH_MAX_MISSES = 12
 SCENE3_WRIST_REFINE_RETRY = 2
 SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
-SCENE3_WRIST_OBSERVE_DZ_M = 0.20
-SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
-SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
+SCENE3_WRIST_OBSERVE_DZ_M = 0.16
+SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.18
+SCENE3_WRIST_OBSERVE_X_RANGE_M = (0.46, 0.56)
+SCENE3_WRIST_OBSERVE_Z_RANGE_BY_SHELF_M = {
+    "lower": (0.18, 0.32),
+    "upper": (0.38, 0.62),
+}
+SCENE3_TRAY_GRASP_OFFSET_BASE_BY_SHELF = {
+    "lower": (-0.075, 0.0, 0.035),
+    "upper": (-0.070, 0.0, 0.025),
+}
+SCENE3_TRAY_GRASP_X_RANGE_M = (0.40, 0.56)
+SCENE3_TRAY_GRASP_Z_RANGE_BY_SHELF_M = {
+    "lower": (-0.05, 0.18),
+    "upper": (0.20, 0.58),
+}
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
 SCENE3_PICK_RETRY = 10
 SCENE3_PICK_RETRY_SETTLE_SEC = 0.25
@@ -189,7 +202,7 @@ TARGET_BOUNDS_BASE = {
     },
     "scene3": {
         "x_min": -0.20,
-        "x_max": 0.82,
+        "x_max": 0.66,
         "z_min": -0.25,
         "z_max": 1.35,
     },
@@ -460,6 +473,10 @@ def smoothstep(t: float) -> float:
 
 def distance3(a: Sequence[float], b: Sequence[float]) -> float:
     return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))
+
+
+def scene3_shelf_from_base_z(z_base_m: float) -> str:
+    return "lower" if float(z_base_m) < SCENE3_SHELF_SPLIT_Z_M else "upper"
 
 
 def quat_down(yaw_rad: float = 0.0) -> List[float]:
@@ -2128,7 +2145,13 @@ class Skills:
             offset = SCENE2_GRASP_OFFSETS_BASE.get(target.class_name, (0.0, 0.0, 0.0))
             xyz = [float(xyz[i]) + float(offset[i]) for i in range(3)]
         elif self.scene == "scene3" and target.class_name == "smt_tray":
-            xyz = [float(xyz[i]) + float(SCENE3_TRAY_GRASP_OFFSET_BASE[i]) for i in range(3)]
+            shelf = scene3_shelf_from_base_z(float(xyz[2]))
+            offset = SCENE3_TRAY_GRASP_OFFSET_BASE_BY_SHELF.get(shelf, (0.0, 0.0, 0.0))
+            xyz = [float(xyz[i]) + float(offset[i]) for i in range(3)]
+            xyz[0] = clamp(xyz[0], SCENE3_TRAY_GRASP_X_RANGE_M[0], SCENE3_TRAY_GRASP_X_RANGE_M[1])
+            z_range = SCENE3_TRAY_GRASP_Z_RANGE_BY_SHELF_M.get(shelf)
+            if z_range is not None:
+                xyz[2] = clamp(xyz[2], z_range[0], z_range[1])
         return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
 
     def _close_percent(self, class_name: str) -> float:
@@ -2532,25 +2555,36 @@ class Scene3Controller(BaseSceneController):
             return None
         camera = "{}_wrist".format(arm)
         xyz = tray.position_base
-        observe_xyz = (
+        shelf = self._tray_shelf(tray)
+        observe_x = clamp(
             float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M,
+            SCENE3_WRIST_OBSERVE_X_RANGE_M[0],
+            SCENE3_WRIST_OBSERVE_X_RANGE_M[1],
+        )
+        observe_z = float(xyz[2]) + SCENE3_WRIST_OBSERVE_DZ_M
+        z_range = SCENE3_WRIST_OBSERVE_Z_RANGE_BY_SHELF_M.get(shelf)
+        if z_range is not None:
+            observe_z = clamp(observe_z, z_range[0], z_range[1])
+        observe_xyz = (
+            observe_x,
             float(xyz[1]),
-            float(xyz[2]) + SCENE3_WRIST_OBSERVE_DZ_M,
+            observe_z,
         )
         log_stage(
             self.scene,
             "腕部复检",
-            "arm=%s camera=%s rough=%s observe=%s",
+            "arm=%s camera=%s shelf=%s rough=%s observe=%s",
             arm,
             camera,
+            shelf,
             _fmt_xyz(xyz),
             _fmt_xyz(observe_xyz),
         )
         self.robot.open_claw(arm)
         observe_ok = self.robot.move_hand_ik(arm, observe_xyz, duration=1.0, label="wrist_refine_view")
         if not observe_ok:
-            log_warn(self.scene, "腕部复检", "观察位 IK 失败，不执行近似动作，交由外层重新检测")
-            return None
+            log_warn(self.scene, "腕部复检", "观察位 IK 失败，沿用头部相机坐标并交由抓取保护处理")
+            return tray
         self.robot.rospy.sleep(0.25)
 
         for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
@@ -2712,7 +2746,7 @@ class Scene3Controller(BaseSceneController):
 
     def _tray_shelf(self, target: PerceptionTarget) -> str:
         xyz = target.position_base or (99.0, 99.0, 99.0)
-        return "lower" if float(xyz[2]) < SCENE3_SHELF_SPLIT_Z_M else "upper"
+        return scene3_shelf_from_base_z(float(xyz[2]))
 
     def resolve_outbound_place(self) -> Tuple[float, float, float]:
         place = PLACE_TARGETS_BASE[self.scene]["outbound_box"]
