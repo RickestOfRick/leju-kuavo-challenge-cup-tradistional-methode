@@ -2505,7 +2505,9 @@ class Scene3Controller(BaseSceneController):
 
     def detect_reachable_trays(self, completed_positions: Sequence[Tuple[float, float, float]]) -> List[PerceptionTarget]:
         miss_count = 0
-        for attempt in range(1, SCENE3_APPROACH_RETRY + 1):
+        attempt = 0
+        while not self.robot.rospy.is_shutdown() and attempt < SCENE3_APPROACH_RETRY:
+            attempt += 1
             raw_targets = self.perception.detect_targets(
                 class_names=["smt_tray"],
                 cameras=["head"],
@@ -2555,6 +2557,8 @@ class Scene3Controller(BaseSceneController):
                     label="approach_search_tray",
                 )
                 self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+                attempt = 0
+                log_stage(self.scene, "导航", "短步靠近完成，重置检测尝试次数")
                 continue
 
             miss_count = 0
@@ -2581,6 +2585,8 @@ class Scene3Controller(BaseSceneController):
                 label="approach_visible_tray",
             )
             self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+            attempt = 0
+            log_stage(self.scene, "导航", "预估靠近完成，重置检测尝试次数")
         return []
 
     def _target_is_far_but_approachable(self, target: PerceptionTarget, reason: str) -> bool:
