@@ -1447,6 +1447,9 @@ class YoloScene1Perception(RuleBasedPerception):
             purpose="目标区",
         )
 
+    def preload_model(self) -> bool:
+        return self._ensure_yolo()
+
     def _detect_yolo_classes(self, class_names: Sequence[str], cameras: Sequence[str],
                              max_targets: Optional[int], purpose: str) -> List[PerceptionTarget]:
         if not class_names:
@@ -2364,6 +2367,7 @@ class Scene3Controller(BaseSceneController):
         start = time.time()
         if not self.wait_for_perception():
             return ActionResult(False, "scene3", "sensor not ready", duration_sec=time.time() - start)
+        self.preload_yolo_model()
         outbound_xyz = self.resolve_outbound_place()
 
         moved_to_rack = False
@@ -2413,6 +2417,14 @@ class Scene3Controller(BaseSceneController):
             return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
+
+    def preload_yolo_model(self) -> None:
+        preload = getattr(self.perception, "preload_model", None)
+        if not callable(preload):
+            return
+        log_stage(self.scene, "YOLO", "预加载模型，避免首次检测时阻塞导航")
+        if not preload():
+            log_warn(self.scene, "YOLO", "模型预加载失败，后续检测会再次尝试并输出原因")
 
     def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> PerceptionTarget:
         if tray.position_base is None:
