@@ -85,6 +85,12 @@ SCENE3_APPROACH_SPEED_MPS = 0.16
 SCENE3_APPROACH_MIN_DURATION_SEC = 1.0
 SCENE3_APPROACH_MAX_DURATION_SEC = 5.0
 SCENE3_APPROACH_RETRY = 10
+SCENE3_WRIST_REFINE_RETRY = 2
+SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
+SCENE3_WRIST_OBSERVE_DZ_M = 0.20
+SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
+SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
+SCENE3_CLAW_CLOSE_PERCENT = 92.0
 
 ARM_JOINT_NAMES = [
     "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
@@ -119,6 +125,9 @@ SAFE_LIFT_DZ_M = 0.18
 SAFE_PLACE_DZ_M = 0.12
 SAFE_MIN_Z_BASE_M = -0.14
 SAFE_MAX_Z_BASE_M = 0.85
+SCENE_SAFE_MIN_Z_BASE_M = {
+    "scene3": -0.24,
+}
 SCENE_SAFE_MAX_Z_BASE_M = {
     "scene3": 1.30,
 }
@@ -738,11 +747,12 @@ class RobotBase:
     def move_hand_ik(self, arm: str, target_xyz_base: Sequence[float],
                      yaw_rad: float = 0.0, duration: float = 1.2,
                      label: str = "ik") -> bool:
+        z_min = SCENE_SAFE_MIN_Z_BASE_M.get(self.scene, SAFE_MIN_Z_BASE_M)
         z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
         target = [
             clamp(float(target_xyz_base[0]), -0.05, REACH_X_MAX_M),
             float(target_xyz_base[1]),
-            clamp(float(target_xyz_base[2]), SAFE_MIN_Z_BASE_M, z_max),
+            clamp(float(target_xyz_base[2]), z_min, z_max),
         ]
         quat = quat_down(yaw_rad if arm == "left" else yaw_rad + math.pi)
         try:
@@ -2036,11 +2046,12 @@ class Skills:
         )
 
     def _reachable_xyz(self, xyz: Sequence[float]) -> Tuple[float, float, float]:
+        z_min = SCENE_SAFE_MIN_Z_BASE_M.get(self.scene, SAFE_MIN_Z_BASE_M)
         z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
         return (
             clamp(float(xyz[0]), -0.05, REACH_X_MAX_M),
             float(xyz[1]),
-            clamp(float(xyz[2]), SAFE_MIN_Z_BASE_M, z_max),
+            clamp(float(xyz[2]), z_min, z_max),
         )
 
     def _grasp_xyz(self, target: PerceptionTarget) -> Tuple[float, float, float]:
@@ -2049,11 +2060,13 @@ class Skills:
         if self.scene == "scene2":
             offset = SCENE2_GRASP_OFFSETS_BASE.get(target.class_name, (0.0, 0.0, 0.0))
             xyz = [float(xyz[i]) + float(offset[i]) for i in range(3)]
+        elif self.scene == "scene3" and target.class_name == "smt_tray":
+            xyz = [float(xyz[i]) + float(SCENE3_TRAY_GRASP_OFFSET_BASE[i]) for i in range(3)]
         return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
 
     def _close_percent(self, class_name: str) -> float:
         if class_name == "smt_tray":
-            return 72.0
+            return SCENE3_CLAW_CLOSE_PERCENT
         if class_name == "part_type_c":
             return 82.0
         return CLAW_CLOSE_PERCENT
@@ -2367,8 +2380,9 @@ class Scene3Controller(BaseSceneController):
                 break
             targets.sort(key=self._tray_sort_key)
             tray = targets[0]
-            shelf = self._tray_shelf(tray)
             arm = self.skills.choose_arm(tray)
+            tray = self.refine_tray_with_wrist(tray, arm)
+            shelf = self._tray_shelf(tray)
             log_stage(
                 self.scene,
                 "流程",
@@ -2394,9 +2408,75 @@ class Scene3Controller(BaseSceneController):
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
 
+    def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> PerceptionTarget:
+        if tray.position_base is None:
+            return tray
+        camera = "{}_wrist".format(arm)
+        xyz = tray.position_base
+        observe_xyz = (
+            float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M,
+            float(xyz[1]),
+            float(xyz[2]) + SCENE3_WRIST_OBSERVE_DZ_M,
+        )
+        log_stage(
+            self.scene,
+            "腕部复检",
+            "arm=%s camera=%s rough=%s observe=%s",
+            arm,
+            camera,
+            _fmt_xyz(xyz),
+            _fmt_xyz(observe_xyz),
+        )
+        self.robot.open_claw(arm)
+        self.robot.move_hand_ik(arm, observe_xyz, duration=1.0, label="wrist_refine_view")
+        self.robot.rospy.sleep(0.25)
+
+        for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
+            candidates = self.perception.detect_targets(
+                class_names=["smt_tray"],
+                cameras=[camera],
+                max_targets=None,
+            )
+            log_target_list(self.scene, "腕部复检", candidates)
+            usable: List[PerceptionTarget] = []
+            rejected: List[Tuple[PerceptionTarget, str]] = []
+            for candidate in candidates:
+                reason = self._target_reject_reason(candidate)
+                if reason is not None:
+                    rejected.append((candidate, reason))
+                    continue
+                if (candidate.position_base is not None
+                        and distance3(candidate.position_base, tray.position_base) <= SCENE3_WRIST_REFINE_MAX_DELTA_M):
+                    usable.append(candidate)
+                else:
+                    rejected.append((candidate, "too far from rough target"))
+            self._log_rejected_targets(rejected)
+            if usable:
+                usable.sort(key=lambda item: (
+                    distance3(item.position_base, tray.position_base) if item.position_base is not None else 99.0,
+                    -float(item.confidence),
+                ))
+                refined = usable[0]
+                log_stage(
+                    self.scene,
+                    "腕部复检",
+                    "使用腕部相机修正 base %s -> %s",
+                    _fmt_xyz(tray.position_base),
+                    _fmt_xyz(refined.position_base),
+                )
+                return refined
+            self.robot.rospy.sleep(0.25)
+
+        log_warn(self.scene, "腕部复检", "未获得可用腕部复检结果，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
+        return tray
+
     def detect_reachable_trays(self, completed_shelves: set) -> List[PerceptionTarget]:
         for attempt in range(1, SCENE3_APPROACH_RETRY + 1):
-            raw_targets = self.perception.detect_targets(class_names=["smt_tray"], max_targets=None)
+            raw_targets = self.perception.detect_targets(
+                class_names=["smt_tray"],
+                cameras=["head"],
+                max_targets=None,
+            )
             raw_targets = [
                 target for target in raw_targets
                 if self._tray_shelf(target) not in completed_shelves
