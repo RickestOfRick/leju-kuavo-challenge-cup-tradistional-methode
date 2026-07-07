@@ -57,10 +57,26 @@ SCENE1_YOLO_DEFAULT_IMGSZ = 640
 SCENE1_YOLO_CENTER_DEPTH_FRACTION = 0.45
 SCENE3_YOLO_CLASS_NAME = "smt_tray"
 SCENE3_YOLO_TARGET_BIN = "outbound_box"
+SCENE3_YOLO_WORLD_PROMPTS = (
+    "smt tray",
+    "tray",
+    "electronics tray",
+    "component tray",
+    "plastic tray",
+    "",
+)
 SCENE3_YOLO_CLASS_ALIASES = {
     "tray": SCENE3_YOLO_CLASS_NAME,
     "charging_tray": SCENE3_YOLO_CLASS_NAME,
     "smt_tray": SCENE3_YOLO_CLASS_NAME,
+    "smt tray": SCENE3_YOLO_CLASS_NAME,
+    "smttray": SCENE3_YOLO_CLASS_NAME,
+    "electronics_tray": SCENE3_YOLO_CLASS_NAME,
+    "electronics tray": SCENE3_YOLO_CLASS_NAME,
+    "component_tray": SCENE3_YOLO_CLASS_NAME,
+    "component tray": SCENE3_YOLO_CLASS_NAME,
+    "plastic_tray": SCENE3_YOLO_CLASS_NAME,
+    "plastic tray": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
 
@@ -1816,6 +1832,99 @@ class YoloScene3Perception(YoloScene1Perception):
         self.yolo_class_names = (SCENE3_YOLO_CLASS_NAME,)
         self.yolo_class_aliases = dict(SCENE3_YOLO_CLASS_ALIASES)
         self.yolo_target_bins = {SCENE3_YOLO_CLASS_NAME: SCENE3_YOLO_TARGET_BIN}
+        self.yolo_world_prompts = tuple(SCENE3_YOLO_WORLD_PROMPTS)
+
+    def _ensure_yolo(self) -> bool:
+        if self._yolo_model is not None:
+            return True
+        if self._yolo_unavailable_reason is not None:
+            return False
+        if not self._ensure_cv():
+            self._yolo_unavailable_reason = "cv2/numpy import failed"
+            return False
+        if (not os.path.isfile(self.yolo_model_path)
+                and not self._is_ultralytics_world_model_name(self.yolo_model_path)):
+            self._yolo_unavailable_reason = (
+                "model not found: {}; generate scene3_smt_tray.pt with YOLOWorld "
+                "or pass yolov8s-worldv2.pt as --yolo-model"
+            ).format(self.yolo_model_path)
+            return False
+
+        load_errors: List[str] = []
+        if self._try_load_scene3_yolo_world(load_errors):
+            return True
+        if self._try_load_scene3_yolo_fallback(load_errors):
+            return True
+
+        self._yolo_unavailable_reason = "; ".join(load_errors) or "ultralytics/model load failed"
+        self._yolo_model = None
+        return False
+
+    def _try_load_scene3_yolo_world(self, load_errors: List[str]) -> bool:
+        try:
+            from ultralytics import YOLOWorld
+
+            model = YOLOWorld(self.yolo_model_path)
+            prompts_applied = self._apply_scene3_world_prompts(model)
+            self._yolo_model = model
+            self._log_scene3_yolo_ready("YOLOWorld", prompts_applied=prompts_applied)
+            return True
+        except Exception as exc:
+            load_errors.append("YOLOWorld load failed: {}".format(exc))
+            self._yolo_model = None
+            return False
+
+    def _try_load_scene3_yolo_fallback(self, load_errors: List[str]) -> bool:
+        try:
+            from ultralytics import YOLO
+
+            model = YOLO(self.yolo_model_path)
+            prompts_applied = self._apply_scene3_world_prompts(model)
+            self._yolo_model = model
+            self._log_scene3_yolo_ready("YOLO", prompts_applied=prompts_applied)
+            return True
+        except Exception as exc:
+            load_errors.append("YOLO fallback load failed: {}".format(exc))
+            self._yolo_model = None
+            return False
+
+    def _apply_scene3_world_prompts(self, model: Any) -> bool:
+        if not self._scene3_model_needs_prompts() or not hasattr(model, "set_classes"):
+            return False
+        model.set_classes(list(self.yolo_world_prompts))
+        return True
+
+    def _scene3_model_needs_prompts(self) -> bool:
+        basename = os.path.basename(self.yolo_model_path).lower()
+        return "world" in basename
+
+    def _is_ultralytics_world_model_name(self, model_path: str) -> bool:
+        basename = os.path.basename(model_path)
+        return (
+            basename == model_path
+            and basename.lower().endswith(".pt")
+            and "world" in basename.lower()
+        )
+
+    def _log_scene3_yolo_ready(self, backend: str, prompts_applied: bool) -> None:
+        if self._yolo_ready_logged:
+            return
+        prompt_summary = ",".join(
+            prompt or "<background>" for prompt in self.yolo_world_prompts
+        )
+        log_stage(
+            self.scene,
+            "YOLO",
+            "已加载%s模型 %s device=%s conf=%.2f imgsz=%d prompts_applied=%s prompts=%s",
+            backend,
+            self.yolo_model_path,
+            self.yolo_device,
+            self.yolo_conf,
+            self.yolo_imgsz,
+            prompts_applied,
+            prompt_summary,
+        )
+        self._yolo_ready_logged = True
 
 
 # ---------------------------------------------------------------------------
@@ -2450,7 +2559,7 @@ def main():
     parser.add_argument("--scene1-perception", choices=["auto", "yolo"], default="auto",
                         help="场景一识别后端：auto/yolo 均使用 YOLO，不再支持规则识别")
     parser.add_argument("--scene3-perception", choices=["yolo", "rule"], default="yolo",
-                        help="场景三料盘识别后端：默认强制 YOLO，rule 用于调试原 HSV 规则")
+                        help="场景三料盘识别后端：默认强制 YOLO-World，rule 用于调试原 HSV 规则")
     parser.add_argument("--yolo-model", default=None,
                         help="YOLO .pt 模型路径；未指定时按 scene 选择默认权重")
     parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0"], default="auto",
