@@ -79,12 +79,14 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "plastic tray": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
+SCENE3_INITIAL_APPROACH_DURATION_SEC = 1.2
 SCENE3_APPROACH_TARGET_X_M = 0.72
 SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
 SCENE3_APPROACH_SPEED_MPS = 0.16
-SCENE3_APPROACH_MIN_DURATION_SEC = 1.0
-SCENE3_APPROACH_MAX_DURATION_SEC = 5.0
-SCENE3_APPROACH_RETRY = 10
+SCENE3_APPROACH_MIN_DURATION_SEC = 0.35
+SCENE3_APPROACH_MAX_DURATION_SEC = 0.80
+SCENE3_APPROACH_SETTLE_SEC = 0.10
+SCENE3_APPROACH_RETRY = 24
 SCENE3_WRIST_REFINE_RETRY = 2
 SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
 SCENE3_WRIST_OBSERVE_DZ_M = 0.20
@@ -2370,9 +2372,13 @@ class Scene3Controller(BaseSceneController):
         max_trays = SCENE_TARGET_LIMIT["scene3"]
         for index in range(1, max_trays + 1):
             if not moved_to_rack:
-                self.navigation.drive_for(linear_x=0.16, duration=3.2, label="approach_smt_rack")
+                self.navigation.drive_for(
+                    linear_x=SCENE3_APPROACH_SPEED_MPS,
+                    duration=SCENE3_INITIAL_APPROACH_DURATION_SEC,
+                    label="approach_smt_rack",
+                )
                 moved_to_rack = True
-                self.robot.rospy.sleep(0.5)
+                self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
 
             targets = self.detect_reachable_trays(completed_shelves)
             if not targets:
@@ -2523,7 +2529,7 @@ class Scene3Controller(BaseSceneController):
                 duration=duration,
                 label="approach_visible_tray",
             )
-            self.robot.rospy.sleep(0.35)
+            self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
         return []
 
     def _target_is_far_but_approachable(self, target: PerceptionTarget, reason: str) -> bool:
