@@ -152,7 +152,7 @@ TARGET_BOUNDS_BASE = {
     },
     "scene3": {
         "x_min": -0.20,
-        "x_max": 0.95,
+        "x_max": 0.82,
         "z_min": -0.25,
         "z_max": 1.35,
     },
@@ -2017,10 +2017,19 @@ class Skills:
         )
         self.navigation.fine_align_to_image_target(target)
         self.robot.open_claw(arm)
-        self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
-        ik_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
+        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
+        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
+        if self.scene == "scene3" and target.class_name == "smt_tray" and not grasp_ok:
+            reason = "grasp IK failed"
+            log_warn(self.scene, "抓取", "%s，放弃本次料盘完成判定", reason)
+            return ActionResult(False, "pick", reason, target, time.time() - start)
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
-        self.robot.move_hand_ik(arm, lift, yaw_rad=yaw, duration=1.0, label="lift")
+        lift_ok = self.robot.move_hand_ik(arm, lift, yaw_rad=yaw, duration=1.0, label="lift")
+        if self.scene == "scene3" and target.class_name == "smt_tray" and not lift_ok:
+            reason = "lift IK failed"
+            log_warn(self.scene, "抓取", "%s，料盘可能未被抬起", reason)
+            return ActionResult(False, "pick", reason, target, time.time() - start)
+        ik_ok = pre_ok and grasp_ok and lift_ok
         reason = "" if ik_ok else "IK fallback used"
         return ActionResult(True, "pick", reason, target, time.time() - start)
 
@@ -2374,7 +2383,7 @@ class Scene3Controller(BaseSceneController):
 
         moved_to_rack = False
         completed = 0
-        completed_shelves = set()
+        completed_positions: List[Tuple[float, float, float]] = []
         max_trays = SCENE_TARGET_LIMIT["scene3"]
         for index in range(1, max_trays + 1):
             if not moved_to_rack:
@@ -2386,7 +2395,7 @@ class Scene3Controller(BaseSceneController):
                 moved_to_rack = True
                 self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
 
-            targets = self.detect_reachable_trays(completed_shelves)
+            targets = self.detect_reachable_trays(completed_positions)
             if not targets:
                 log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
                 break
@@ -2411,8 +2420,12 @@ class Scene3Controller(BaseSceneController):
 
             self.navigation.drive_for(linear_x=-0.16, duration=3.4, label="return_to_outbound_box")
             moved_to_rack = False
-            self.skills.place(arm, outbound_xyz, label="tray{}_outbound".format(index))
-            completed_shelves.add(shelf)
+            place_result = self.skills.place(arm, outbound_xyz, label="tray{}_outbound".format(index))
+            if not place_result.ok:
+                log_warn(self.scene, "失败", "料盘 #%02d 放置失败: %s", index, place_result.reason)
+                break
+            if tray.position_base is not None:
+                completed_positions.append(tray.position_base)
             completed += 1
 
         if completed == 0:
@@ -2490,7 +2503,7 @@ class Scene3Controller(BaseSceneController):
         log_warn(self.scene, "腕部复检", "未获得可用腕部复检结果，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
         return tray
 
-    def detect_reachable_trays(self, completed_shelves: set) -> List[PerceptionTarget]:
+    def detect_reachable_trays(self, completed_positions: Sequence[Tuple[float, float, float]]) -> List[PerceptionTarget]:
         miss_count = 0
         for attempt in range(1, SCENE3_APPROACH_RETRY + 1):
             raw_targets = self.perception.detect_targets(
@@ -2500,7 +2513,7 @@ class Scene3Controller(BaseSceneController):
             )
             raw_targets = [
                 target for target in raw_targets
-                if self._tray_shelf(target) not in completed_shelves
+                if not self._is_near_completed_position(target, completed_positions)
             ]
             log_target_list(self.scene, "检测", raw_targets)
 
@@ -2575,6 +2588,22 @@ class Scene3Controller(BaseSceneController):
             return False
         x = float(target.position_base[0])
         return TARGET_BOUNDS_BASE["scene3"]["x_max"] < x <= SCENE3_APPROACH_MAX_DETECT_X_M
+
+    def _is_near_completed_position(self, target: PerceptionTarget,
+                                    completed_positions: Sequence[Tuple[float, float, float]]) -> bool:
+        if target.position_base is None:
+            return False
+        for position in completed_positions:
+            if distance3(target.position_base, position) < 0.18:
+                log_warn(
+                    self.scene,
+                    "检测过滤",
+                    "跳过已完成位置附近候选 base=%s completed=%s",
+                    _fmt_xyz(target.position_base),
+                    _fmt_xyz(position),
+                )
+                return True
+        return False
 
     def _tray_sort_key(self, target: PerceptionTarget) -> Tuple[int, float, float, float]:
         xyz = target.position_base or (99.0, 99.0, 99.0)
