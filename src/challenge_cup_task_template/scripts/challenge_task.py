@@ -59,10 +59,21 @@ SCENE3_YOLO_CLASS_NAME = "smt_tray"
 SCENE3_YOLO_TARGET_BIN = "outbound_box"
 SCENE3_YOLO_WORLD_PROMPTS = (
     "smt tray",
+    "smt component tray",
+    "smt material tray",
+    "smt reel tray",
+    "electronics component tray",
     "tray",
     "electronics tray",
     "component tray",
+    "component storage tray",
+    "electronic parts tray",
     "plastic tray",
+    "plastic parts tray",
+    "rectangular plastic tray",
+    "black plastic tray",
+    "industrial plastic tray",
+    "tray on shelf",
     "",
 )
 SCENE3_YOLO_CLASS_ALIASES = {
@@ -71,12 +82,34 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "smt_tray": SCENE3_YOLO_CLASS_NAME,
     "smt tray": SCENE3_YOLO_CLASS_NAME,
     "smttray": SCENE3_YOLO_CLASS_NAME,
+    "smt_component_tray": SCENE3_YOLO_CLASS_NAME,
+    "smt component tray": SCENE3_YOLO_CLASS_NAME,
+    "smt_material_tray": SCENE3_YOLO_CLASS_NAME,
+    "smt material tray": SCENE3_YOLO_CLASS_NAME,
+    "smt_reel_tray": SCENE3_YOLO_CLASS_NAME,
+    "smt reel tray": SCENE3_YOLO_CLASS_NAME,
     "electronics_tray": SCENE3_YOLO_CLASS_NAME,
     "electronics tray": SCENE3_YOLO_CLASS_NAME,
+    "electronics_component_tray": SCENE3_YOLO_CLASS_NAME,
+    "electronics component tray": SCENE3_YOLO_CLASS_NAME,
     "component_tray": SCENE3_YOLO_CLASS_NAME,
     "component tray": SCENE3_YOLO_CLASS_NAME,
+    "component_storage_tray": SCENE3_YOLO_CLASS_NAME,
+    "component storage tray": SCENE3_YOLO_CLASS_NAME,
+    "electronic_parts_tray": SCENE3_YOLO_CLASS_NAME,
+    "electronic parts tray": SCENE3_YOLO_CLASS_NAME,
     "plastic_tray": SCENE3_YOLO_CLASS_NAME,
     "plastic tray": SCENE3_YOLO_CLASS_NAME,
+    "plastic_parts_tray": SCENE3_YOLO_CLASS_NAME,
+    "plastic parts tray": SCENE3_YOLO_CLASS_NAME,
+    "rectangular_plastic_tray": SCENE3_YOLO_CLASS_NAME,
+    "rectangular plastic tray": SCENE3_YOLO_CLASS_NAME,
+    "black_plastic_tray": SCENE3_YOLO_CLASS_NAME,
+    "black plastic tray": SCENE3_YOLO_CLASS_NAME,
+    "industrial_plastic_tray": SCENE3_YOLO_CLASS_NAME,
+    "industrial plastic tray": SCENE3_YOLO_CLASS_NAME,
+    "tray_on_shelf": SCENE3_YOLO_CLASS_NAME,
+    "tray on shelf": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
 SCENE3_INITIAL_APPROACH_DURATION_SEC = 1.2
@@ -95,7 +128,7 @@ SCENE3_WRIST_OBSERVE_DZ_M = 0.20
 SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
-SCENE3_PICK_RETRY = 3
+SCENE3_PICK_RETRY = 10
 SCENE3_PICK_RETRY_SETTLE_SEC = 0.25
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
