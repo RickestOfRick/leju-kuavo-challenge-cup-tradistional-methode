@@ -95,6 +95,8 @@ SCENE3_WRIST_OBSERVE_DZ_M = 0.20
 SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
+SCENE3_PICK_RETRY = 3
+SCENE3_PICK_RETRY_SETTLE_SEC = 0.25
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
 
@@ -766,24 +768,9 @@ class RobotBase:
             self.move_arm_deg(q_deg, duration=duration)
             return True
         except Exception as exc:
-            log_warn(self.scene, "IK", "%s 失败，使用关节空间兜底: %s target=%s", label, exc, _fmt_xyz(target))
-            self.move_arm_deg(self._fallback_pose(arm, target), duration=duration)
+            log_warn(self.scene, "IK", "%s 失败，不执行近似关节动作，等待上层重新检测: %s target=%s",
+                     label, exc, _fmt_xyz(target))
             return False
-
-    def _fallback_pose(self, arm: str, target_xyz_base: Sequence[float]) -> List[float]:
-        pose = list(self.current_arm_deg())
-        if len(pose) != 14:
-            pose = list(self.last_arm_deg)
-        x = clamp(float(target_xyz_base[0]), 0.18, 0.75)
-        y = float(target_xyz_base[1])
-        z = float(target_xyz_base[2])
-        reach = clamp((0.38 - x) * 90.0 + (0.18 - z) * 70.0, -35.0, 35.0)
-        side = clamp(y * 85.0, -35.0, 35.0)
-        if arm == "left":
-            pose[:7] = [30 + reach, 18 - side, 8, -95, -45, 0, 0]
-        else:
-            pose[7:] = [30 + reach, -18 - side, -8, -95, 45, 0, 0]
-        return pose
 
 
 # ---------------------------------------------------------------------------
@@ -2022,12 +2009,10 @@ class Skills:
         pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
         grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
         scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
-        if scene3_tray and not grasp_ok:
-            log_warn(
-                self.scene,
-                "抓取",
-                "grasp IK failed，但关节空间兜底已执行；继续闭爪并尝试抬升",
-            )
+        if not grasp_ok:
+            reason = "grasp IK failed"
+            log_warn(self.scene, "抓取", "%s，不闭爪，重新检测后再试", reason)
+            return ActionResult(False, "pick", reason, target, time.time() - start)
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
         lift_targets = [lift]
         if scene3_tray:
@@ -2059,11 +2044,11 @@ class Skills:
             if lift_ok:
                 break
         if scene3_tray and not lift_ok:
-            reason = "lift IK failed" if grasp_ok else "grasp/lift IK failed"
+            reason = "lift IK failed"
             log_warn(self.scene, "抓取", "%s，已尝试 %d 次抬升，料盘可能未被抬起", reason, len(lift_targets))
             return ActionResult(False, "pick", reason, target, time.time() - start)
         ik_ok = pre_ok and grasp_ok and lift_ok
-        reason = "" if ik_ok else "IK fallback used"
+        reason = "" if ik_ok else "IK step failed"
         return ActionResult(True, "pick", reason, target, time.time() - start)
 
     def place(self, arm: str, place_xyz_base: Sequence[float],
@@ -2411,7 +2396,6 @@ class Scene3Controller(BaseSceneController):
         start = time.time()
         if not self.wait_for_perception():
             return ActionResult(False, "scene3", "sensor not ready", duration_sec=time.time() - start)
-        self.preload_yolo_model()
         outbound_xyz = self.resolve_outbound_place()
 
         moved_to_rack = False
@@ -2428,27 +2412,63 @@ class Scene3Controller(BaseSceneController):
                 moved_to_rack = True
                 self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
 
-            targets = self.detect_reachable_trays(completed_positions)
-            if not targets:
-                log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
-                break
-            targets.sort(key=self._tray_sort_key)
-            tray = targets[0]
-            arm = self.skills.choose_arm(tray)
-            tray = self.refine_tray_with_wrist(tray, arm)
-            shelf = self._tray_shelf(tray)
-            log_stage(
-                self.scene,
-                "流程",
-                "料盘 #%02d shelf=%s 出库，arm=%s base=%s",
-                index,
-                shelf,
-                arm,
-                _fmt_xyz(tray.position_base),
-            )
-            pick_result = self.skills.pick(tray, arm=arm)
-            if not pick_result.ok:
-                log_warn(self.scene, "失败", "料盘 #%02d 抓取失败: %s", index, pick_result.reason)
+            tray: Optional[PerceptionTarget] = None
+            arm = "right"
+            pick_result: Optional[ActionResult] = None
+            for pick_attempt in range(1, SCENE3_PICK_RETRY + 1):
+                targets = self.detect_reachable_trays(completed_positions)
+                if not targets:
+                    log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
+                    break
+                targets.sort(key=self._tray_sort_key)
+                tray_candidate = targets[0]
+                arm = self.skills.choose_arm(tray_candidate)
+                refined = self.refine_tray_with_wrist(tray_candidate, arm)
+                if refined is None:
+                    log_warn(
+                        self.scene,
+                        "抓取",
+                        "料盘 #%02d 尝试 #%d/%d 腕部复检失败，重新检测",
+                        index,
+                        pick_attempt,
+                        SCENE3_PICK_RETRY,
+                    )
+                    self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
+                    self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                    continue
+                tray = refined
+                shelf = self._tray_shelf(tray)
+                log_stage(
+                    self.scene,
+                    "流程",
+                    "料盘 #%02d 尝试 #%d/%d shelf=%s 出库，arm=%s base=%s",
+                    index,
+                    pick_attempt,
+                    SCENE3_PICK_RETRY,
+                    shelf,
+                    arm,
+                    _fmt_xyz(tray.position_base),
+                )
+                pick_result = self.skills.pick(tray, arm=arm)
+                pick_result.retry_count = pick_attempt - 1
+                if pick_result.ok:
+                    break
+                log_warn(
+                    self.scene,
+                    "抓取",
+                    "料盘 #%02d 尝试 #%d/%d 失败: %s，重新检测后再试",
+                    index,
+                    pick_attempt,
+                    SCENE3_PICK_RETRY,
+                    pick_result.reason,
+                )
+                self.robot.open_claw(arm)
+                self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
+                self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+
+            if pick_result is None or not pick_result.ok or tray is None:
+                reason = pick_result.reason if pick_result is not None else "no target after retry"
+                log_warn(self.scene, "失败", "料盘 #%02d 抓取失败: %s", index, reason)
                 break
 
             self.navigation.drive_for(linear_x=-0.16, duration=3.4, label="return_to_outbound_box")
@@ -2474,9 +2494,9 @@ class Scene3Controller(BaseSceneController):
         if not preload():
             log_warn(self.scene, "YOLO", "模型预加载失败，后续检测会再次尝试并输出原因")
 
-    def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> PerceptionTarget:
+    def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> Optional[PerceptionTarget]:
         if tray.position_base is None:
-            return tray
+            return None
         camera = "{}_wrist".format(arm)
         xyz = tray.position_base
         observe_xyz = (
@@ -2494,7 +2514,10 @@ class Scene3Controller(BaseSceneController):
             _fmt_xyz(observe_xyz),
         )
         self.robot.open_claw(arm)
-        self.robot.move_hand_ik(arm, observe_xyz, duration=1.0, label="wrist_refine_view")
+        observe_ok = self.robot.move_hand_ik(arm, observe_xyz, duration=1.0, label="wrist_refine_view")
+        if not observe_ok:
+            log_warn(self.scene, "腕部复检", "观察位 IK 失败，不执行近似动作，交由外层重新检测")
+            return None
         self.robot.rospy.sleep(0.25)
 
         for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
@@ -2771,6 +2794,10 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     navigation = Navigation(robot)
     skills = Skills(scene=scene, robot=robot, navigation=navigation)
     controller = build_controller(scene, robot, perception, navigation, skills)
+    if scene == "scene3":
+        preload_yolo = getattr(controller, "preload_yolo_model", None)
+        if callable(preload_yolo):
+            preload_yolo()
 
     result = ActionResult(False, "run_scene", "not started")
     try:
