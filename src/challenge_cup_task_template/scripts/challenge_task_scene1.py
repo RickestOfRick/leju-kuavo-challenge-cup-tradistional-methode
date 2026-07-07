@@ -106,9 +106,9 @@ RIGHT_PICK_FINAL_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
 PICK_ALIGN_MOVE_TIME = 1.2
 PICK_GRASP_MOVE_TIME = 1.4
 PICK_LIFT_MOVE_TIME = 1.2
-IK_VALIDATION_TRANSIT_POS_TOL = 0.04
+IK_VALIDATION_TRANSIT_POS_TOL = 0.02
 IK_VALIDATION_TRANSIT_ORI_TOL_DEG = None
-IK_VALIDATION_FINAL_POS_TOL = 0.04
+IK_VALIDATION_FINAL_POS_TOL = 0.02
 IK_VALIDATION_FINAL_ORI_TOL_DEG = None
 
 WEIGH_RELEASE_IK = (0.396, -0.574, 0.146217)
@@ -159,6 +159,7 @@ GRIPPER_HOLD_TIME = 1.0
 SCENE1_PARCEL_COLORS = ("brown", "yellow", "orange", "blue")
 SCENE1_MAX_SCAN_RETRIES = 3
 SCENE1_PICK_ATTEMPTS = 1
+SCENE1_ABORT_ON_PICK_FAIL = True
 
 
 # ---------------------------------------------------------------------------
@@ -863,12 +864,22 @@ class Manipulation(object):
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
                 max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
             self.rospy.logwarn("pick: 横移到上方 IK 无解")
-            self.hw.move_home(settle=0.2)
             return False
         actual_hover, _actual_quat = self.hw.current_eef_pose(side)
         if actual_hover is None:
             self.rospy.logwarn("pick: 无法读取右手上方实际位置")
-            self.hw.move_home(settle=0.2)
+            return False
+        hover_xy_err = math.sqrt(
+            (float(actual_hover[0]) - float(hover[0])) ** 2 +
+            (float(actual_hover[1]) - float(hover[1])) ** 2
+        )
+        if hover_xy_err > 0.035 or float(actual_hover[2]) < 0.20:
+            self.rospy.logwarn(
+                "pick: 实际上方点偏差过大，停止下降 actual=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) xy_err=%.1fmm",
+                actual_hover[0], actual_hover[1], actual_hover[2],
+                hover[0], hover[1], hover[2],
+                hover_xy_err * 1000.0,
+            )
             return False
         vertical_lift = (float(actual_hover[0]), float(actual_hover[1]), float(lift[2]))
         self.rospy.loginfo(
@@ -896,7 +907,6 @@ class Manipulation(object):
                 break
         if not descended:
             self.rospy.logwarn("pick: 下降到抓取高度 IK 无解")
-            self.hw.move_home(settle=0.2)
             return False
         self.hw.gripper(close=True, side=side)
         self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE, side=side)
@@ -907,7 +917,6 @@ class Manipulation(object):
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
                 max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
             self.rospy.logwarn("pick: 抬起阶段 IK 无解或误差过大")
-            self.hw.move_home(settle=0.2)
             return False
         return self._claw_state_ok(self.perception.snapshot()["claw"], side, CLAW_CLOSE_MIN_STATE)
 
@@ -1009,6 +1018,9 @@ def run_scene1(rospy, manip):
                 rospy.logwarn("[scene1] %s 第 %d 次抓取失败", color, attempt + 1)
             if not picked:
                 rospy.logwarn("[scene1] %s 抓取失败，保留到下一轮重扫", color)
+                if SCENE1_ABORT_ON_PICK_FAIL:
+                    rospy.logerr("[scene1] 抓取失败后停止任务，避免继续扫桌或触发摔倒")
+                    return
                 continue
             rospy.loginfo("[scene1] %s 已抓取，开始移动到桌面称重区", color)
             if not manip.place_weigh(side="right"):
