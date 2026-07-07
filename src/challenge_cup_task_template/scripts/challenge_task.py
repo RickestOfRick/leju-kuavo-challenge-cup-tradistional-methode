@@ -124,14 +124,25 @@ SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
 SCENE3_APPROACH_MAX_MISSES = 12
 SCENE3_WRIST_REFINE_RETRY = 2
 SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
-SCENE3_WRIST_OBSERVE_DZ_M = 0.20
-SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.05
+SCENE3_WRIST_OBSERVE_DZ_M = 0.04
+SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.14
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
+# 场景三货架内抓取不从上方垂直抬手：根据料盘高度估算当前层安全高度，
+# 先到侧方安全位，再水平插入货架，抓住后先水平抽出，离开货架后再抬升。
+SCENE3_LOWER_SHELF_INSERT_CLEARANCE_DZ_M = 0.035
+SCENE3_UPPER_SHELF_INSERT_CLEARANCE_DZ_M = 0.030
+SCENE3_SHELF_SIDE_EXTRA_CLEARANCE_DZ_M = 0.015
+SCENE3_SHELF_SIDE_CLEARANCE_Y_M = 0.14
+SCENE3_SHELF_ENTRY_BACKOFF_X_M = 0.14
+SCENE3_SHELF_SIDE_DURATION_SEC = 1.80
+SCENE3_SHELF_ENTRY_DURATION_SEC = 1.60
+SCENE3_SHELF_INSERT_DURATION_SEC = 2.20
+SCENE3_SHELF_RETRACT_DURATION_SEC = 2.20
 # 场景三不考速度，料盘抓取留出更长稳定时间，避免夹爪/手臂半程动作被重试打断。
 SCENE3_CLAW_OPEN_SETTLE_SEC = 0.80
 SCENE3_PRE_GRASP_DURATION_SEC = 2.40
-SCENE3_GRASP_DURATION_SEC = 2.20
+SCENE3_GRASP_DURATION_SEC = 1.40
 SCENE3_GRASP_DWELL_SEC = 0.60
 SCENE3_CLAW_CLOSE_SETTLE_SEC = 1.60
 SCENE3_POST_CLOSE_SETTLE_SEC = 0.80
@@ -435,6 +446,20 @@ def _fmt_xyz(xyz: Optional[Sequence[float]]) -> str:
     if xyz is None:
         return "None"
     return "({:.3f},{:.3f},{:.3f})m".format(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+
+def scene3_shelf_name_from_z(z_base: float) -> str:
+    return "lower" if float(z_base) < SCENE3_SHELF_SPLIT_Z_M else "upper"
+
+
+def scene3_insert_clearance_dz(z_base: float) -> float:
+    if scene3_shelf_name_from_z(z_base) == "lower":
+        return SCENE3_LOWER_SHELF_INSERT_CLEARANCE_DZ_M
+    return SCENE3_UPPER_SHELF_INSERT_CLEARANCE_DZ_M
+
+
+def arm_side_sign(arm: str) -> float:
+    return 1.0 if arm == "left" else -1.0
 
 
 def log_target_list(scene: str, stage: str, targets: Sequence["PerceptionTarget"],
@@ -2051,13 +2076,13 @@ class Skills:
         arm = arm or self.choose_arm(target)
         xyz = self._reachable_xyz(self._grasp_xyz(target))
         yaw = float(target.yaw_rad or 0.0)
+        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        if scene3_tray:
+            return self._pick_scene3_tray(target, arm, xyz, yaw, start)
+
         pre = (xyz[0], xyz[1], xyz[2] + SAFE_PRE_GRASP_DZ_M)
         grasp = (xyz[0], xyz[1], xyz[2])
         lift = (xyz[0], xyz[1], xyz[2] + SAFE_LIFT_DZ_M)
-        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
-        pre_duration = SCENE3_PRE_GRASP_DURATION_SEC if scene3_tray else 1.2
-        grasp_duration = SCENE3_GRASP_DURATION_SEC if scene3_tray else 1.0
-        lift_duration = SCENE3_LIFT_DURATION_SEC if scene3_tray else 1.0
 
         log_stage(
             self.scene,
@@ -2069,50 +2094,16 @@ class Skills:
             _fmt_xyz(grasp),
             math.degrees(yaw),
         )
-        if scene3_tray:
-            log_stage(
-                self.scene,
-                "抓取",
-                "场景三保守时序: pre=%.1fs grasp=%.1fs dwell=%.1fs close=%.1fs post=%.1fs lift=%.1fs",
-                pre_duration,
-                grasp_duration,
-                SCENE3_GRASP_DWELL_SEC,
-                SCENE3_CLAW_CLOSE_SETTLE_SEC,
-                SCENE3_POST_CLOSE_SETTLE_SEC,
-                lift_duration,
-            )
         self.navigation.fine_align_to_image_target(target)
-        if scene3_tray:
-            self.robot.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=SCENE3_CLAW_OPEN_SETTLE_SEC)
-        else:
-            self.robot.open_claw(arm)
-        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=pre_duration, label="pre_grasp")
-        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=grasp_duration, label="grasp")
+        self.robot.open_claw(arm)
+        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
+        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
         if not grasp_ok:
             reason = "grasp IK failed"
             log_warn(self.scene, "抓取", "%s，不闭爪，重新检测后再试", reason)
             return ActionResult(False, "pick", reason, target, time.time() - start)
-        if scene3_tray:
-            self.robot.hold_arm(SCENE3_GRASP_DWELL_SEC, label="tray_grasp_dwell")
-            self.robot.set_claw(
-                arm,
-                self._close_percent(target.class_name),
-                settle_sec=0.0,
-            )
-            self.robot.hold_arm(SCENE3_CLAW_CLOSE_SETTLE_SEC, label="tray_claw_close")
-            self.robot.hold_arm(SCENE3_POST_CLOSE_SETTLE_SEC, label="tray_post_close")
-        else:
-            self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
+        self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
         lift_targets = [lift]
-        if scene3_tray:
-            lift_targets = [
-                (
-                    xyz[0] - SCENE3_LIFT_RETRY_BACKOFF_X_M * index,
-                    xyz[1],
-                    xyz[2] + SAFE_LIFT_DZ_M,
-                )
-                for index in range(SCENE3_LIFT_RETRY)
-            ]
         lift_ok = False
         for lift_attempt, lift_target in enumerate(lift_targets, start=1):
             log_stage(
@@ -2127,20 +2118,124 @@ class Skills:
                 arm,
                 lift_target,
                 yaw_rad=yaw,
-                duration=lift_duration,
+                duration=1.0,
                 label="lift#{}".format(lift_attempt),
             )
             if lift_ok:
-                if scene3_tray:
-                    self.robot.hold_arm(SCENE3_LIFT_SETTLE_SEC, label="tray_lift_settle")
                 break
-        if scene3_tray and not lift_ok:
-            reason = "lift IK failed"
-            log_warn(self.scene, "抓取", "%s，已尝试 %d 次抬升，料盘可能未被抬起", reason, len(lift_targets))
-            return ActionResult(False, "pick", reason, target, time.time() - start)
         ik_ok = pre_ok and grasp_ok and lift_ok
         reason = "" if ik_ok else "IK step failed"
         return ActionResult(True, "pick", reason, target, time.time() - start)
+
+    def _pick_scene3_tray(self, target: PerceptionTarget, arm: str,
+                          xyz: Sequence[float], yaw: float, start: float) -> ActionResult:
+        shelf = scene3_shelf_name_from_z(float(xyz[2]))
+        insert_clearance_dz = scene3_insert_clearance_dz(float(xyz[2]))
+        side_sign = arm_side_sign(arm)
+        entry_x = float(xyz[0]) - SCENE3_SHELF_ENTRY_BACKOFF_X_M
+        side_y = float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M
+        insert_z = float(xyz[2]) + insert_clearance_dz
+        side_z = insert_z + SCENE3_SHELF_SIDE_EXTRA_CLEARANCE_DZ_M
+
+        side_ready = self._reachable_xyz((entry_x, side_y, side_z))
+        shelf_entry = self._reachable_xyz((entry_x, xyz[1], insert_z))
+        insert_pre = self._reachable_xyz((xyz[0], xyz[1], insert_z))
+        grasp = self._reachable_xyz(xyz)
+        retract = self._reachable_xyz((entry_x, xyz[1], xyz[2]))
+
+        log_stage(
+            self.scene,
+            "抓取",
+            (
+                "货架路径 shelf=%s arm=%s clearance=%.3fm "
+                "side=%s entry=%s insert=%s grasp=%s retract=%s"
+            ),
+            shelf,
+            arm,
+            insert_clearance_dz,
+            _fmt_xyz(side_ready),
+            _fmt_xyz(shelf_entry),
+            _fmt_xyz(insert_pre),
+            _fmt_xyz(grasp),
+            _fmt_xyz(retract),
+        )
+        log_stage(
+            self.scene,
+            "抓取",
+            "先侧方平举，再水平插入；闭爪后先水平抽出，离开货架后再抬升",
+        )
+
+        self.navigation.fine_align_to_image_target(target)
+        self.robot.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=SCENE3_CLAW_OPEN_SETTLE_SEC)
+
+        waypoints = [
+            ("side_ready", side_ready, SCENE3_SHELF_SIDE_DURATION_SEC),
+            ("shelf_entry", shelf_entry, SCENE3_SHELF_ENTRY_DURATION_SEC),
+            ("shelf_insert", insert_pre, SCENE3_SHELF_INSERT_DURATION_SEC),
+            ("grasp", grasp, SCENE3_GRASP_DURATION_SEC),
+        ]
+        for label, waypoint, duration in waypoints:
+            ok = self.robot.move_hand_ik(arm, waypoint, yaw_rad=yaw, duration=duration, label=label)
+            if not ok:
+                reason = "{} IK failed".format(label)
+                log_warn(self.scene, "抓取", "%s，不闭爪，重新检测后再试", reason)
+                return ActionResult(False, "pick", reason, target, time.time() - start)
+
+        self.robot.hold_arm(SCENE3_GRASP_DWELL_SEC, label="tray_grasp_dwell")
+        self.robot.set_claw(
+            arm,
+            self._close_percent(target.class_name),
+            settle_sec=0.0,
+        )
+        self.robot.hold_arm(SCENE3_CLAW_CLOSE_SETTLE_SEC, label="tray_claw_close")
+        self.robot.hold_arm(SCENE3_POST_CLOSE_SETTLE_SEC, label="tray_post_close")
+
+        retract_ok = self.robot.move_hand_ik(
+            arm,
+            retract,
+            yaw_rad=yaw,
+            duration=SCENE3_SHELF_RETRACT_DURATION_SEC,
+            label="shelf_retract",
+        )
+        if not retract_ok:
+            reason = "shelf retract IK failed"
+            log_warn(self.scene, "抓取", "%s，料盘可能仍在货架内", reason)
+            return ActionResult(False, "pick", reason, target, time.time() - start)
+
+        lift_targets = [
+            (
+                retract[0] - SCENE3_LIFT_RETRY_BACKOFF_X_M * index,
+                retract[1],
+                retract[2] + SAFE_LIFT_DZ_M,
+            )
+            for index in range(SCENE3_LIFT_RETRY)
+        ]
+        lift_ok = False
+        for lift_attempt, lift_target in enumerate(lift_targets, start=1):
+            log_stage(
+                self.scene,
+                "抓取",
+                "离架后抬升 #%d/%d target=%s",
+                lift_attempt,
+                len(lift_targets),
+                _fmt_xyz(lift_target),
+            )
+            lift_ok = self.robot.move_hand_ik(
+                arm,
+                lift_target,
+                yaw_rad=yaw,
+                duration=SCENE3_LIFT_DURATION_SEC,
+                label="lift#{}".format(lift_attempt),
+            )
+            if lift_ok:
+                self.robot.hold_arm(SCENE3_LIFT_SETTLE_SEC, label="tray_lift_settle")
+                break
+        if not lift_ok:
+            reason = "lift IK failed"
+            log_warn(self.scene, "抓取", "%s，已尝试 %d 次离架后抬升", reason, len(lift_targets))
+            return ActionResult(False, "pick", reason, target, time.time() - start)
+
+        return ActionResult(True, "pick", "", target, time.time() - start)
 
     def place(self, arm: str, place_xyz_base: Sequence[float],
               label: str = "place") -> ActionResult:
@@ -2590,25 +2685,49 @@ class Scene3Controller(BaseSceneController):
             return None
         camera = "{}_wrist".format(arm)
         xyz = tray.position_base
+        insert_clearance_dz = scene3_insert_clearance_dz(float(xyz[2]))
+        side_sign = arm_side_sign(arm)
+        entry_x = float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M
+        observe_z = float(xyz[2]) + max(SCENE3_WRIST_OBSERVE_DZ_M, insert_clearance_dz)
+        side_observe_xyz = (
+            entry_x,
+            float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M,
+            observe_z + SCENE3_SHELF_SIDE_EXTRA_CLEARANCE_DZ_M,
+        )
         observe_xyz = (
-            float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M,
+            entry_x,
             float(xyz[1]),
-            float(xyz[2]) + SCENE3_WRIST_OBSERVE_DZ_M,
+            observe_z,
         )
         log_stage(
             self.scene,
             "腕部复检",
-            "arm=%s camera=%s rough=%s observe=%s",
+            "arm=%s camera=%s rough=%s side=%s observe=%s",
             arm,
             camera,
             _fmt_xyz(xyz),
+            _fmt_xyz(side_observe_xyz),
             _fmt_xyz(observe_xyz),
         )
         self.robot.open_claw(arm)
-        observe_ok = self.robot.move_hand_ik(arm, observe_xyz, duration=1.0, label="wrist_refine_view")
+        side_ok = self.robot.move_hand_ik(
+            arm,
+            side_observe_xyz,
+            duration=SCENE3_SHELF_SIDE_DURATION_SEC,
+            label="wrist_refine_side",
+        )
+        if not side_ok:
+            log_warn(self.scene, "腕部复检", "侧方观察位 IK 失败，跳过腕部复检，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
+            return tray
+        observe_ok = self.robot.move_hand_ik(
+            arm,
+            observe_xyz,
+            duration=SCENE3_SHELF_ENTRY_DURATION_SEC,
+            label="wrist_refine_view",
+        )
         if not observe_ok:
-            log_warn(self.scene, "腕部复检", "观察位 IK 失败，不执行近似动作，交由外层重新检测")
-            return None
+            log_warn(self.scene, "腕部复检", "观察位 IK 失败，跳过腕部复检，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
+            return tray
         self.robot.rospy.sleep(0.25)
 
         for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
