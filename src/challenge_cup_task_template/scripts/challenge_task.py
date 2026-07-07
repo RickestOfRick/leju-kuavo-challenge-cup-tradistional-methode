@@ -128,17 +128,16 @@ SCENE3_WRIST_OBSERVE_DZ_M = 0.06
 SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.14
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
-# 场景三货架内抓取不从上方垂直抬手：根据料盘高度估算当前层安全高度，
-# 先到侧方安全位，再水平插入货架，抓住后先水平抽出，离开货架后再抬升。
-SCENE3_LOWER_SHELF_INSERT_CLEARANCE_DZ_M = 0.055
-SCENE3_UPPER_SHELF_INSERT_CLEARANCE_DZ_M = 0.050
-SCENE3_SHELF_SIDE_EXTRA_CLEARANCE_DZ_M = 0.020
-SCENE3_SHELF_SIDE_CLEARANCE_Y_M = 0.14
+# 场景三货架内抓取不从上方垂直抬手：平举/插入高度使用料盘中心高度，
+# 抓取点再由 SCENE3_TRAY_GRASP_OFFSET_BASE 做轻微下探。
+SCENE3_SHELF_SIDE_CLEARANCE_Y_M = 0.08
 SCENE3_SHELF_ENTRY_BACKOFF_X_M = 0.14
 SCENE3_SHELF_SIDE_DURATION_SEC = 1.80
 SCENE3_SHELF_ENTRY_DURATION_SEC = 1.60
 SCENE3_SHELF_INSERT_DURATION_SEC = 2.20
 SCENE3_SHELF_RETRACT_DURATION_SEC = 2.20
+SCENE3_PRE_PICK_BASE_SETTLE_SEC = 0.80
+SCENE3_ARM_MODE_SETTLE_SEC = 2.60
 # 场景三不考速度，料盘抓取留出更长稳定时间，避免夹爪/手臂半程动作被重试打断。
 SCENE3_CLAW_OPEN_SETTLE_SEC = 0.80
 SCENE3_PRE_GRASP_DURATION_SEC = 2.40
@@ -455,12 +454,6 @@ def scene3_shelf_name_from_z(z_base: float) -> str:
     return "lower" if float(z_base) < SCENE3_SHELF_SPLIT_Z_M else "upper"
 
 
-def scene3_insert_clearance_dz(z_base: float) -> float:
-    if scene3_shelf_name_from_z(z_base) == "lower":
-        return SCENE3_LOWER_SHELF_INSERT_CLEARANCE_DZ_M
-    return SCENE3_UPPER_SHELF_INSERT_CLEARANCE_DZ_M
-
-
 def arm_side_sign(arm: str) -> float:
     return 1.0 if arm == "left" else -1.0
 
@@ -630,6 +623,14 @@ class RobotBase:
                     raise RuntimeError(getattr(res, "message", "service returned false"))
                 self._arm_mode = int(mode)
                 log_stage(self.scene, "手臂模式", "%s -> mode=%d", service_name, mode)
+                if self.scene == "scene3" and int(mode) == ARM_MODE_EXTERNAL_CONTROL:
+                    log_stage(
+                        self.scene,
+                        "手臂模式",
+                        "等待外部手臂控制稳定 %.1fs 后再发送轨迹",
+                        SCENE3_ARM_MODE_SETTLE_SEC,
+                    )
+                    self.rospy.sleep(SCENE3_ARM_MODE_SETTLE_SEC)
                 return True
             except Exception as exc:
                 last_exc = exc
@@ -2183,17 +2184,16 @@ class Skills:
 
     def _pick_scene3_tray(self, target: PerceptionTarget, arm: str,
                           xyz: Sequence[float], yaw: float, start: float) -> ActionResult:
-        shelf = scene3_shelf_name_from_z(float(xyz[2]))
-        insert_clearance_dz = scene3_insert_clearance_dz(float(xyz[2]))
+        tray_center_z = float(target.position_base[2]) if target.position_base is not None else float(xyz[2])
+        shelf = scene3_shelf_name_from_z(tray_center_z)
         side_sign = arm_side_sign(arm)
         entry_x = float(xyz[0]) - SCENE3_SHELF_ENTRY_BACKOFF_X_M
         side_y = float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M
-        insert_z = float(xyz[2]) + insert_clearance_dz
-        side_z = insert_z + SCENE3_SHELF_SIDE_EXTRA_CLEARANCE_DZ_M
+        level_z = tray_center_z
 
-        side_ready = self._reachable_xyz((entry_x, side_y, side_z))
-        shelf_entry = self._reachable_xyz((entry_x, xyz[1], insert_z))
-        insert_pre = self._reachable_xyz((xyz[0], xyz[1], insert_z))
+        side_ready = self._reachable_xyz((entry_x, side_y, level_z))
+        shelf_entry = self._reachable_xyz((entry_x, xyz[1], level_z))
+        insert_pre = self._reachable_xyz((xyz[0], xyz[1], level_z))
         grasp = self._reachable_xyz(xyz)
         retract = self._reachable_xyz((entry_x, xyz[1], xyz[2]))
 
@@ -2201,12 +2201,12 @@ class Skills:
             self.scene,
             "抓取",
             (
-                "货架路径 shelf=%s arm=%s clearance=%.3fm "
+                "货架路径 shelf=%s arm=%s level_z=%.3fm "
                 "side=%s entry=%s insert=%s grasp=%s retract=%s"
             ),
             shelf,
             arm,
-            insert_clearance_dz,
+            level_z,
             _fmt_xyz(side_ready),
             _fmt_xyz(shelf_entry),
             _fmt_xyz(insert_pre),
@@ -2219,7 +2219,13 @@ class Skills:
             "先侧方平举，再水平插入；闭爪后先水平抽出，离开货架后再抬升",
         )
 
-        self.navigation.fine_align_to_image_target(target)
+        log_stage(
+            self.scene,
+            "抓取",
+            "抓取前不再触发底盘 fine_align，停车稳定 %.1fs",
+            SCENE3_PRE_PICK_BASE_SETTLE_SEC,
+        )
+        self.robot.stop_base(duration=SCENE3_PRE_PICK_BASE_SETTLE_SEC)
         self.robot.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=SCENE3_CLAW_OPEN_SETTLE_SEC)
 
         waypoints = [
@@ -2740,14 +2746,13 @@ class Scene3Controller(BaseSceneController):
             return None
         camera = "{}_wrist".format(arm)
         xyz = tray.position_base
-        insert_clearance_dz = scene3_insert_clearance_dz(float(xyz[2]))
+        observe_z = float(xyz[2])
         side_sign = arm_side_sign(arm)
         entry_x = float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M
-        observe_z = float(xyz[2]) + max(SCENE3_WRIST_OBSERVE_DZ_M, insert_clearance_dz)
         side_observe_xyz = (
             entry_x,
             float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M,
-            observe_z + SCENE3_SHELF_SIDE_EXTRA_CLEARANCE_DZ_M,
+            observe_z,
         )
         observe_xyz = (
             entry_x,
