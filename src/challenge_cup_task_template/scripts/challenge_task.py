@@ -8,6 +8,9 @@ scripts/challenge_task_scene*.py。
 
 import argparse
 import importlib
+import importlib.util
+import os
+import sys
 
 
 SCENE_CONFIGS = {
@@ -27,7 +30,7 @@ def run_scene(scene, seed, node_name=None, timeout=None,
         raise ValueError("unknown scene: {}".format(scene))
 
     config = SCENE_CONFIGS[scene]
-    scene_module = importlib.import_module(config["module"])
+    scene_module = _import_scene_module(config["module"])
     return scene_module.run_scene(
         scene=scene,
         seed=seed,
@@ -36,6 +39,22 @@ def run_scene(scene, seed, node_name=None, timeout=None,
         time_limit=time_limit,
         timer_gui=timer_gui,
     )
+
+
+def _import_scene_module(module_name):
+    """Load sibling scene scripts from source, not catkin's devel wrappers."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(script_dir, module_name + ".py")
+    if not os.path.exists(script_path):
+        return importlib.import_module(module_name)
+
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load scene module from {}".format(script_path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def main():
