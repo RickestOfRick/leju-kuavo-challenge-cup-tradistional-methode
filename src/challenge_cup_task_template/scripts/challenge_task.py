@@ -141,8 +141,15 @@ SCENE3_TRAY_GRASP_Z_RANGE_BY_SHELF_M = {
     "upper": (0.20, 0.58),
 }
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
-SCENE3_PICK_RETRY = 10
-SCENE3_PICK_RETRY_SETTLE_SEC = 0.25
+SCENE3_PICK_RETRY = 100
+SCENE3_PICK_RETRY_SETTLE_SEC = 1.50
+SCENE3_PRE_GRASP_DURATION_SEC = 2.6
+SCENE3_GRASP_DURATION_SEC = 2.2
+SCENE3_GRASP_SETTLE_SEC = 0.80
+SCENE3_POST_CLOSE_SETTLE_SEC = 1.20
+SCENE3_LIFT_DURATION_SEC = 2.2
+SCENE3_WRIST_OBSERVE_DURATION_SEC = 1.8
+SCENE3_WRIST_REFINE_SETTLE_SEC = 0.60
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
 
@@ -539,6 +546,7 @@ class RobotBase:
         self.claw_state = None
         self._sensor_seen = False
         self._arm_mode: Optional[int] = None
+        self.last_ik_failure = ""
 
         rospy.Subscriber("/sensors_data_raw", sensorsData, self._sensor_cb, queue_size=1)
         rospy.Subscriber("/leju_claw_state", lejuClawState, self._claw_state_cb, queue_size=1)
@@ -567,6 +575,18 @@ class RobotBase:
         if not self._sensor_seen:
             return list(self.last_arm_deg)
         return [math.degrees(float(v)) for v in self.current_arm_rad]
+
+    def active_arm_deg_summary(self, arm: str) -> str:
+        joints = self.current_arm_deg()
+        if len(joints) != 14:
+            joints = list(self.last_arm_deg)
+        if arm == "left":
+            values = joints[:7]
+        elif arm == "right":
+            values = joints[7:]
+        else:
+            values = joints
+        return "[" + ",".join("{:.1f}".format(float(v)) for v in values) + "]"
 
     def prepare(self) -> None:
         log_stage(self.scene, "初始化", "等待传感器、打开夹爪、准备任务姿态")
@@ -805,21 +825,46 @@ class RobotBase:
     def move_hand_ik(self, arm: str, target_xyz_base: Sequence[float],
                      yaw_rad: float = 0.0, duration: float = 1.2,
                      label: str = "ik") -> bool:
+        requested = (
+            float(target_xyz_base[0]),
+            float(target_xyz_base[1]),
+            float(target_xyz_base[2]),
+        )
         z_min = SCENE_SAFE_MIN_Z_BASE_M.get(self.scene, SAFE_MIN_Z_BASE_M)
         z_max = SCENE_SAFE_MAX_Z_BASE_M.get(self.scene, SAFE_MAX_Z_BASE_M)
         target = [
-            clamp(float(target_xyz_base[0]), -0.05, REACH_X_MAX_M),
-            float(target_xyz_base[1]),
-            clamp(float(target_xyz_base[2]), z_min, z_max),
+            clamp(requested[0], -0.05, REACH_X_MAX_M),
+            requested[1],
+            clamp(requested[2], z_min, z_max),
         ]
         quat = quat_down(yaw_rad if arm == "left" else yaw_rad + math.pi)
+        self.last_ik_failure = ""
         try:
             q_deg = self.solve_ik(arm, target, quat_xyzw=quat, constraint_mode=2)
             self.move_arm_deg(q_deg, duration=duration)
             return True
         except Exception as exc:
-            log_warn(self.scene, "IK", "%s 失败，不执行近似关节动作，等待上层重新检测: %s target=%s",
-                     label, exc, _fmt_xyz(target))
+            clamp_note = ""
+            if distance3(requested, target) > 1e-4:
+                clamp_note = " requested=%s clamped=%s" % (_fmt_xyz(requested), _fmt_xyz(target))
+            else:
+                clamp_note = " target=%s" % _fmt_xyz(target)
+            self.last_ik_failure = (
+                "{} IK failed: arm={} err={}{} yaw={:.1f}deg mode={} "
+                "active_joints_deg={} x_limit=[-0.05,{:.2f}] z_limit=[{:.2f},{:.2f}]"
+            ).format(
+                label,
+                arm,
+                exc,
+                clamp_note,
+                math.degrees(float(yaw_rad)),
+                self._arm_mode,
+                self.active_arm_deg_summary(arm),
+                REACH_X_MAX_M,
+                z_min,
+                z_max,
+            )
+            log_warn(self.scene, "IK", "%s，不执行近似关节动作，等待上层重新检测", self.last_ik_failure)
             return False
 
 
@@ -2043,27 +2088,46 @@ class Skills:
         pre = (xyz[0], xyz[1], xyz[2] + SAFE_PRE_GRASP_DZ_M)
         grasp = (xyz[0], xyz[1], xyz[2])
         lift = (xyz[0], xyz[1], xyz[2] + SAFE_LIFT_DZ_M)
+        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        pre_duration = SCENE3_PRE_GRASP_DURATION_SEC if scene3_tray else 1.2
+        grasp_duration = SCENE3_GRASP_DURATION_SEC if scene3_tray else 1.0
+        lift_duration = SCENE3_LIFT_DURATION_SEC if scene3_tray else 1.0
 
         log_stage(
             self.scene,
             "抓取",
-            "class=%s arm=%s pre=%s grasp=%s yaw=%.1fdeg",
+            "class=%s arm=%s pre=%s grasp=%s yaw=%.1fdeg timing(pre=%.1fs,grasp=%.1fs,lift=%.1fs)",
             target.class_name,
             arm,
             _fmt_xyz(pre),
             _fmt_xyz(grasp),
             math.degrees(yaw),
+            pre_duration,
+            grasp_duration,
+            lift_duration,
         )
         self.navigation.fine_align_to_image_target(target)
         self.robot.open_claw(arm)
-        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
-        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
-        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=pre_duration, label="pre_grasp")
+        pre_failure = "" if pre_ok else self.robot.last_ik_failure
+        if pre_failure:
+            log_warn(
+                self.scene,
+                "抓取",
+                "%s，仍继续尝试进入抓取点",
+                self._pick_failure_reason("pre_grasp", target, arm, pre, pre_failure),
+            )
+        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=grasp_duration, label="grasp")
+        grasp_failure = "" if grasp_ok else self.robot.last_ik_failure
         if not grasp_ok:
-            reason = "grasp IK failed"
+            reason = self._pick_failure_reason("grasp", target, arm, grasp, grasp_failure)
             log_warn(self.scene, "抓取", "%s，不闭爪，重新检测后再试", reason)
             return ActionResult(False, "pick", reason, target, time.time() - start)
+        if scene3_tray:
+            self.robot.rospy.sleep(SCENE3_GRASP_SETTLE_SEC)
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
+        if scene3_tray:
+            self.robot.rospy.sleep(SCENE3_POST_CLOSE_SETTLE_SEC)
         lift_targets = [lift]
         if scene3_tray:
             lift_targets = [
@@ -2088,17 +2152,18 @@ class Skills:
                 arm,
                 lift_target,
                 yaw_rad=yaw,
-                duration=1.0,
+                duration=lift_duration,
                 label="lift#{}".format(lift_attempt),
             )
             if lift_ok:
                 break
+        lift_failure = "" if lift_ok else self.robot.last_ik_failure
         if scene3_tray and not lift_ok:
-            reason = "lift IK failed"
+            reason = self._pick_failure_reason("lift", target, arm, lift_targets[-1], lift_failure)
             log_warn(self.scene, "抓取", "%s，已尝试 %d 次抬升，料盘可能未被抬起", reason, len(lift_targets))
             return ActionResult(False, "pick", reason, target, time.time() - start)
         ik_ok = pre_ok and grasp_ok and lift_ok
-        reason = "" if ik_ok else "IK step failed"
+        reason = "" if ik_ok else self._pick_failure_reason("pre_grasp", target, arm, pre, pre_failure)
         return ActionResult(True, "pick", reason, target, time.time() - start)
 
     def place(self, arm: str, place_xyz_base: Sequence[float],
@@ -2137,6 +2202,34 @@ class Skills:
             float(xyz[1]),
             clamp(float(xyz[2]), z_min, z_max),
         )
+
+    def _pick_failure_reason(self, stage: str, target: PerceptionTarget, arm: str,
+                             intended_xyz: Sequence[float], ik_failure: str = "") -> str:
+        pieces = [
+            "{} failed".format(stage),
+            "class={}".format(target.class_name),
+            "arm={}".format(arm),
+            "target_base={}".format(_fmt_xyz(target.position_base)),
+            "intended={}".format(_fmt_xyz(intended_xyz)),
+            "cam={}".format(target.camera),
+            "uv={}".format(target.center_uv),
+            "conf={:.2f}".format(float(target.confidence)),
+        ]
+        if self.scene == "scene3" and target.position_base is not None:
+            pieces.append("shelf={}".format(scene3_shelf_from_base_z(float(target.position_base[2]))))
+        if target.debug:
+            depth = target.debug.get("depth_m")
+            frame = target.debug.get("frame_id")
+            if depth is not None:
+                try:
+                    pieces.append("depth={:.3f}m".format(float(depth)))
+                except (TypeError, ValueError):
+                    pieces.append("depth={}".format(depth))
+            if frame:
+                pieces.append("frame={}".format(frame))
+        if ik_failure:
+            pieces.append("ik={}".format(ik_failure))
+        return "; ".join(pieces)
 
     def _grasp_xyz(self, target: PerceptionTarget) -> Tuple[float, float, float]:
         assert target.position_base is not None
@@ -2581,11 +2674,16 @@ class Scene3Controller(BaseSceneController):
             _fmt_xyz(observe_xyz),
         )
         self.robot.open_claw(arm)
-        observe_ok = self.robot.move_hand_ik(arm, observe_xyz, duration=1.0, label="wrist_refine_view")
+        observe_ok = self.robot.move_hand_ik(
+            arm,
+            observe_xyz,
+            duration=SCENE3_WRIST_OBSERVE_DURATION_SEC,
+            label="wrist_refine_view",
+        )
         if not observe_ok:
             log_warn(self.scene, "腕部复检", "观察位 IK 失败，沿用头部相机坐标并交由抓取保护处理")
             return tray
-        self.robot.rospy.sleep(0.25)
+        self.robot.rospy.sleep(SCENE3_WRIST_REFINE_SETTLE_SEC)
 
         for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
             candidates = self.perception.detect_targets(
