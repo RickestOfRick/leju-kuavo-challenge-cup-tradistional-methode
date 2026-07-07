@@ -86,7 +86,9 @@ SCENE3_APPROACH_SPEED_MPS = 0.16
 SCENE3_APPROACH_MIN_DURATION_SEC = 0.35
 SCENE3_APPROACH_MAX_DURATION_SEC = 0.80
 SCENE3_APPROACH_SETTLE_SEC = 0.10
-SCENE3_APPROACH_RETRY = 24
+SCENE3_APPROACH_RETRY = 48
+SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
+SCENE3_APPROACH_MAX_MISSES = 12
 SCENE3_WRIST_REFINE_RETRY = 2
 SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
 SCENE3_WRIST_OBSERVE_DZ_M = 0.20
@@ -2489,6 +2491,7 @@ class Scene3Controller(BaseSceneController):
         return tray
 
     def detect_reachable_trays(self, completed_shelves: set) -> List[PerceptionTarget]:
+        miss_count = 0
         for attempt in range(1, SCENE3_APPROACH_RETRY + 1):
             raw_targets = self.perception.detect_targets(
                 class_names=["smt_tray"],
@@ -2517,8 +2520,31 @@ class Scene3Controller(BaseSceneController):
             if reachable:
                 return reachable
             if not far_targets:
-                return []
+                miss_count += 1
+                if miss_count > SCENE3_APPROACH_MAX_MISSES:
+                    log_warn(
+                        self.scene,
+                        "检测",
+                        "连续 %d 次没有可靠近候选，结束出库循环",
+                        miss_count,
+                    )
+                    return []
+                log_stage(
+                    self.scene,
+                    "导航",
+                    "第 %d 次未得到可抓/远处料盘候选，短步靠近 %.2fs 后继续检测",
+                    attempt,
+                    SCENE3_APPROACH_SEARCH_DURATION_SEC,
+                )
+                self.navigation.drive_for(
+                    linear_x=SCENE3_APPROACH_SPEED_MPS,
+                    duration=SCENE3_APPROACH_SEARCH_DURATION_SEC,
+                    label="approach_search_tray",
+                )
+                self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+                continue
 
+            miss_count = 0
             far_targets.sort(key=lambda item: float(item.position_base[0]) if item.position_base else 99.0)
             target = far_targets[0]
             assert target.position_base is not None
