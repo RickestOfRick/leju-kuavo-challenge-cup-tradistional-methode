@@ -89,24 +89,23 @@ PARCEL_DETECT_MIN_AREA = 120
 PARCEL_DETECT_MORPH_KERNEL = 5
 PARCEL_DEPTH_WINDOW = 5
 
-RIGHT_PICK_IK_Z = -0.03
-RIGHT_PICK_TRANSIT_IK_Z = 0.120
-RIGHT_PICK_OFFSET_FAR_ROW = (-0.03, 0.0, 0.0)
-RIGHT_PICK_OFFSET_NEAR_ROW = (-0.03, 0.02, -0.02)
-RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
-RIGHT_PICK_YZ_ALIGN_SAFE_IK_X = 0.184
-LIFT_Z_OFFSET = 0.300
+RIGHT_PICK_GRASP_Z_OFFSET = 0.070
+RIGHT_PICK_GRASP_Z_MIN = 0.015
+RIGHT_PICK_GRASP_Z_MAX = 0.090
+RIGHT_PICK_HOVER_Z_OFFSET = 0.220
+RIGHT_PICK_LIFT_Z_OFFSET = 0.300
+RIGHT_PICK_XY_OFFSET = (0.0, 0.0)
 RIGHT_PICK_FIRST_YPR_DEG = (0.0, -90.0, 0.0)
 RIGHT_PICK_SECOND_YPR_DEG = (90.0, 0.0, 0.0)
 RIGHT_PICK_TRANSIT_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
-RIGHT_PICK_FINAL_CONSTRAINT_MODE = IK_MODE_POS_HARD_ORI_HARD
+RIGHT_PICK_FINAL_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
 PICK_ALIGN_MOVE_TIME = 1.2
 PICK_GRASP_MOVE_TIME = 1.4
 PICK_LIFT_MOVE_TIME = 1.2
 IK_VALIDATION_TRANSIT_POS_TOL = 0.07
 IK_VALIDATION_TRANSIT_ORI_TOL_DEG = None
 IK_VALIDATION_FINAL_POS_TOL = 0.03
-IK_VALIDATION_FINAL_ORI_TOL_DEG = 35.0
+IK_VALIDATION_FINAL_ORI_TOL_DEG = None
 
 WEIGH_RELEASE_IK = (0.396, -0.574, 0.146217)
 WEIGH_TRANSIT_IK_Z = 0.326217
@@ -136,6 +135,15 @@ LEFT_HANDOFF_RECEIVE_SECOND_YPR_DEG = (-90.0, 0.0, -90.0)
 BOX_DROP_IK = (0.605966, 0.226114, 0.556217)
 BOX_DROP_FIRST_YPR_DEG = (-0.328, -100.935, 0.0)
 BOX_DROP_SECOND_YPR_DEG = (-90.0, 0.0, 0.369)
+LEFT_BOX_STATION_IK = BOX_DROP_IK
+LEFT_BOX_STATION_FIRST_YPR_DEG = BOX_DROP_FIRST_YPR_DEG
+LEFT_BOX_STATION_SECOND_YPR_DEG = BOX_DROP_SECOND_YPR_DEG
+RIGHT_BOX_HANDOFF_IK = (
+    LEFT_BOX_STATION_IK[0] - 0.020,
+    LEFT_BOX_STATION_IK[1] - 0.091,
+    LEFT_BOX_STATION_IK[2] + 0.080,
+)
+RIGHT_BOX_HANDOFF_TRANSIT_IK_Z = RIGHT_BOX_HANDOFF_IK[2] + 0.120
 BOX_DROP_OFFSETS = (
     (0.0, -0.01, 0.0),
     (0.0, 0.04, 0.0),
@@ -361,6 +369,8 @@ class Hardware(object):
             self._tf_listener = rt["tf2_ros"].TransformListener(self.tf_buffer)
         self._srv_cache = {}
         self._arm_mode = None
+        self._claw_cmd = {"left": CLAW_OPEN, "right": CLAW_OPEN}
+        self.locked_left_pose = None
 
     def _service(self, name, srv_type, timeout=2.0):
         proxy = self._srv_cache.get(name)
@@ -516,8 +526,13 @@ class Hardware(object):
         cmd.hand_poses.right_pose.joint_angles = cur[7:14]
         cmd.hand_poses.left_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
         cmd.hand_poses.right_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
-        cmd.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
-        cmd.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
+        if side == "right" and self.locked_left_pose is not None:
+            left_pos, left_quat = self.locked_left_pose
+            cmd.hand_poses.left_pose.pos_xyz = list(left_pos)
+            cmd.hand_poses.left_pose.quat_xyzw = list(left_quat)
+        else:
+            cmd.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
+            cmd.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
         cmd.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
         cmd.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
         target = cmd.hand_poses.left_pose if side == "left" else cmd.hand_poses.right_pose
@@ -599,13 +614,21 @@ class Hardware(object):
         self.interp_publish(start_deg, target_deg, move_time=move_time)
         return True
 
+    def lock_left_pose(self, pos_ik, first_ypr, second_ypr=None):
+        self.locked_left_pose = (tuple(float(v) for v in pos_ik),
+                                 tuple(quat_from_ypr(first_ypr, second_ypr)))
+
     def gripper(self, close, side="both", vel=50.0, effort=1.0):
         if self.claw_srv is None:
             self.rospy.logwarn_throttle(10.0, "夹爪服务缺失，跳过 gripper")
             return False
         pos = CLAW_CLOSE if close else CLAW_OPEN
-        left = pos if side in ("both", "left") else CLAW_OPEN
-        right = pos if side in ("both", "right") else CLAW_OPEN
+        if side in ("both", "left"):
+            self._claw_cmd["left"] = pos
+        if side in ("both", "right"):
+            self._claw_cmd["right"] = pos
+        left = self._claw_cmd["left"]
+        right = self._claw_cmd["right"]
         try:
             req = self.rt["controlLejuClawRequest"]()
             req.data.name = ["left_claw", "right_claw"]
@@ -617,11 +640,18 @@ class Hardware(object):
             self.rospy.logerr("夹爪调用失败: %s", exc)
             return False
 
-    def wait_claw_settled(self, min_state=CLAW_OPEN_MIN_STATE, timeout=3.0):
+    def wait_claw_settled(self, min_state=CLAW_OPEN_MIN_STATE, timeout=3.0, side=None):
         end = self.rospy.Time.now() + self.rospy.Duration(timeout)
         rate = self.rospy.Rate(20)
         while self.rospy.Time.now() < end and not self.rospy.is_shutdown():
-            if all(s >= min_state for s in self.perception.snapshot()["claw"]):
+            claw_state = self.perception.snapshot()["claw"]
+            if side == "left":
+                ok = len(claw_state) >= 1 and claw_state[0] >= min_state
+            elif side == "right":
+                ok = len(claw_state) >= 2 and claw_state[1] >= min_state
+            else:
+                ok = all(s >= min_state for s in claw_state)
+            if ok:
                 return True
             rate.sleep()
         return False
@@ -749,24 +779,20 @@ class Manipulation(object):
         self.vision = vision
 
     @staticmethod
-    def _pick_offset_for(pos_ik):
-        if pos_ik[1] > RIGHT_PICK_NEAR_FAR_Y_THRESHOLD:
-            return RIGHT_PICK_OFFSET_NEAR_ROW
-        return RIGHT_PICK_OFFSET_FAR_ROW
+    def _clamp(value, lower, upper):
+        return max(float(lower), min(float(upper), float(value)))
 
-    @staticmethod
-    def _right_pick_yz_align_ik(current_right_ik, right_pick_pre_ik):
-        if current_right_ik is None:
-            return None
-        current_x = float(current_right_ik[0])
-        target_x = float(right_pick_pre_ik[0])
-        safe_x = float(RIGHT_PICK_YZ_ALIGN_SAFE_IK_X)
-        if current_x <= target_x:
-            align_x = min(target_x, max(current_x, safe_x))
-        else:
-            align_x = max(target_x, min(current_x, safe_x))
-        align_z = max(float(current_right_ik[2]), float(right_pick_pre_ik[2]))
-        return (align_x, float(right_pick_pre_ik[1]), align_z)
+    def _pick_targets_for(self, pos_ik):
+        x = float(pos_ik[0]) + float(RIGHT_PICK_XY_OFFSET[0])
+        y = float(pos_ik[1]) + float(RIGHT_PICK_XY_OFFSET[1])
+        grasp_z = self._clamp(
+            float(pos_ik[2]) + float(RIGHT_PICK_GRASP_Z_OFFSET),
+            RIGHT_PICK_GRASP_Z_MIN,
+            RIGHT_PICK_GRASP_Z_MAX,
+        )
+        hover_z = grasp_z + float(RIGHT_PICK_HOVER_Z_OFFSET)
+        lift_z = grasp_z + float(RIGHT_PICK_LIFT_Z_OFFSET)
+        return (x, y, hover_z), (x, y, grasp_z), (x, y, lift_z)
 
     @staticmethod
     def _claw_state_ok(claw_state, side, min_state):
@@ -775,6 +801,28 @@ class Manipulation(object):
         if side == "right":
             return len(claw_state) >= 2 and claw_state[1] >= min_state
         return all(s >= min_state for s in claw_state)
+
+    def prepare_left_box_station(self):
+        if not self.hw.ensure_external_arm_mode("prepare_left_box_station"):
+            return False
+        self.hw.gripper(close=False, side="left")
+        if not self.hw.move_eef_to(
+                "left", LEFT_BOX_STATION_IK,
+                LEFT_BOX_STATION_FIRST_YPR_DEG,
+                LEFT_BOX_STATION_SECOND_YPR_DEG,
+                constraint_mode=IK_MODE_THREE_POINT_MIXED,
+                move_time=ARM_MOVE_TIME,
+                max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
+                max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
+            self.rospy.logwarn("prepare_left_box_station: 左手箱上方固定站位失败")
+            return False
+        self.hw.lock_left_pose(
+            LEFT_BOX_STATION_IK,
+            LEFT_BOX_STATION_FIRST_YPR_DEG,
+            LEFT_BOX_STATION_SECOND_YPR_DEG,
+        )
+        self.rospy.loginfo("左手已固定在箱子上方，后续只开合夹爪")
+        return True
 
     def scan_locate_all(self, color_names):
         found = {}
@@ -801,24 +849,18 @@ class Manipulation(object):
     def pick(self, pos_ik, side="right"):
         if not self.hw.ensure_external_arm_mode("pick"):
             return False
-        ox, oy, oz = self._pick_offset_for(pos_ik)
-        x, y, _z = pos_ik[0] + ox, pos_ik[1] + oy, pos_ik[2] + oz
+        hover, grasp, lift = self._pick_targets_for(pos_ik)
         first, second = RIGHT_PICK_FIRST_YPR_DEG, RIGHT_PICK_SECOND_YPR_DEG
-        self.hw.gripper(close=False)
+        self.rospy.loginfo(
+            "pick: raw=(%.3f, %.3f, %.3f) hover=(%.3f, %.3f, %.3f) grasp=(%.3f, %.3f, %.3f)",
+            pos_ik[0], pos_ik[1], pos_ik[2],
+            hover[0], hover[1], hover[2],
+            grasp[0], grasp[1], grasp[2],
+        )
+        self.hw.gripper(close=False, side=side)
         self.hw.look_forward()
-        pre_pick = (x, y, RIGHT_PICK_TRANSIT_IK_Z)
-        current_right, _quat = self.hw.current_eef_pose(side)
-        yz_align = self._right_pick_yz_align_ik(current_right, pre_pick)
-        if yz_align is not None and not self.hw.move_eef_to(
-                side, yz_align, first, second,
-                constraint_mode=IK_MODE_THREE_POINT_MIXED,
-                move_time=PICK_ALIGN_MOVE_TIME,
-                max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
-                max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
-            self.rospy.logwarn("pick: y/z 对齐 IK 无解或误差过大")
-            return False
         if not self.hw.move_eef_to(
-                side, pre_pick, first, second,
+                side, hover, first, second,
                 constraint_mode=RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
                 move_time=PICK_ALIGN_MOVE_TIME,
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
@@ -826,24 +868,17 @@ class Manipulation(object):
             self.rospy.logwarn("pick: 横移到上方 IK 无解")
             return False
         if not self.hw.move_eef_to(
-                side, (x, y, RIGHT_PICK_IK_Z), first, second,
+                side, grasp, first, second,
                 constraint_mode=RIGHT_PICK_FINAL_CONSTRAINT_MODE,
                 move_time=PICK_GRASP_MOVE_TIME,
                 max_pos_error=IK_VALIDATION_FINAL_POS_TOL,
                 max_ori_error_deg=IK_VALIDATION_FINAL_ORI_TOL_DEG):
-            self.rospy.logwarn("pick: 0x03 下降抓取失败，回退 0x06 再试")
-            if not self.hw.move_eef_to(
-                    side, (x, y, RIGHT_PICK_IK_Z), first, second,
-                    constraint_mode=RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
-                    move_time=PICK_GRASP_MOVE_TIME,
-                    max_pos_error=IK_VALIDATION_FINAL_POS_TOL,
-                    max_ori_error_deg=IK_VALIDATION_FINAL_ORI_TOL_DEG):
-                self.rospy.logwarn("pick: 下降到抓取高度 IK 无解")
-                return False
-        self.hw.gripper(close=True)
-        self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE)
+            self.rospy.logwarn("pick: 下降到抓取高度 IK 无解")
+            return False
+        self.hw.gripper(close=True, side=side)
+        self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE, side=side)
         if not self.hw.move_eef_to(
-                side, (x, y, RIGHT_PICK_IK_Z + LIFT_Z_OFFSET), first, second,
+                side, lift, first, second,
                 constraint_mode=RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
                 move_time=PICK_LIFT_MOVE_TIME,
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
@@ -887,18 +922,13 @@ class Manipulation(object):
             return False
         self.hw.gripper(close=False, side="left")
         r_first, r_second = RIGHT_HANDOFF_TO_LEFT_FIRST_YPR_DEG, RIGHT_HANDOFF_TO_LEFT_SECOND_YPR_DEG
-        hx, hy, hz = RIGHT_HANDOFF_TO_LEFT_IK
-        self.hw.move_eef_to("right", (hx, hy, RIGHT_HANDOFF_TRANSIT_IK_Z), r_first, r_second)
+        hx, hy, hz = RIGHT_BOX_HANDOFF_IK
+        self.hw.move_eef_to("right", (hx, hy, RIGHT_BOX_HANDOFF_TRANSIT_IK_Z), r_first, r_second)
         if not self.hw.move_eef_to("right", (hx, hy, hz), r_first, r_second):
             self.rospy.logwarn("handoff: 右手到交接点 IK 无解")
             return False
-        l_first, l_second = LEFT_HANDOFF_RECEIVE_FIRST_YPR_DEG, LEFT_HANDOFF_RECEIVE_SECOND_YPR_DEG
-        self.hw.move_eef_to("left", LEFT_HANDOFF_RECEIVE_XZ_READY_IK, l_first, l_second)
-        if not self.hw.move_eef_to("left", LEFT_HANDOFF_RECEIVE_IK, l_first, l_second):
-            self.rospy.logwarn("handoff: 左手接近接收点 IK 无解")
-            return False
         self.hw.gripper(close=True, side="left")
-        self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE)
+        self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE, side="left")
         self.hw.gripper(close=False, side="right")
         self.rospy.sleep(GRIPPER_HOLD_TIME)
         self.hw.move_eef_to("right", (hx, hy + RIGHT_HANDOFF_RELEASE_RETRACT_Y_OFFSET, hz),
@@ -908,22 +938,17 @@ class Manipulation(object):
     def drop_in_box(self, index=0):
         if not self.hw.ensure_external_arm_mode("drop_in_box"):
             return False
-        bx, by, bz = BOX_DROP_IK
-        off = BOX_DROP_OFFSETS[index % len(BOX_DROP_OFFSETS)]
-        tx, ty, tz = bx + off[0], by + off[1], bz + off[2]
-        first, second = BOX_DROP_FIRST_YPR_DEG, BOX_DROP_SECOND_YPR_DEG
-        if not self.hw.move_eef_to("left", (tx, ty, tz + 0.10), first, second):
-            self.rospy.logwarn("drop_in_box: 移到箱上方 IK 无解")
-            return False
-        self.hw.move_eef_to("left", (tx, ty, tz), first, second)
         self.hw.gripper(close=False, side="left")
-        self.hw.wait_claw_settled()
+        self.hw.wait_claw_settled(side="left")
         self.rospy.sleep(GRIPPER_HOLD_TIME)
         return True
 
 
 def run_scene1(rospy, manip):
     rospy.loginfo("[scene1] 快递称重与摆放（完整流程）")
+    if not manip.prepare_left_box_station():
+        rospy.logerr("[scene1] 左手箱上方固定站位失败，停止任务")
+        return
     remaining = set(SCENE1_PARCEL_COLORS)
     completed = []
     scan_round = 0
