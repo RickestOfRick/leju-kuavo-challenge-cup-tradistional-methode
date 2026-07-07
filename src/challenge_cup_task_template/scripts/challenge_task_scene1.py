@@ -98,7 +98,7 @@ RIGHT_PICK_XY_OFFSET = (0.0, 0.0)
 RIGHT_PICK_MIN_X = 0.150
 RIGHT_PICK_MAX_X = 0.500
 RIGHT_PICK_MIN_Y = -0.430
-RIGHT_PICK_MAX_Y = 0.080
+RIGHT_PICK_MAX_Y = -0.180
 RIGHT_PICK_FIRST_YPR_DEG = (0.0, -90.0, 0.0)
 RIGHT_PICK_SECOND_YPR_DEG = (90.0, 0.0, 0.0)
 RIGHT_PICK_TRANSIT_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
@@ -106,9 +106,9 @@ RIGHT_PICK_FINAL_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
 PICK_ALIGN_MOVE_TIME = 1.2
 PICK_GRASP_MOVE_TIME = 1.4
 PICK_LIFT_MOVE_TIME = 1.2
-IK_VALIDATION_TRANSIT_POS_TOL = 0.02
+IK_VALIDATION_TRANSIT_POS_TOL = 0.04
 IK_VALIDATION_TRANSIT_ORI_TOL_DEG = None
-IK_VALIDATION_FINAL_POS_TOL = 0.02
+IK_VALIDATION_FINAL_POS_TOL = 0.04
 IK_VALIDATION_FINAL_ORI_TOL_DEG = None
 
 WEIGH_RELEASE_IK = (0.396, -0.574, 0.146217)
@@ -865,19 +865,43 @@ class Manipulation(object):
             self.rospy.logwarn("pick: 横移到上方 IK 无解")
             self.hw.move_home(settle=0.2)
             return False
-        if not self.hw.move_eef_to(
-                side, grasp, first, second,
-                constraint_mode=RIGHT_PICK_FINAL_CONSTRAINT_MODE,
-                move_time=PICK_GRASP_MOVE_TIME,
-                max_pos_error=IK_VALIDATION_FINAL_POS_TOL,
-                max_ori_error_deg=IK_VALIDATION_FINAL_ORI_TOL_DEG):
+        actual_hover, _actual_quat = self.hw.current_eef_pose(side)
+        if actual_hover is None:
+            self.rospy.logwarn("pick: 无法读取右手上方实际位置")
+            self.hw.move_home(settle=0.2)
+            return False
+        vertical_lift = (float(actual_hover[0]), float(actual_hover[1]), float(lift[2]))
+        self.rospy.loginfo(
+            "pick: 使用实际上方点竖直下降 actual_hover=(%.3f, %.3f, %.3f)",
+            actual_hover[0], actual_hover[1], actual_hover[2],
+        )
+        descended = False
+        for z_offset in (0.0, 0.03, 0.06):
+            vertical_grasp = (
+                float(actual_hover[0]),
+                float(actual_hover[1]),
+                min(float(grasp[2]) + z_offset, float(RIGHT_PICK_GRASP_Z_MAX)),
+            )
+            self.rospy.loginfo(
+                "pick: 尝试竖直下降 grasp=(%.3f, %.3f, %.3f)",
+                vertical_grasp[0], vertical_grasp[1], vertical_grasp[2],
+            )
+            if self.hw.move_eef_to(
+                    side, vertical_grasp, first, second,
+                    constraint_mode=RIGHT_PICK_FINAL_CONSTRAINT_MODE,
+                    move_time=PICK_GRASP_MOVE_TIME,
+                    max_pos_error=IK_VALIDATION_FINAL_POS_TOL,
+                    max_ori_error_deg=IK_VALIDATION_FINAL_ORI_TOL_DEG):
+                descended = True
+                break
+        if not descended:
             self.rospy.logwarn("pick: 下降到抓取高度 IK 无解")
             self.hw.move_home(settle=0.2)
             return False
         self.hw.gripper(close=True, side=side)
         self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE, side=side)
         if not self.hw.move_eef_to(
-                side, lift, first, second,
+                side, vertical_lift, first, second,
                 constraint_mode=RIGHT_PICK_TRANSIT_CONSTRAINT_MODE,
                 move_time=PICK_LIFT_MOVE_TIME,
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
