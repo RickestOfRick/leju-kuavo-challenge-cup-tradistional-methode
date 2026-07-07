@@ -84,17 +84,21 @@ HSV_COLORS = {
     "orange": ((8, 120, 120), (20, 255, 255)),
     "blue": ((100, 80, 120), (130, 255, 255)),
 }
-PARCEL_MIN_AREA = 150
-PARCEL_DETECT_MIN_AREA = 120
+PARCEL_MIN_AREA = 500
+PARCEL_DETECT_MIN_AREA = 500
 PARCEL_DETECT_MORPH_KERNEL = 5
 PARCEL_DEPTH_WINDOW = 5
 
-RIGHT_PICK_GRASP_Z_OFFSET = 0.070
-RIGHT_PICK_GRASP_Z_MIN = 0.015
-RIGHT_PICK_GRASP_Z_MAX = 0.090
+RIGHT_PICK_GRASP_Z_OFFSET = 0.100
+RIGHT_PICK_GRASP_Z_MIN = 0.045
+RIGHT_PICK_GRASP_Z_MAX = 0.110
 RIGHT_PICK_HOVER_Z_OFFSET = 0.220
 RIGHT_PICK_LIFT_Z_OFFSET = 0.300
 RIGHT_PICK_XY_OFFSET = (0.0, 0.0)
+RIGHT_PICK_MIN_X = 0.150
+RIGHT_PICK_MAX_X = 0.500
+RIGHT_PICK_MIN_Y = -0.430
+RIGHT_PICK_MAX_Y = 0.080
 RIGHT_PICK_FIRST_YPR_DEG = (0.0, -90.0, 0.0)
 RIGHT_PICK_SECOND_YPR_DEG = (90.0, 0.0, 0.0)
 RIGHT_PICK_TRANSIT_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
@@ -102,9 +106,9 @@ RIGHT_PICK_FINAL_CONSTRAINT_MODE = IK_MODE_THREE_POINT_MIXED
 PICK_ALIGN_MOVE_TIME = 1.2
 PICK_GRASP_MOVE_TIME = 1.4
 PICK_LIFT_MOVE_TIME = 1.2
-IK_VALIDATION_TRANSIT_POS_TOL = 0.07
+IK_VALIDATION_TRANSIT_POS_TOL = 0.02
 IK_VALIDATION_TRANSIT_ORI_TOL_DEG = None
-IK_VALIDATION_FINAL_POS_TOL = 0.03
+IK_VALIDATION_FINAL_POS_TOL = 0.02
 IK_VALIDATION_FINAL_ORI_TOL_DEG = None
 
 WEIGH_RELEASE_IK = (0.396, -0.574, 0.146217)
@@ -154,7 +158,7 @@ BOX_DROP_OFFSETS = (
 GRIPPER_HOLD_TIME = 1.0
 SCENE1_PARCEL_COLORS = ("brown", "yellow", "orange", "blue")
 SCENE1_MAX_SCAN_RETRIES = 3
-SCENE1_PICK_ATTEMPTS = 2
+SCENE1_PICK_ATTEMPTS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +786,9 @@ class Manipulation(object):
     def _pick_targets_for(self, pos_ik):
         x = float(pos_ik[0]) + float(RIGHT_PICK_XY_OFFSET[0])
         y = float(pos_ik[1]) + float(RIGHT_PICK_XY_OFFSET[1])
+        if not (RIGHT_PICK_MIN_X <= x <= RIGHT_PICK_MAX_X and
+                RIGHT_PICK_MIN_Y <= y <= RIGHT_PICK_MAX_Y):
+            return None
         grasp_z = self._clamp(
             float(pos_ik[2]) + float(RIGHT_PICK_GRASP_Z_OFFSET),
             RIGHT_PICK_GRASP_Z_MIN,
@@ -803,18 +810,8 @@ class Manipulation(object):
         if not self.hw.ensure_external_arm_mode("prepare_left_box_station"):
             return False
         self.hw.gripper(close=False, side="left")
-        if not self.hw.move_eef_to(
-                "left", LEFT_BOX_STATION_IK,
-                LEFT_BOX_STATION_FIRST_YPR_DEG,
-                LEFT_BOX_STATION_SECOND_YPR_DEG,
-                constraint_mode=IK_MODE_THREE_POINT_MIXED,
-                move_time=ARM_MOVE_TIME,
-                max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
-                max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
-            self.rospy.logwarn("prepare_left_box_station: 左手箱上方固定站位失败")
-            return False
         self.hw.lock_current_left_joints()
-        self.rospy.loginfo("左手已固定在箱子上方关节位，后续右手动作保持左臂关节不变")
+        self.rospy.loginfo("左手保持当前安全姿态并锁定关节；先避免开局扫桌/摔倒")
         return True
 
     def scan_locate_all(self, color_names):
@@ -842,7 +839,14 @@ class Manipulation(object):
     def pick(self, pos_ik, side="right"):
         if not self.hw.ensure_external_arm_mode("pick"):
             return False
-        hover, grasp, lift = self._pick_targets_for(pos_ik)
+        targets = self._pick_targets_for(pos_ik)
+        if targets is None:
+            self.rospy.logwarn(
+                "pick: 目标超出保守抓取工作区，跳过 raw=(%.3f, %.3f, %.3f)",
+                pos_ik[0], pos_ik[1], pos_ik[2],
+            )
+            return False
+        hover, grasp, lift = targets
         first, second = RIGHT_PICK_FIRST_YPR_DEG, RIGHT_PICK_SECOND_YPR_DEG
         self.rospy.loginfo(
             "pick: raw=(%.3f, %.3f, %.3f) hover=(%.3f, %.3f, %.3f) grasp=(%.3f, %.3f, %.3f)",
@@ -859,6 +863,7 @@ class Manipulation(object):
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
                 max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
             self.rospy.logwarn("pick: 横移到上方 IK 无解")
+            self.hw.move_home(settle=0.2)
             return False
         if not self.hw.move_eef_to(
                 side, grasp, first, second,
@@ -867,6 +872,7 @@ class Manipulation(object):
                 max_pos_error=IK_VALIDATION_FINAL_POS_TOL,
                 max_ori_error_deg=IK_VALIDATION_FINAL_ORI_TOL_DEG):
             self.rospy.logwarn("pick: 下降到抓取高度 IK 无解")
+            self.hw.move_home(settle=0.2)
             return False
         self.hw.gripper(close=True, side=side)
         self.hw.wait_claw_settled(min_state=CLAW_CLOSE_MIN_STATE, side=side)
@@ -877,6 +883,7 @@ class Manipulation(object):
                 max_pos_error=IK_VALIDATION_TRANSIT_POS_TOL,
                 max_ori_error_deg=IK_VALIDATION_TRANSIT_ORI_TOL_DEG):
             self.rospy.logwarn("pick: 抬起阶段 IK 无解或误差过大")
+            self.hw.move_home(settle=0.2)
             return False
         return self._claw_state_ok(self.perception.snapshot()["claw"], side, CLAW_CLOSE_MIN_STATE)
 
