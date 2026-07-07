@@ -213,18 +213,6 @@ TARGET_RULES = {
             "min_extent": 0.08,
         },
     ],
-    "scene3": [
-        {
-            "class_name": "smt_tray",
-            "target_bin": "outbound_box",
-            "hsv_ranges": [((0, 0, 105), (180, 70, 235))],
-            "min_area_px": 140,
-            "max_area_px": 42000,
-            "min_aspect": 0.18,
-            "max_aspect": 6.5,
-            "min_extent": 0.10,
-        },
-    ],
 }
 
 SCENE2_YOLO_CLASS_ALIASES = {
@@ -314,21 +302,10 @@ BIN_RULES = {
             "min_extent": 0.20,
         },
     ],
-    "scene3": [
-        {
-            "class_name": "outbound_box",
-            "hsv_ranges": [((45, 45, 45), (95, 255, 255))],
-            "min_area_px": 500,
-            "max_area_px": 90000,
-            "min_aspect": 0.35,
-            "max_aspect": 4.0,
-            "min_extent": 0.20,
-        },
-    ],
 }
 
-# 放置目标优先由规则感知更新；这些点只作为感知失败时的保守兜底，坐标系为
-# base_link，来源于公开场景几何与样例控制脚本的人工标定量级。
+# 放置目标坐标系为 base_link，来源于公开场景几何与样例控制脚本的
+# 人工标定量级；场景三出库区直接使用该预设点。
 PLACE_TARGETS_BASE = {
     "scene1": {
         "weighing_area": (0.42, -0.56, 0.12),
@@ -1198,9 +1175,6 @@ class RuleBasedPerception:
         bottom = int(h * 0.96)
         left = int(w * 0.08)
         right = int(w * 0.92)
-        if self.scene == "scene3" and purpose == "检测":
-            top = int(h * 0.05)
-            bottom = int(h * 0.98)
         roi[top:bottom, left:right] = 255
         return self.cv2.bitwise_and(mask, roi)
 
@@ -1434,7 +1408,7 @@ class YoloScene1Perception(RuleBasedPerception):
             return []
         if not self._ensure_yolo():
             reason = self._yolo_unavailable_reason or "unknown"
-            self._report_yolo_unavailable("error", "YOLO 不可用，场景一不再使用规则识别: %s", reason)
+            self._report_yolo_unavailable("error", "YOLO 不可用: %s", reason)
             return []
 
         try:
@@ -1445,7 +1419,7 @@ class YoloScene1Perception(RuleBasedPerception):
                 purpose=purpose,
             )
         except Exception as exc:
-            log_error(self.scene, "YOLO", "推理失败，场景一不再使用规则识别: %s", exc)
+            log_error(self.scene, "YOLO", "推理失败: %s", exc)
             return []
 
     def _ensure_yolo(self) -> bool:
@@ -1853,8 +1827,6 @@ class YoloScene3Perception(YoloScene1Perception):
         load_errors: List[str] = []
         if self._try_load_scene3_yolo_world(load_errors):
             return True
-        if self._try_load_scene3_yolo_fallback(load_errors):
-            return True
 
         self._yolo_unavailable_reason = "; ".join(load_errors) or "ultralytics/model load failed"
         self._yolo_model = None
@@ -1871,20 +1843,6 @@ class YoloScene3Perception(YoloScene1Perception):
             return True
         except Exception as exc:
             load_errors.append("YOLOWorld load failed: {}".format(exc))
-            self._yolo_model = None
-            return False
-
-    def _try_load_scene3_yolo_fallback(self, load_errors: List[str]) -> bool:
-        try:
-            from ultralytics import YOLO
-
-            model = YOLO(self.yolo_model_path)
-            prompts_applied = self._apply_scene3_world_prompts(model)
-            self._yolo_model = model
-            self._log_scene3_yolo_ready("YOLO", prompts_applied=prompts_applied)
-            return True
-        except Exception as exc:
-            load_errors.append("YOLO fallback load failed: {}".format(exc))
             self._yolo_model = None
             return False
 
@@ -2358,7 +2316,7 @@ class Scene3Controller(BaseSceneController):
         start = time.time()
         if not self.wait_for_perception():
             return ActionResult(False, "scene3", "sensor not ready", duration_sec=time.time() - start)
-        outbound_xyz = self.resolve_place("outbound_box")
+        outbound_xyz = self.resolve_outbound_place()
 
         moved_to_rack = False
         completed = 0
@@ -2416,6 +2374,11 @@ class Scene3Controller(BaseSceneController):
         xyz = target.position_base or (99.0, 99.0, 99.0)
         return "lower" if float(xyz[2]) < SCENE3_SHELF_SPLIT_Z_M else "upper"
 
+    def resolve_outbound_place(self) -> Tuple[float, float, float]:
+        place = PLACE_TARGETS_BASE[self.scene]["outbound_box"]
+        log_stage(self.scene, "目标区", "outbound_box 使用预设出库区 %s", _fmt_xyz(place))
+        return place
+
 
 # ---------------------------------------------------------------------------
 # 系统入口与装配层
@@ -2453,7 +2416,7 @@ def default_yolo_model_for_scene(scene: str) -> str:
     return DEFAULT_SCENE1_YOLO_MODEL
 
 
-def build_perception(scene: str, scene1_perception: str, scene3_perception: str,
+def build_perception(scene: str, scene1_perception: str,
                      yolo_model: Optional[str], yolo_device: str,
                      yolo_conf: float, yolo_imgsz: int) -> RuleBasedPerception:
     if scene == "scene1":
@@ -2467,7 +2430,7 @@ def build_perception(scene: str, scene1_perception: str, scene3_perception: str,
             conf=yolo_conf,
             imgsz=yolo_imgsz,
         )
-    if scene == "scene3" and scene3_perception == "yolo":
+    if scene == "scene3":
         return YoloScene3Perception(
             scene=scene,
             base_frame=BASE_FRAME,
@@ -2482,7 +2445,6 @@ def build_perception(scene: str, scene1_perception: str, scene3_perception: str,
 def run_scene(scene, seed, node_name=None, timeout=120,
               time_limit=None, timer_gui=True,
               scene1_perception="auto",
-              scene3_perception="yolo",
               yolo_model=None,
               yolo_device="auto",
               yolo_conf=SCENE1_YOLO_DEFAULT_CONF,
@@ -2517,7 +2479,6 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     perception = build_perception(
         scene=scene,
         scene1_perception=scene1_perception,
-        scene3_perception=scene3_perception,
         yolo_model=yolo_model,
         yolo_device=yolo_device,
         yolo_conf=yolo_conf,
@@ -2558,8 +2519,6 @@ def main():
                         help="不弹出计时器窗口，仅保留后台计时日志")
     parser.add_argument("--scene1-perception", choices=["auto", "yolo"], default="auto",
                         help="场景一识别后端：auto/yolo 均使用 YOLO，不再支持规则识别")
-    parser.add_argument("--scene3-perception", choices=["yolo", "rule"], default="yolo",
-                        help="场景三料盘识别后端：默认强制 YOLO-World，rule 用于调试原 HSV 规则")
     parser.add_argument("--yolo-model", default=None,
                         help="YOLO .pt 模型路径；未指定时按 scene 选择默认权重")
     parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0"], default="auto",
@@ -2578,7 +2537,6 @@ def main():
         time_limit=args.time_limit,
         timer_gui=not args.no_timer_gui,
         scene1_perception=args.scene1_perception,
-        scene3_perception=args.scene3_perception,
         yolo_model=args.yolo_model,
         yolo_device=args.yolo_device,
         yolo_conf=args.yolo_conf,
