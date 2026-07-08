@@ -24,15 +24,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 BASE_FRAME = "base_link"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_SCENE1_YOLO_MODEL = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "models", "yolo", "scene1_objects.pt")
-)
-DEFAULT_SCENE2_YOLO_MODEL = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "models", "yolo", "scene2_parts.pt")
-)
 DEFAULT_SCENE3_YOLO_MODEL = os.path.normpath(
     os.path.join(SCRIPT_DIR, "..", "models", "yolo", "scene3_smt_tray.pt")
 )
+DEFAULT_SCENE1_YOLO_MODEL = DEFAULT_SCENE3_YOLO_MODEL
+DEFAULT_SCENE2_YOLO_MODEL = DEFAULT_SCENE3_YOLO_MODEL
 SCENE1_YOLO_CLASS_NAMES = ("parcel", "weighing_area", "drop_box")
 SCENE1_YOLO_WORLD_PROMPTS = (
     "parcel",
@@ -1275,14 +1271,10 @@ class YoloWorldPerception(RGBDPerceptionBase):
             return False
 
     def _apply_world_prompts(self, model: Any) -> bool:
-        if not self._model_needs_prompts() or not hasattr(model, "set_classes"):
+        if not hasattr(model, "set_classes"):
             return False
         model.set_classes(list(self.yolo_world_prompts))
         return True
-
-    def _model_needs_prompts(self) -> bool:
-        basename = os.path.basename(self.yolo_model_path).lower()
-        return "world" in basename
 
     def _is_ultralytics_world_model_name(self, model_path: str) -> bool:
         basename = os.path.basename(model_path)

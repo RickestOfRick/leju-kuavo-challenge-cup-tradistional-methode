@@ -61,10 +61,10 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 默认权重路径：
 
 ```text
-src/challenge_cup_task_template/models/yolo/scene1_objects.pt
+src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt
 ```
 
-权重文件需参赛队自行生成或提供，模板中不包含 `.pt` 模型。推荐先用 YOLO-World 零样本方式生成带场景一词表的专用权重；也可运行时直接传 `yolov8s-worldv2.pt`，程序会自动设置场景一 prompts。
+权重文件使用场景三同名模型 `scene3_smt_tray.pt`。程序加载后会重新设置场景一 prompts，因此同一个模型文件可在场景一使用不同词表。
 
 ```text
 parcel, package, delivery package, cardboard box
@@ -98,7 +98,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --s
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception yolo
 
 # 指定专用权重和 GPU
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene1_objects.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
 
 # 直接使用原始 YOLO-World 权重并套用 prompts
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --yolo-model yolov8s-worldv2.pt --yolo-device cuda --yolo-conf 0.25 --yolo-imgsz 640
@@ -109,7 +109,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --y
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--scene1-perception` | `auto` | 兼容旧参数；`auto` 和 `yolo` 均使用 YOLO-World。 |
-| `--yolo-model` | 按场景选择 | YOLO-World `.pt` 权重路径；场景一默认 `src/challenge_cup_task_template/models/yolo/scene1_objects.pt`。 |
+| `--yolo-model` | 按场景选择 | YOLO-World `.pt` 权重路径；场景一默认 `src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt`。 |
 | `--yolo-device` | `auto` | 可选 `auto`、`cpu`、`cuda`、`cuda:0`、`cuda:1`。 |
 | `--yolo-conf` | `0.45` | YOLO-World 检测置信度阈值。 |
 | `--yolo-imgsz` | `640` | YOLO-World 推理输入尺寸。 |
@@ -129,10 +129,10 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --y
 默认权重路径：
 
 ```text
-src/challenge_cup_task_template/models/yolo/scene2_parts.pt
+src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt
 ```
 
-场景二 YOLO-World prompts 包含：
+权重文件同样使用场景三同名模型 `scene3_smt_tray.pt`。程序加载后会重新设置场景二 prompts。场景二 YOLO-World prompts 包含：
 
 ```text
 pipe fitting, steel pipe fastener, steel pipe fasteners, part type a
@@ -146,11 +146,11 @@ sorting bin c, purple sorting bin
 运行示例：
 
 ```bash
-# 默认使用 scene2_parts.pt
+# 默认使用 scene3_smt_tray.pt，并套用场景二 prompts
 rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3
 
-# 指定专用权重和 GPU
-rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene2_parts.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
+# 指定同名模型和 GPU
+rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
 
 # 直接使用原始 YOLO-World 权重并套用 prompts
 rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --yolo-model yolov8s-worldv2.pt --yolo-device cuda --yolo-conf 0.25 --yolo-imgsz 640
