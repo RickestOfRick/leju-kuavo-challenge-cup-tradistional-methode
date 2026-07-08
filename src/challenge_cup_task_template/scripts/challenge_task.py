@@ -349,10 +349,10 @@ SCENE3_APPROACH_SETTLE_SEC = 0.10
 SCENE3_APPROACH_RETRY = 48
 SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
 SCENE3_APPROACH_MAX_MISSES = 12
-SCENE3_WRIST_REFINE_RETRY = 2
-SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
-SCENE3_WRIST_OBSERVE_DZ_M = 0.06
-SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.14
+SCENE3_HEAD_RELOCALIZE_RETRY = 2
+SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M = 0.45
+SCENE3_SIDE_OBSERVE_DZ_M = 0.06
+SCENE3_SIDE_OBSERVE_BACKOFF_X_M = 0.14
 SCENE3_SIDE_RELOCALIZE_SETTLE_SEC = 0.35
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
@@ -2002,7 +2002,7 @@ class Skills:
         xyz = target.position_base
         level_z = float(xyz[2])
         side_sign = arm_side_sign(arm)
-        entry_x = float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M
+        entry_x = float(xyz[0]) - SCENE3_SIDE_OBSERVE_BACKOFF_X_M
         side_observe_xyz = self._reachable_xyz((
             entry_x,
             float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M,
@@ -2011,7 +2011,7 @@ class Skills:
         return Scene3TrayObservation(
             rough_target=target,
             arm=arm,
-            camera="{}_wrist".format(arm),
+            camera="head",
             side_observe_xyz=side_observe_xyz,
             level_z=level_z,
             shelf=scene3_shelf_name_from_z(level_z),
@@ -3122,13 +3122,13 @@ class Scene3Controller(BaseSceneController):
         observation: Scene3TrayObservation,
     ) -> Optional[PerceptionTarget]:
         rough = observation.rough_target
-        for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
+        for attempt in range(1, SCENE3_HEAD_RELOCALIZE_RETRY + 1):
             log_stage(
                 self.scene,
                 "二次定位",
-                "侧方同高观察后第 %d/%d 次腕部 YOLO-World 检测 camera=%s rough=%s",
+                "侧方同高观察后第 %d/%d 次头部 YOLO-World 检测 camera=%s rough=%s",
                 attempt,
-                SCENE3_WRIST_REFINE_RETRY,
+                SCENE3_HEAD_RELOCALIZE_RETRY,
                 observation.camera,
                 _fmt_xyz(rough.position_base),
             )
@@ -3147,7 +3147,7 @@ class Scene3Controller(BaseSceneController):
                     continue
                 if (candidate.position_base is not None
                         and rough.position_base is not None
-                        and distance3(candidate.position_base, rough.position_base) <= SCENE3_WRIST_REFINE_MAX_DELTA_M):
+                        and distance3(candidate.position_base, rough.position_base) <= SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M):
                     usable.append(candidate)
                 else:
                     rejected.append((candidate, "too far from rough target"))
@@ -3163,7 +3163,7 @@ class Scene3Controller(BaseSceneController):
                 log_stage(
                     self.scene,
                     "二次定位",
-                    "使用腕部 YOLO-World 修正 base %s -> %s delta=%.3fm conf=%.2f",
+                    "使用头部 YOLO-World 修正 base %s -> %s delta=%.3fm conf=%.2f",
                     _fmt_xyz(rough.position_base),
                     _fmt_xyz(refined.position_base),
                     (
@@ -3179,7 +3179,7 @@ class Scene3Controller(BaseSceneController):
         log_warn(
             self.scene,
             "二次定位",
-            "未获得可用腕部复定位结果，不再直接抓初定位目标 rough=%s",
+            "未获得可用头部复定位结果，不再直接抓初定位目标 rough=%s",
             _fmt_xyz(rough.position_base),
         )
         return None
