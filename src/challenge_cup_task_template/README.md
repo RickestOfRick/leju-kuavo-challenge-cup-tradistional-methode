@@ -70,9 +70,12 @@ src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt
 parcel, package, delivery package, cardboard box
 small cardboard parcel, thin cardboard package, rectangular cardboard package
 yellow parcel with tape, brown parcel with tape, mailing box, shipping box
-weighing area, scale area, weighing square, weighing pad
-green weighing pad, bright green square pad, bright green rectangular pad
-small green mat, neon green pad
+vivid green mat, bright green mat, neon green mat, flat green mat
+green rectangular mat, flat green rectangular mat, bright green rectangular mat
+green table mat, green floor mat, green target mat, green target area
+green rectangular target, green rectangular patch
+bright green rectangle, neon green rectangle, colored rectangular mat
+weighing mat, weighing pad
 drop box, sorting box, destination box, green sorting box
 open green box, open dark green box, green open bin
 open top green bin, green storage bin, empty green container
