@@ -68,8 +68,14 @@ src/challenge_cup_task_template/models/yolo/scene1_objects.pt
 
 ```text
 parcel, package, delivery package, cardboard box
-weighing area, scale area, weighing square
+small cardboard parcel, thin cardboard package, rectangular cardboard package
+yellow parcel with tape, brown parcel with tape, mailing box, shipping box
+weighing area, scale area, weighing square, weighing pad
+green weighing pad, bright green square pad, bright green rectangular pad
+small green mat, neon green pad
 drop box, sorting box, destination box, green sorting box
+open green box, open dark green box, green open bin
+open top green bin, green storage bin, empty green container
 ```
 
 程序会把这些输出统一映射为 `parcel`、`weighing_area`、`drop_box`。
