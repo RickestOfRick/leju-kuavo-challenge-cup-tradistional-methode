@@ -349,11 +349,12 @@ SCENE3_APPROACH_SETTLE_SEC = 0.10
 SCENE3_APPROACH_RETRY = 48
 SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
 SCENE3_APPROACH_MAX_MISSES = 12
-SCENE3_HEAD_RELOCALIZE_RETRY = 2
+SCENE3_HEAD_RELOCALIZE_RETRY = 1
 SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M = 0.45
 SCENE3_SIDE_OBSERVE_DZ_M = 0.06
 SCENE3_SIDE_OBSERVE_BACKOFF_X_M = 0.14
 SCENE3_SIDE_RELOCALIZE_SETTLE_SEC = 0.35
+SCENE3_BEND_RELOCALIZE_HOLD_SEC = 0.35
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
 # 场景三货架内抓取不从上方垂直抬手：平举/插入高度使用料盘中心高度，
@@ -376,6 +377,7 @@ SCENE3_POST_CLOSE_SETTLE_SEC = 0.80
 SCENE3_LIFT_DURATION_SEC = 2.00
 SCENE3_LIFT_SETTLE_SEC = 0.50
 SCENE3_PICK_RETRY = 40
+SCENE3_BEND_RETRY = 10
 SCENE3_PICK_RETRY_SETTLE_SEC = 1.20
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
@@ -2333,7 +2335,7 @@ class Skills:
     ) -> ActionResult:
         start = time.time()
         arm = self.single_arm(arm, target, "抓取重试")
-        # 场景三控制器已经有按“重新检测 -> 腕部复检 -> 抓取”的 40 次外层循环，
+        # 场景三控制器已经有“平举 40 次，每次平举内头部复定位/弯臂 10 次”的外层循环，
         # 这里保持单次，避免每轮料盘抓取被嵌套放大到数百次。
         max_attempts = 1 if self.scene == "scene3" else SKILL_PICK_RETRY
         last_result = ActionResult(False, "pick", "not attempted", target)
@@ -3036,7 +3038,7 @@ class Scene3Controller(BaseSceneController):
             tray: Optional[PerceptionTarget] = None
             arm = "right"
             pick_result: Optional[ActionResult] = None
-            for pick_attempt in range(1, SCENE3_PICK_RETRY + 1):
+            for side_attempt in range(1, SCENE3_PICK_RETRY + 1):
                 targets = self.detect_reachable_trays(completed_positions)
                 if not targets:
                     log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
@@ -3044,46 +3046,134 @@ class Scene3Controller(BaseSceneController):
                 targets.sort(key=self._tray_sort_key)
                 tray_candidate = targets[0]
                 arm = self.skills.choose_arm(tray_candidate)
-                refined = self.refine_tray_with_wrist(tray_candidate, arm)
-                if refined is None:
+                observation = self.stage_tray_side_observe(tray_candidate, arm)
+                if observation is None:
                     log_warn(
                         self.scene,
                         "抓取",
-                        "料盘 #%02d 尝试 #%d/%d 平举/二次定位失败，重新检测",
+                        "料盘 #%02d 平举 #%d/%d 失败，重新检测后再平举",
                         index,
-                        pick_attempt,
+                        side_attempt,
                         SCENE3_PICK_RETRY,
                     )
                     self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
                     self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
                     continue
-                tray = refined
-                shelf = self._tray_shelf(tray)
+
                 log_stage(
                     self.scene,
-                    "流程",
-                    "料盘 #%02d 尝试 #%d/%d shelf=%s 出库，arm=%s base=%s",
+                    "抓取",
+                    "料盘 #%02d 平举 #%d/%d 成功，在当前平举姿态内最多尝试弯臂 %d 次",
                     index,
-                    pick_attempt,
+                    side_attempt,
                     SCENE3_PICK_RETRY,
-                    shelf,
-                    arm,
-                    _fmt_xyz(tray.position_base),
+                    SCENE3_BEND_RETRY,
                 )
-                pick_result = self.skills.pick(tray, arm=arm)
-                pick_result.retry_count = pick_attempt - 1
-                if pick_result.ok:
+                current_observation = observation
+                current_target = tray_candidate
+                for bend_attempt in range(1, SCENE3_BEND_RETRY + 1):
+                    relocalize_observation = self._retarget_tray_observation(
+                        current_observation,
+                        current_target,
+                    )
+                    log_stage(
+                        self.scene,
+                        "二次定位",
+                        "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d：保持平举，用头部相机复定位 rough=%s",
+                        index,
+                        side_attempt,
+                        SCENE3_PICK_RETRY,
+                        bend_attempt,
+                        SCENE3_BEND_RETRY,
+                        _fmt_xyz(current_target.position_base),
+                    )
+                    refined = self._relocalize_tray_from_side_observe(relocalize_observation)
+                    if refined is None:
+                        log_warn(
+                            self.scene,
+                            "二次定位",
+                            "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d 头部二次定位失败，保持平举继续",
+                            index,
+                            side_attempt,
+                            SCENE3_PICK_RETRY,
+                            bend_attempt,
+                            SCENE3_BEND_RETRY,
+                        )
+                        self.robot.hold_arm(
+                            SCENE3_BEND_RELOCALIZE_HOLD_SEC,
+                            label="tray_relocalize_failed_hold",
+                        )
+                        continue
+
+                    tray = refined
+                    current_target = tray
+                    current_observation = self._retarget_tray_observation(
+                        current_observation,
+                        tray,
+                    )
+                    shelf = self._tray_shelf(tray)
+                    log_stage(
+                        self.scene,
+                        "流程",
+                        "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d shelf=%s 出库，arm=%s base=%s",
+                        index,
+                        side_attempt,
+                        SCENE3_PICK_RETRY,
+                        bend_attempt,
+                        SCENE3_BEND_RETRY,
+                        shelf,
+                        arm,
+                        _fmt_xyz(tray.position_base),
+                    )
+                    pick_result = self.skills.pick(tray, arm=arm)
+                    pick_result.retry_count = (side_attempt - 1) * SCENE3_BEND_RETRY + bend_attempt - 1
+                    if pick_result.ok:
+                        break
+                    log_warn(
+                        self.scene,
+                        "抓取",
+                        "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d 失败: %s",
+                        index,
+                        side_attempt,
+                        SCENE3_PICK_RETRY,
+                        bend_attempt,
+                        SCENE3_BEND_RETRY,
+                        pick_result.reason,
+                    )
+                    if self._is_scene3_bend_failure(pick_result):
+                        log_warn(
+                            self.scene,
+                            "抓取",
+                            "弯臂/插入失败，保持当前平举姿态不放下，继续头部二次定位: %s",
+                            pick_result.reason,
+                        )
+                        self.robot.hold_arm(
+                            SCENE3_BEND_RELOCALIZE_HOLD_SEC,
+                            label="tray_bend_failed_hold",
+                        )
+                        continue
+
+                    log_warn(
+                        self.scene,
+                        "抓取",
+                        "非弯臂阶段失败，退出当前平举姿态后重新平举: %s",
+                        pick_result.reason,
+                    )
+                    self.robot.open_claw(arm)
                     break
+
+                if pick_result is not None and pick_result.ok:
+                    break
+
                 log_warn(
                     self.scene,
                     "抓取",
-                    "料盘 #%02d 尝试 #%d/%d 失败: %s，重新检测后再试",
+                    "料盘 #%02d 平举 #%d/%d 内 %d 次头部复定位/弯臂未成功，重新尝试平举",
                     index,
-                    pick_attempt,
+                    side_attempt,
                     SCENE3_PICK_RETRY,
-                    pick_result.reason,
+                    SCENE3_BEND_RETRY,
                 )
-                self.robot.open_claw(arm)
                 self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
                 self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
 
@@ -3107,13 +3197,41 @@ class Scene3Controller(BaseSceneController):
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
 
-    def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> Optional[PerceptionTarget]:
+    def _retarget_tray_observation(
+        self,
+        observation: Scene3TrayObservation,
+        target: PerceptionTarget,
+    ) -> Scene3TrayObservation:
+        return Scene3TrayObservation(
+            rough_target=target,
+            arm=observation.arm,
+            camera=observation.camera,
+            side_observe_xyz=observation.side_observe_xyz,
+            level_z=observation.level_z,
+            shelf=observation.shelf,
+        )
+
+    def _is_scene3_bend_failure(self, result: ActionResult) -> bool:
+        return result.reason in {
+            "side_ready IK failed",
+            "shelf_entry IK failed",
+            "shelf_insert IK failed",
+            "grasp IK failed",
+        }
+
+    def stage_tray_side_observe(self, tray: PerceptionTarget, arm: str) -> Optional[Scene3TrayObservation]:
         observation = self.skills.scene3_tray_observation(tray, arm)
         if observation is None:
             return None
 
         staged = self.skills.stage_scene3_tray_side_observe(observation)
         if not staged.ok:
+            return None
+        return observation
+
+    def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> Optional[PerceptionTarget]:
+        observation = self.stage_tray_side_observe(tray, arm)
+        if observation is None:
             return None
         return self._relocalize_tray_from_side_observe(observation)
 
