@@ -56,7 +56,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 
 ## 场景一 YOLO-World 识别
 
-场景一使用 Ultralytics YOLO-World 识别快递包裹、称重区和放置箱。YOLO-World 只负责输出检测框，三维位置仍由相机深度图、CameraInfo 和 TF 转换到 `base_link`，不读取仿真真值或禁用接口。场景一不保留 HSV 规则识别或公开几何兜底；`parcel`、`weighing_area`、`drop_box` 会最多重试 5 次 YOLO-World 检测，仍无可用结果时直接失败并输出原因。
+场景一使用 Ultralytics YOLO-World 识别快递包裹、称重区和放置箱。YOLO-World 只负责输出检测框，三维位置仍由相机深度图、CameraInfo 和 TF 转换到 `base_link`，不读取仿真真值或禁用接口。场景一不保留 HSV 规则识别或公开几何兜底；`parcel`、`weighing_area`、`drop_box` 会最多重试 5 次 YOLO-World 检测，仍无可用结果时直接失败并输出原因。抓取动作最多重试 10 次，每次失败会打印目标信息、手臂、抓取点和失败的 IK 阶段。
 
 默认权重路径：
 
@@ -131,7 +131,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --y
 
 ## 场景二 YOLO-World 识别
 
-场景二按“识别-定位-抓取-归档”链路执行，零件和分拣目标区都使用 YOLO-World 检测。YOLO-World 只输出检测框，三维位置由 RGB-D、CameraInfo 和 TF 计算得到；代码不再保留 YOLOv8 segmentation、HSV 规则检测、自动权重扫描或公开几何兜底点。实际需要的目标区或零件没有可用 `base_link` 坐标时，场景二会直接失败并输出原因。
+场景二按“识别-定位-抓取-归档”链路执行，零件和分拣目标区都使用 YOLO-World 检测。YOLO-World 只输出检测框，三维位置由 RGB-D、CameraInfo 和 TF 计算得到；代码不再保留 YOLOv8 segmentation、HSV 规则检测、自动权重扫描或公开几何兜底点。实际需要的目标区或零件没有可用 `base_link` 坐标时，场景二会直接失败并输出原因。抓取动作最多重试 10 次，每次失败会打印目标信息、手臂、抓取点和失败的 IK 阶段。
 
 类别映射：
 

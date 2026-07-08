@@ -424,6 +424,8 @@ SCENE_REACH_X_MAX_M = {
     "scene3": 0.94,
 }
 TARGET_WAIT_SEC = 8.0
+SKILL_PICK_RETRY = 10
+SKILL_PICK_RETRY_SETTLE_SEC = 0.30
 SCENE1_YOLO_RETRY = 5
 SCENE1_YOLO_RETRY_SETTLE_SEC = 0.25
 SCENE2_STABLE_TARGET_COUNT = 4
@@ -1877,15 +1879,77 @@ class Skills:
         log_warn(self.scene, "选臂", "%s 收到未知手臂 %s，默认使用右手", purpose, arm)
         return "right"
 
-    def pick(self, target: PerceptionTarget, arm: Optional[str] = None) -> ActionResult:
+    def _target_debug_summary(self, target: PerceptionTarget) -> str:
+        debug = target.debug or {}
+        items = [
+            "class={}".format(target.class_name),
+            "conf={:.2f}".format(float(target.confidence)),
+            "cam={}".format(target.camera),
+            "uv={}".format(target.center_uv),
+            "base={}".format(_fmt_xyz(target.position_base)),
+            "cam_xyz={}".format(_fmt_xyz(target.position_camera)),
+            "bbox={}".format(target.bbox),
+            "area={:.0f}".format(float(target.area_px)),
+            "bin={}".format(target.target_bin),
+        ]
+        for key in ("raw_class", "depth_m", "frame_id", "image_size"):
+            if key in debug:
+                items.append("{}={}".format(key, debug.get(key)))
+        return " ".join(items)
+
+    def _log_pick_failure_detail(self, target: PerceptionTarget, arm: str,
+                                 step: str, reason: str,
+                                 attempt_index: int = 0, attempt_total: int = 0,
+                                 requested: Optional[Sequence[float]] = None,
+                                 reachable: Optional[Sequence[float]] = None,
+                                 pre: Optional[Sequence[float]] = None,
+                                 grasp: Optional[Sequence[float]] = None,
+                                 lift: Optional[Sequence[float]] = None,
+                                 yaw_rad: float = 0.0) -> None:
+        attempt = (
+            "#{}/{}".format(attempt_index, attempt_total)
+            if attempt_index > 0 and attempt_total > 0
+            else "single"
+        )
+        log_warn(
+            self.scene,
+            "抓取失败详情",
+            (
+                "attempt=%s step=%s reason=%s arm=%s yaw=%.1fdeg "
+                "requested=%s reachable=%s pre=%s grasp=%s lift=%s %s"
+            ),
+            attempt,
+            step,
+            reason,
+            arm,
+            math.degrees(yaw_rad),
+            _fmt_xyz(requested),
+            _fmt_xyz(reachable),
+            _fmt_xyz(pre),
+            _fmt_xyz(grasp),
+            _fmt_xyz(lift),
+            self._target_debug_summary(target),
+        )
+
+    def pick(self, target: PerceptionTarget, arm: Optional[str] = None,
+             attempt_index: int = 0, attempt_total: int = 0) -> ActionResult:
         start = time.time()
+        arm = self.single_arm(arm, target, "抓取")
         if target.position_base is None:
             reason = "target has no base_link position"
             log_warn(self.scene, "抓取", "%s class=%s", reason, target.class_name)
+            self._log_pick_failure_detail(
+                target,
+                arm,
+                "target_position",
+                reason,
+                attempt_index=attempt_index,
+                attempt_total=attempt_total,
+            )
             return ActionResult(False, "pick", reason, target, time.time() - start)
 
-        arm = self.single_arm(arm, target, "抓取")
-        xyz = self._reachable_xyz(self._grasp_xyz(target))
+        requested_xyz = self._grasp_xyz(target)
+        xyz = self._reachable_xyz(requested_xyz)
         yaw = float(target.yaw_rad or 0.0)
         scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
         if scene3_tray:
@@ -1908,10 +1972,42 @@ class Skills:
         self.navigation.fine_align_to_image_target(target)
         self.robot.open_claw(arm)
         pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
+        if not pre_ok:
+            reason = "pre_grasp IK failed"
+            self._log_pick_failure_detail(
+                target,
+                arm,
+                "pre_grasp",
+                reason,
+                attempt_index=attempt_index,
+                attempt_total=attempt_total,
+                requested=requested_xyz,
+                reachable=xyz,
+                pre=pre,
+                grasp=grasp,
+                lift=lift,
+                yaw_rad=yaw,
+            )
+            return ActionResult(False, "pick", reason, target, time.time() - start)
+
         grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
         if not grasp_ok:
             reason = "grasp IK failed"
-            log_warn(self.scene, "抓取", "%s，不闭爪，重新检测后再试", reason)
+            self._log_pick_failure_detail(
+                target,
+                arm,
+                "grasp",
+                reason,
+                attempt_index=attempt_index,
+                attempt_total=attempt_total,
+                requested=requested_xyz,
+                reachable=xyz,
+                pre=pre,
+                grasp=grasp,
+                lift=lift,
+                yaw_rad=yaw,
+            )
+            log_warn(self.scene, "抓取", "%s，不闭爪，等待重试", reason)
             return ActionResult(False, "pick", reason, target, time.time() - start)
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
         lift_targets = [lift]
@@ -1934,9 +2030,25 @@ class Skills:
             )
             if lift_ok:
                 break
-        ik_ok = pre_ok and grasp_ok and lift_ok
-        reason = "" if ik_ok else "IK step failed"
-        return ActionResult(True, "pick", reason, target, time.time() - start)
+        if not lift_ok:
+            reason = "lift IK failed"
+            self._log_pick_failure_detail(
+                target,
+                arm,
+                "lift",
+                reason,
+                attempt_index=attempt_index,
+                attempt_total=attempt_total,
+                requested=requested_xyz,
+                reachable=xyz,
+                pre=pre,
+                grasp=grasp,
+                lift=lift,
+                yaw_rad=yaw,
+            )
+            return ActionResult(False, "pick", reason, target, time.time() - start)
+
+        return ActionResult(True, "pick", "", target, time.time() - start)
 
     def _pick_scene3_tray(self, target: PerceptionTarget, arm: str,
                           xyz: Sequence[float], yaw: float, start: float) -> ActionResult:
@@ -2053,6 +2165,72 @@ class Skills:
 
         return ActionResult(True, "pick", "", target, time.time() - start)
 
+    def pick_with_retry(self, target: PerceptionTarget,
+                        arm: Optional[str] = None) -> ActionResult:
+        start = time.time()
+        arm = self.single_arm(arm, target, "抓取重试")
+        # 场景三控制器已经有按“重新检测 -> 腕部复检 -> 抓取”的 40 次外层循环，
+        # 这里保持单次，避免每轮料盘抓取被嵌套放大到数百次。
+        max_attempts = 1 if self.scene == "scene3" else SKILL_PICK_RETRY
+        last_result = ActionResult(False, "pick", "not attempted", target)
+        for attempt in range(1, max_attempts + 1):
+            if max_attempts > 1:
+                log_stage(
+                    self.scene,
+                    "抓取",
+                    "尝试 #%d/%d class=%s arm=%s target=%s",
+                    attempt,
+                    max_attempts,
+                    target.class_name,
+                    arm,
+                    _fmt_xyz(target.position_base),
+                )
+            result = self.pick(
+                target,
+                arm=arm,
+                attempt_index=attempt,
+                attempt_total=max_attempts,
+            )
+            result.retry_count = attempt - 1
+            if result.ok:
+                if attempt > 1:
+                    log_stage(
+                        self.scene,
+                        "抓取",
+                        "第 %d/%d 次抓取成功 class=%s arm=%s",
+                        attempt,
+                        max_attempts,
+                        target.class_name,
+                        arm,
+                    )
+                return result
+
+            last_result = result
+            log_warn(
+                self.scene,
+                "抓取",
+                "尝试 #%d/%d 失败: %s",
+                attempt,
+                max_attempts,
+                result.reason,
+            )
+            if attempt < max_attempts:
+                self.robot.open_claw(arm)
+                self.robot.rospy.sleep(SKILL_PICK_RETRY_SETTLE_SEC)
+
+        reason = "pick failed after {} attempts; last: {}".format(
+            max_attempts,
+            last_result.reason,
+        )
+        return ActionResult(
+            False,
+            "pick",
+            reason,
+            target,
+            time.time() - start,
+            max_attempts - 1,
+        )
+
     def place(self, arm: str, place_xyz_base: Sequence[float],
               label: str = "place") -> ActionResult:
         start = time.time()
@@ -2070,7 +2248,7 @@ class Skills:
     def pick_and_place(self, target: PerceptionTarget, place_xyz_base: Sequence[float],
                        arm: Optional[str] = None, label: str = "pick_place") -> ActionResult:
         arm = self.single_arm(arm, target, "抓放")
-        pick_result = self.pick(target, arm=arm)
+        pick_result = self.pick_with_retry(target, arm=arm)
         if not pick_result.ok:
             return pick_result
         place_result = self.place(arm, place_xyz_base, label=label)
@@ -2080,6 +2258,7 @@ class Skills:
             place_result.reason,
             target,
             pick_result.duration_sec + place_result.duration_sec,
+            pick_result.retry_count,
         )
 
     def _reachable_xyz(self, xyz: Sequence[float]) -> Tuple[float, float, float]:
