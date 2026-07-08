@@ -430,6 +430,9 @@ SKILL_PRE_GRASP_DURATION_SEC = 1.80
 SKILL_GRASP_DURATION_SEC = 1.50
 SKILL_POST_GRASP_SETTLE_SEC = 0.35
 SKILL_LIFT_DURATION_SEC = 1.50
+SKILL_PLACE_PRE_DURATION_SEC = 1.60
+SKILL_PLACE_DURATION_SEC = 1.30
+SKILL_PLACE_RETREAT_DURATION_SEC = 1.20
 SKILL_RELOCALIZE_SETTLE_SEC = 0.20
 SCENE1_YOLO_RETRY = 5
 SCENE1_YOLO_RETRY_SETTLE_SEC = 0.25
@@ -731,7 +734,15 @@ class RobotBase:
             return False
         raise RuntimeError("set_arm_mode failed: {}".format(last_exc))
 
-    def move_arm_deg(self, target_deg: Sequence[float], duration: float = 1.0) -> None:
+    def _arm_index_groups(self, arm: str) -> Tuple[range, range, str]:
+        if arm == "left":
+            return range(0, 7), range(7, 14), "右"
+        if arm == "right":
+            return range(7, 14), range(0, 7), "左"
+        raise ValueError("unknown arm: {}".format(arm))
+
+    def move_arm_deg(self, target_deg: Sequence[float], duration: float = 1.0,
+                     active_arm: Optional[str] = None) -> None:
         from sensor_msgs.msg import JointState
 
         self.set_arm_mode(ARM_MODE_EXTERNAL_CONTROL)
@@ -742,6 +753,26 @@ class RobotBase:
         start = self.current_arm_deg()
         if len(start) != 14:
             start = list(self.last_arm_deg)
+        if active_arm in ("left", "right"):
+            _active, inactive, inactive_label = self._arm_index_groups(active_arm)
+            lock = list(self.last_arm_deg)
+            if len(lock) != 14:
+                lock = list(start)
+            sensor_delta = max(abs(float(start[i]) - float(lock[i])) for i in inactive)
+            target_delta = max(abs(float(target[i]) - float(lock[i])) for i in inactive)
+            for i in inactive:
+                start[i] = float(lock[i])
+                target[i] = float(lock[i])
+            if sensor_delta > 1.0 or target_delta > 1.0:
+                log_stage(
+                    self.scene,
+                    "单臂轨迹",
+                    "%s手动作时锁定%s手：sensor_delta=%.1fdeg target_delta=%.1fdeg",
+                    "左" if active_arm == "left" else "右",
+                    inactive_label,
+                    sensor_delta,
+                    target_delta,
+                )
         steps = max(2, int(max(duration, 0.1) * ARM_TRAJ_HZ))
         rate = self.rospy.Rate(ARM_TRAJ_HZ)
         msg = JointState()
@@ -779,9 +810,11 @@ class RobotBase:
 
     def send_single_arm_deg(self, arm: str, active_deg: Sequence[float],
                             duration: float = 1.0) -> None:
-        target = list(self.current_arm_deg())
+        target = list(self.last_arm_deg)
         if len(target) != 14:
-            target = list(self.last_arm_deg)
+            target = list(self.current_arm_deg())
+        if len(target) != 14:
+            target = list(HOME_ARM_DEG)
         values = [float(v) for v in active_deg]
         if len(values) != 7:
             raise ValueError("single arm target expects 7 joints")
@@ -791,16 +824,16 @@ class RobotBase:
             target[7:] = values
         else:
             raise ValueError("unknown arm: {}".format(arm))
-        self.move_arm_deg(target, duration=duration)
+        self.move_arm_deg(target, duration=duration, active_arm=arm)
 
     def single_arm_target_from_ik(self, arm: str, q_deg: Sequence[float]) -> List[float]:
         solved = [float(v) for v in q_deg]
         if len(solved) != 14:
             raise ValueError("IK target expects 14 joints, got {}".format(len(solved)))
 
-        target = list(self.current_arm_deg())
+        target = list(self.last_arm_deg)
         if len(target) != 14:
-            target = list(self.last_arm_deg)
+            target = list(self.current_arm_deg())
         if len(target) != 14:
             target = list(HOME_ARM_DEG)
 
@@ -985,7 +1018,7 @@ class RobotBase:
         try:
             q_deg = self.solve_ik(arm, target, quat_xyzw=quat, constraint_mode=2)
             q_deg = self.single_arm_target_from_ik(arm, q_deg)
-            self.move_arm_deg(q_deg, duration=duration)
+            self.move_arm_deg(q_deg, duration=duration, active_arm=arm)
             return True
         except Exception as exc:
             log_warn(self.scene, "IK", "%s 失败，不执行近似关节动作，等待上层重新检测: %s target=%s",
@@ -2285,19 +2318,126 @@ class Skills:
             max_attempts - 1,
         )
 
+    def _place_candidates(self, place_xyz_base: Sequence[float], arm: str,
+                          label: str) -> List[Tuple[float, float, float]]:
+        base = self._reachable_xyz(place_xyz_base)
+        side = arm_side_sign(arm)
+        if "weigh" in label:
+            offsets = (
+                (0.00, 0.00, 0.00),
+                (0.00, side * 0.04, 0.00),
+                (-0.04, side * 0.04, 0.00),
+                (0.04, side * 0.04, 0.00),
+                (0.00, side * 0.07, 0.00),
+            )
+        else:
+            offsets = (
+                (0.00, 0.00, 0.00),
+                (0.00, side * 0.08, 0.00),
+                (-0.06, side * 0.10, 0.00),
+                (-0.10, side * 0.14, 0.00),
+                (0.04, side * 0.08, 0.00),
+            )
+
+        candidates: List[Tuple[float, float, float]] = []
+        seen = set()
+        for dx, dy, dz in offsets:
+            candidate = self._reachable_xyz((base[0] + dx, base[1] + dy, base[2] + dz))
+            key = tuple(round(value, 3) for value in candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+        return candidates
+
+    def _log_place_failure_detail(self, arm: str, label: str, step: str, reason: str,
+                                  candidate_index: int, candidate_total: int,
+                                  place: Sequence[float],
+                                  pre: Sequence[float],
+                                  retreat: Sequence[float]) -> None:
+        log_warn(
+            self.scene,
+            "放置失败详情",
+            (
+                "label=%s candidate=#%d/%d step=%s reason=%s arm=%s "
+                "place=%s pre=%s retreat=%s"
+            ),
+            label,
+            candidate_index,
+            candidate_total,
+            step,
+            reason,
+            arm,
+            _fmt_xyz(place),
+            _fmt_xyz(pre),
+            _fmt_xyz(retreat),
+        )
+
     def place(self, arm: str, place_xyz_base: Sequence[float],
               label: str = "place") -> ActionResult:
         start = time.time()
         arm = self.single_arm(arm, None, "放置")
-        place = self._reachable_xyz(place_xyz_base)
-        pre = (place[0], place[1], place[2] + SAFE_PLACE_DZ_M)
-        retreat = (place[0], place[1], place[2] + SAFE_LIFT_DZ_M)
-        log_stage(self.scene, "放置", "arm=%s label=%s place=%s", arm, label, _fmt_xyz(place))
-        self.robot.move_hand_ik(arm, pre, duration=1.1, label=label + "_pre")
-        self.robot.move_hand_ik(arm, place, duration=0.9, label=label)
-        self.robot.open_claw(arm)
-        self.robot.move_hand_ik(arm, retreat, duration=0.9, label=label + "_retreat")
-        return ActionResult(True, "place", "", None, time.time() - start)
+        candidates = self._place_candidates(place_xyz_base, arm, label)
+        last_reason = "no place candidate"
+        for index, place in enumerate(candidates, start=1):
+            pre = (place[0], place[1], place[2] + SAFE_PLACE_DZ_M)
+            retreat = (place[0], place[1], place[2] + SAFE_LIFT_DZ_M)
+            log_stage(
+                self.scene,
+                "放置",
+                "arm=%s label=%s candidate=#%d/%d place=%s pre=%s",
+                arm,
+                label,
+                index,
+                len(candidates),
+                _fmt_xyz(place),
+                _fmt_xyz(pre),
+            )
+            pre_ok = self.robot.move_hand_ik(
+                arm,
+                pre,
+                duration=SKILL_PLACE_PRE_DURATION_SEC,
+                label=label + "_pre#{}".format(index),
+            )
+            if not pre_ok:
+                last_reason = "place pre IK failed"
+                self._log_place_failure_detail(
+                    arm, label, "pre", last_reason, index, len(candidates), place, pre, retreat
+                )
+                continue
+
+            place_ok = self.robot.move_hand_ik(
+                arm,
+                place,
+                duration=SKILL_PLACE_DURATION_SEC,
+                label=label + "#{}".format(index),
+            )
+            if not place_ok:
+                last_reason = "place IK failed"
+                self._log_place_failure_detail(
+                    arm, label, "place", last_reason, index, len(candidates), place, pre, retreat
+                )
+                continue
+
+            self.robot.open_claw(arm)
+            retreat_ok = self.robot.move_hand_ik(
+                arm,
+                retreat,
+                duration=SKILL_PLACE_RETREAT_DURATION_SEC,
+                label=label + "_retreat#{}".format(index),
+            )
+            if not retreat_ok:
+                log_warn(
+                    self.scene,
+                    "放置",
+                    "%s 已松爪，但 retreat IK failed，按已放置继续",
+                    label,
+                )
+            return ActionResult(True, "place", "", None, time.time() - start)
+
+        reason = "{} after {} candidates".format(last_reason, len(candidates))
+        log_warn(self.scene, "放置", "label=%s 失败: %s", label, reason)
+        return ActionResult(False, "place", reason, None, time.time() - start)
 
     def pick_and_place(
         self,
@@ -2555,6 +2695,17 @@ class Scene1Controller(BaseSceneController):
             self.robot.rospy.sleep(0.7)
             regrasp_xyz = (weigh_xyz[0], weigh_xyz[1], weigh_xyz[2] - 0.04)
             weighed = self.make_target_at("parcel", regrasp_xyz, target_bin="drop_box")
+            refreshed_weighed = self.relocalize_pick_target(weighed)
+            if refreshed_weighed is not None:
+                log_stage(
+                    self.scene,
+                    "重新定位",
+                    "称重后使用 YOLO-World 更新二次抓取坐标 %s",
+                    _fmt_xyz(refreshed_weighed.position_base),
+                )
+                weighed = refreshed_weighed
+            else:
+                log_warn(self.scene, "重新定位", "称重后未检测到包裹，沿用称重区估计坐标")
             result = self.skills.pick_and_place(
                 weighed,
                 drop_xyz,
