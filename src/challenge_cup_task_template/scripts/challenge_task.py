@@ -9,7 +9,6 @@
 """
 
 import argparse
-import glob
 import math
 import os
 import struct
@@ -26,31 +25,123 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 BASE_FRAME = "base_link"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SCENE1_YOLO_MODEL = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "models", "scene1_objects.pt")
+    os.path.join(SCRIPT_DIR, "..", "models", "yolo", "scene1_objects.pt")
+)
+DEFAULT_SCENE2_YOLO_MODEL = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "models", "yolo", "scene2_parts.pt")
 )
 DEFAULT_SCENE3_YOLO_MODEL = os.path.normpath(
     os.path.join(SCRIPT_DIR, "..", "models", "yolo", "scene3_smt_tray.pt")
 )
-SCENE1_YOLO_CLASS_NAME = "parcel"
-SCENE1_YOLO_TARGET_BIN = "drop_box"
 SCENE1_YOLO_CLASS_NAMES = ("parcel", "weighing_area", "drop_box")
+SCENE1_YOLO_WORLD_PROMPTS = (
+    "parcel",
+    "package",
+    "delivery package",
+    "cardboard box",
+    "weighing area",
+    "scale area",
+    "weighing square",
+    "drop box",
+    "sorting box",
+    "destination box",
+    "green sorting box",
+    "",
+)
 SCENE1_YOLO_CLASS_ALIASES = {
     "parcel": "parcel",
     "package": "parcel",
     "package_box": "parcel",
     "delivery_package": "parcel",
+    "delivery package": "parcel",
     "cardboard_box": "parcel",
+    "cardboard box": "parcel",
     "weighing_area": "weighing_area",
+    "weighing area": "weighing_area",
     "weigh_area": "weighing_area",
     "scale_area": "weighing_area",
+    "scale area": "weighing_area",
+    "weighing_square": "weighing_area",
+    "weighing square": "weighing_area",
     "drop_box": "drop_box",
+    "drop box": "drop_box",
     "sorting_box": "drop_box",
+    "sorting box": "drop_box",
     "destination_box": "drop_box",
+    "destination box": "drop_box",
+    "green_sorting_box": "drop_box",
+    "green sorting box": "drop_box",
 }
 SCENE1_YOLO_TARGET_BINS = {
     "parcel": "drop_box",
     "weighing_area": None,
     "drop_box": None,
+}
+SCENE2_YOLO_CLASS_NAMES = (
+    "part_type_a",
+    "part_type_b",
+    "part_type_c",
+    "sorting_bin_a",
+    "sorting_bin_b",
+    "sorting_bin_c",
+)
+SCENE2_YOLO_WORLD_PROMPTS = (
+    "pipe fitting",
+    "steel pipe fastener",
+    "steel pipe fasteners",
+    "part type a",
+    "pipe clamp",
+    "t junction",
+    "t-junction",
+    "part type b",
+    "screwdriver",
+    "part type c",
+    "sorting bin a",
+    "blue sorting bin",
+    "sorting bin b",
+    "orange sorting bin",
+    "sorting bin c",
+    "purple sorting bin",
+    "",
+)
+SCENE2_YOLO_CLASS_ALIASES = {
+    "pipe_fitting": "part_type_a",
+    "pipe fitting": "part_type_a",
+    "steel_pipe_fastener": "part_type_a",
+    "steel pipe fastener": "part_type_a",
+    "steel_pipe_fasteners": "part_type_a",
+    "steel pipe fasteners": "part_type_a",
+    "part_type_a": "part_type_a",
+    "part type a": "part_type_a",
+    "pipe_clamp": "part_type_b",
+    "pipe clamp": "part_type_b",
+    "t_junction": "part_type_b",
+    "t junction": "part_type_b",
+    "part_type_b": "part_type_b",
+    "part type b": "part_type_b",
+    "screwdriver": "part_type_c",
+    "part_type_c": "part_type_c",
+    "part type c": "part_type_c",
+    "sorting_bin_a": "sorting_bin_a",
+    "sorting bin a": "sorting_bin_a",
+    "blue_sorting_bin": "sorting_bin_a",
+    "blue sorting bin": "sorting_bin_a",
+    "sorting_bin_b": "sorting_bin_b",
+    "sorting bin b": "sorting_bin_b",
+    "orange_sorting_bin": "sorting_bin_b",
+    "orange sorting bin": "sorting_bin_b",
+    "sorting_bin_c": "sorting_bin_c",
+    "sorting bin c": "sorting_bin_c",
+    "purple_sorting_bin": "sorting_bin_c",
+    "purple sorting bin": "sorting_bin_c",
+}
+SCENE2_YOLO_TARGET_BINS = {
+    "part_type_a": "sorting_bin_a",
+    "part_type_b": "sorting_bin_b",
+    "part_type_c": "sorting_bin_c",
+    "sorting_bin_a": None,
+    "sorting_bin_b": None,
+    "sorting_bin_c": None,
 }
 SCENE1_YOLO_DEFAULT_CONF = 0.45
 SCENE1_YOLO_DEFAULT_IMGSZ = 640
@@ -197,7 +288,7 @@ SCENE_REACH_X_MAX_M = {
     "scene3": 0.94,
 }
 TARGET_WAIT_SEC = 8.0
-SCENE2_STABLE_TARGET_COUNT = 6
+SCENE2_STABLE_TARGET_COUNT = 4
 SCENE2_STABLE_FRAMES = 2
 SCENE2_STABLE_POS_EPS_M = 0.03
 SCENE2_DETECT_RETRY = 4
@@ -238,80 +329,6 @@ CAMERA_SPECS = {
     },
 }
 
-# HSV 规则阈值使用公开材质颜色做基线。阈值保守放宽，实际筛选还会叠加面积、
-# 长宽比、深度有效性和去重。
-TARGET_RULES = {
-    "scene1": [
-        {
-            "class_name": "parcel",
-            "target_bin": "drop_box",
-            "hsv_ranges": [
-                ((5, 35, 80), (35, 255, 255)),      # brown/yellow/orange parcel
-                ((88, 15, 115), (128, 120, 255)),   # pale blue parcel
-            ],
-            "min_area_px": 120,
-            "max_area_px": 35000,
-            "min_aspect": 0.25,
-            "max_aspect": 4.2,
-            "min_extent": 0.22,
-        },
-    ],
-    "scene2": [
-        {
-            "class_name": "part_type_a",
-            "target_bin": "sorting_bin_a",
-            "hsv_ranges": [((0, 0, 115), (180, 65, 255))],
-            "min_area_px": 70,
-            "max_area_px": 18000,
-            "min_aspect": 0.18,
-            "max_aspect": 5.0,
-            "min_extent": 0.12,
-        },
-        {
-            "class_name": "part_type_b",
-            "target_bin": "sorting_bin_b",
-            "hsv_ranges": [((0, 0, 0), (180, 90, 85))],
-            "min_area_px": 70,
-            "max_area_px": 18000,
-            "min_aspect": 0.18,
-            "max_aspect": 5.0,
-            "min_extent": 0.12,
-        },
-        {
-            "class_name": "part_type_c",
-            "target_bin": "sorting_bin_c",
-            "hsv_ranges": [
-                ((0, 80, 60), (12, 255, 255)),
-                ((170, 80, 60), (179, 255, 255)),
-            ],
-            "min_area_px": 45,
-            "max_area_px": 14000,
-            "min_aspect": 0.12,
-            "max_aspect": 8.0,
-            "min_extent": 0.08,
-        },
-    ],
-}
-
-SCENE2_YOLO_CLASS_ALIASES = {
-    "pipe_fitting": "part_type_a",
-    "steel_pipe_fasteners": "part_type_a",
-    "part_type_a": "part_type_a",
-    "pipe_clamp": "part_type_b",
-    "t_junction": "part_type_b",
-    "part_type_b": "part_type_b",
-    "screwdriver": "part_type_c",
-    "part_type_c": "part_type_c",
-}
-
-SCENE2_YOLO_MODEL_PATTERNS = [
-    "models/yolo/best.pt",
-    "models/yolo/yolov8n_seg_scene2_demo.pt",
-    "src/challenge_cup_task_template/models/yolo/best.pt",
-    "src/challenge_cup_task_template/models/yolo/yolov8n_seg_scene2_demo.pt",
-    "runs/**/weights/best.pt",
-]
-
 SCENE2_GRASP_OFFSETS_BASE = {
     # base_link 下的经验偏置。视觉给出的是实例可见区域中心，抓取点需要略微移到
     # 稳定受力位置；数值保持保守，后续按实测 seed 微调。
@@ -320,80 +337,9 @@ SCENE2_GRASP_OFFSETS_BASE = {
     "part_type_c": (0.015, 0.00, -0.012),
 }
 
-SCENE2_NOMINAL_PARTS_BASE = [
-    # 仅作为视觉完全失败时的保守退路。正式策略仍以相机/深度/TF 检测为主。
-    ("part_type_a", (0.29, -0.35, -0.12)),
-    ("part_type_a", (0.29, -0.25, -0.12)),
-    ("part_type_b", (0.29, -0.07, -0.10)),
-    ("part_type_b", (0.29, 0.03, -0.10)),
-    ("part_type_c", (0.31, 0.19, -0.10)),
-    ("part_type_c", (0.31, 0.33, -0.10)),
-]
-
-BIN_RULES = {
-    "scene1": [
-        {
-            "class_name": "weighing_area",
-            "hsv_ranges": [((45, 60, 60), (90, 255, 255))],
-            "min_area_px": 400,
-            "max_area_px": 50000,
-            "min_aspect": 0.35,
-            "max_aspect": 3.0,
-            "min_extent": 0.25,
-        },
-        {
-            "class_name": "drop_box",
-            "hsv_ranges": [((45, 45, 45), (95, 255, 255))],
-            "min_area_px": 500,
-            "max_area_px": 90000,
-            "min_aspect": 0.35,
-            "max_aspect": 4.0,
-            "min_extent": 0.20,
-        },
-    ],
-    "scene2": [
-        {
-            "class_name": "sorting_bin_a",
-            "hsv_ranges": [((95, 80, 55), (130, 255, 255))],
-            "min_area_px": 400,
-            "max_area_px": 90000,
-            "min_aspect": 0.35,
-            "max_aspect": 4.0,
-            "min_extent": 0.20,
-        },
-        {
-            "class_name": "sorting_bin_b",
-            "hsv_ranges": [((6, 80, 70), (28, 255, 255))],
-            "min_area_px": 400,
-            "max_area_px": 90000,
-            "min_aspect": 0.35,
-            "max_aspect": 4.0,
-            "min_extent": 0.20,
-        },
-        {
-            "class_name": "sorting_bin_c",
-            "hsv_ranges": [((130, 45, 50), (165, 255, 255))],
-            "min_area_px": 400,
-            "max_area_px": 90000,
-            "min_aspect": 0.35,
-            "max_aspect": 4.0,
-            "min_extent": 0.20,
-        },
-    ],
-}
-
-# 放置目标坐标系为 base_link，来源于公开场景几何与样例控制脚本的
-# 人工标定量级；场景三出库区直接使用该预设点。
+# 场景三出库区为公开指定区域，直接使用 base_link 下的预设点。
+# 场景一/二目标区必须由 YOLO-World 检出，不再保留几何兜底点。
 PLACE_TARGETS_BASE = {
-    "scene1": {
-        "weighing_area": (0.42, -0.56, 0.12),
-        "drop_box": (0.62, 0.30, 0.20),
-    },
-    "scene2": {
-        "sorting_bin_a": (0.56, -0.43, 0.18),
-        "sorting_bin_b": (0.56, 0.00, 0.18),
-        "sorting_bin_c": (0.56, 0.43, 0.18),
-    },
     "scene3": {
         "outbound_box": (0.58, 0.00, 0.22),
     },
@@ -401,7 +347,7 @@ PLACE_TARGETS_BASE = {
 
 SCENE_TARGET_LIMIT = {
     "scene1": 4,
-    "scene2": 6,
+    "scene2": 4,
     "scene3": 2,
 }
 
@@ -903,11 +849,11 @@ class RobotBase:
 
 
 # ---------------------------------------------------------------------------
-# 感知层：规则检测、深度投影和 TF 变换
+# 感知层：YOLO-World 检测、深度投影和 TF 变换
 # ---------------------------------------------------------------------------
 
 
-class RuleBasedPerception:
+class RGBDPerceptionBase:
     def __init__(self, scene: str, base_frame: str = BASE_FRAME):
         import rospy
         import tf2_ros
@@ -919,9 +865,6 @@ class RuleBasedPerception:
         self.cv2 = None
         self.np = None
         self._cv_import_failed = False
-        self._yolo_model = None
-        self._yolo_import_failed = False
-        self._yolo_model_path = None
         self.tf_buffer = tf2_ros.Buffer(rospy.Duration(30.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.cameras: Dict[str, Dict[str, Any]] = {}
@@ -955,7 +898,7 @@ class RuleBasedPerception:
             return True
         except Exception as exc:
             self._cv_import_failed = True
-            log_error(self.scene, "感知", "无法导入 cv2/numpy，规则识别不可用: %s", exc)
+            log_error(self.scene, "感知", "无法导入 cv2/numpy，视觉识别不可用: %s", exc)
             return False
 
     def wait_ready(self, timeout_sec: float = TARGET_WAIT_SEC) -> bool:
@@ -979,260 +922,21 @@ class RuleBasedPerception:
     def detect_targets(self, class_names: Optional[Sequence[str]] = None,
                        cameras: Optional[Sequence[str]] = None,
                        max_targets: Optional[int] = None) -> List[PerceptionTarget]:
-        if self.scene == "scene2":
-            yolo_targets = self._detect_scene2_with_yolo(class_names=class_names, max_targets=max_targets)
-            if yolo_targets:
-                return yolo_targets
-
-        rules = list(TARGET_RULES.get(self.scene, []))
-        if class_names is not None:
-            wanted = set(class_names)
-            rules = [rule for rule in rules if rule["class_name"] in wanted]
-        return self._detect_with_rules(
-            rules=rules,
-            cameras=cameras or self._default_cameras_for_targets(),
-            max_targets=max_targets,
-            purpose="检测",
-        )
+        raise NotImplementedError
 
     def detect_bins(self, bin_names: Optional[Sequence[str]] = None) -> List[PerceptionTarget]:
-        rules = list(BIN_RULES.get(self.scene, []))
-        if bin_names is not None:
-            wanted = set(bin_names)
-            rules = [rule for rule in rules if rule["class_name"] in wanted]
-        return self._detect_with_rules(
-            rules=rules,
-            cameras=["head"],
-            max_targets=None,
-            purpose="目标区",
-        )
+        raise NotImplementedError
 
     def _default_cameras_for_targets(self) -> List[str]:
         if self.scene == "scene3":
             return ["head", "left_wrist", "right_wrist"]
         return ["head", "left_wrist", "right_wrist"]
 
-    def _find_yolo_model_path(self) -> Optional[str]:
-        if self._yolo_model_path:
-            return self._yolo_model_path
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        pkg_dir = os.path.abspath(os.path.join(script_dir, ".."))
-        repo_root = os.path.abspath(os.path.join(pkg_dir, "..", ".."))
-        bases = [pkg_dir, repo_root, os.getcwd()]
-        for pattern in SCENE2_YOLO_MODEL_PATTERNS:
-            for base in bases:
-                matches = glob.glob(os.path.join(base, pattern), recursive=True)
-                for path in sorted(matches):
-                    if os.path.isfile(path):
-                        self._yolo_model_path = path
-                        return path
-        return None
-
-    def _ensure_yolo(self) -> bool:
-        if self._yolo_model is not None:
-            return True
-        if self._yolo_import_failed:
-            return False
-        model_path = self._find_yolo_model_path()
-        if not model_path:
-            self._yolo_import_failed = True
-            log_warn(self.scene, "YOLO", "未找到 Scene2 YOLO 权重，使用 HSV 规则检测兜底")
-            return False
-        try:
-            from ultralytics import YOLO
-
-            self._yolo_model = YOLO(model_path)
-            log_stage(self.scene, "YOLO", "加载模型 %s", model_path)
-            return True
-        except Exception as exc:
-            self._yolo_import_failed = True
-            log_warn(self.scene, "YOLO", "加载失败，使用 HSV 规则检测兜底: %s", exc)
-            return False
-
-    def _detect_scene2_with_yolo(self, class_names: Optional[Sequence[str]],
-                                 max_targets: Optional[int]) -> List[PerceptionTarget]:
-        if not self._ensure_cv() or not self._ensure_yolo():
-            return []
-        state = self.cameras.get("head")
-        if not state:
-            return []
-        color_msg = state.get("color_msg")
-        info_msg = state.get("info_msg")
-        if color_msg is None or info_msg is None:
-            return []
-        color_bgr = self._decode_color(color_msg)
-        if color_bgr is None:
-            return []
-        depth_m = self._decode_depth(state.get("depth_msg"))
-        wanted = set(class_names or ["part_type_a", "part_type_b", "part_type_c"])
-        try:
-            results = self._yolo_model.predict(color_bgr, verbose=False, conf=0.35, imgsz=640)
-        except Exception as exc:
-            log_warn(self.scene, "YOLO", "推理失败，使用 HSV 规则检测兜底: %s", exc)
-            return []
-
-        targets: List[PerceptionTarget] = []
-        for result in results:
-            names = getattr(result, "names", {}) or {}
-            boxes = getattr(result, "boxes", None)
-            masks = getattr(result, "masks", None)
-            if boxes is None:
-                continue
-            box_data = getattr(boxes, "data", None)
-            if box_data is None:
-                continue
-            try:
-                box_rows = box_data.detach().cpu().numpy()
-            except Exception:
-                box_rows = box_data.cpu().numpy()
-            mask_rows = []
-            if masks is not None and getattr(masks, "data", None) is not None:
-                try:
-                    mask_rows = masks.data.detach().cpu().numpy()
-                except Exception:
-                    mask_rows = masks.data.cpu().numpy()
-            for index, row in enumerate(box_rows):
-                if len(row) < 6:
-                    continue
-                cls_idx = int(row[5])
-                raw_name = str(names.get(cls_idx, cls_idx))
-                class_name = SCENE2_YOLO_CLASS_ALIASES.get(raw_name, raw_name)
-                if class_name not in wanted:
-                    continue
-                conf = float(row[4])
-                x0, y0, x1, y1 = [int(round(float(v))) for v in row[:4]]
-                x0 = int(clamp(x0, 0, color_bgr.shape[1] - 1))
-                y0 = int(clamp(y0, 0, color_bgr.shape[0] - 1))
-                x1 = int(clamp(x1, x0 + 1, color_bgr.shape[1]))
-                y1 = int(clamp(y1, y0 + 1, color_bgr.shape[0]))
-                mask = self._mask_from_yolo(mask_rows[index], color_bgr.shape[:2]) if index < len(mask_rows) else None
-                target = self._yolo_detection_to_target(
-                    color_msg=color_msg,
-                    info_msg=info_msg,
-                    depth_m=depth_m,
-                    mask=mask,
-                    bbox=(x0, y0, x1 - x0, y1 - y0),
-                    class_name=class_name,
-                    confidence=conf,
-                )
-                if target is not None:
-                    targets.append(target)
-
-        targets = self._dedupe_targets(targets)
-        targets.sort(key=lambda t: t.confidence, reverse=True)
-        if max_targets is not None:
-            targets = targets[:int(max_targets)]
-        if targets:
-            log_stage(
-                self.scene,
-                "YOLO",
-                "检测结果 %s",
-                " ".join("{}={}".format(name, sum(1 for t in targets if t.class_name == name))
-                         for name in ["part_type_a", "part_type_b", "part_type_c"]),
-            )
-        return targets
-
     def _mask_from_yolo(self, mask_data: Any, shape_hw: Tuple[int, int]) -> Any:
         mask = (mask_data > 0.5).astype(self.np.uint8) * 255
         if mask.shape[:2] != shape_hw:
             mask = self.cv2.resize(mask, (shape_hw[1], shape_hw[0]), interpolation=self.cv2.INTER_NEAREST)
         return mask
-
-    def _yolo_detection_to_target(self, color_msg: Any, info_msg: Any, depth_m: Optional[Any],
-                                  mask: Optional[Any], bbox: Tuple[int, int, int, int],
-                                  class_name: str, confidence: float) -> Optional[PerceptionTarget]:
-        x, y, w, h = bbox
-        if w <= 0 or h <= 0:
-            return None
-        if mask is None:
-            mask = self.np.zeros((max(y + h + 1, 1), max(x + w + 1, 1)), dtype=self.np.uint8)
-            mask[y:y + h, x:x + w] = 255
-        moments = self.cv2.moments(mask[y:y + h, x:x + w])
-        if abs(moments["m00"]) > 1e-6:
-            u = int(x + moments["m10"] / moments["m00"])
-            v = int(y + moments["m01"] / moments["m00"])
-        else:
-            u = int(x + w * 0.5)
-            v = int(y + h * 0.5)
-        depth = self._median_depth_for_contour(depth_m, mask, x, y, w, h)
-        pos_camera = None
-        pos_base = None
-        if depth is not None:
-            pos_camera = self._pixel_to_camera(u, v, depth, info_msg)
-            pos_base = self._transform_camera_to_base(pos_camera, color_msg.header.frame_id, color_msg.header.stamp)
-        contours = self._find_contours(mask[y:y + h, x:x + w])
-        yaw_rad = 0.0
-        if contours:
-            yaw_rad = self._contour_yaw(max(contours, key=self.cv2.contourArea))
-        area = float(self.cv2.countNonZero(mask[y:y + h, x:x + w]))
-        return PerceptionTarget(
-            class_name=class_name,
-            confidence=float(confidence),
-            center_uv=(u, v),
-            position_base=pos_base,
-            position_camera=pos_camera,
-            camera="head",
-            area_px=area,
-            bbox=(int(x), int(y), int(w), int(h)),
-            yaw_rad=yaw_rad,
-            target_bin=Scene2Controller.PART_TO_BIN.get(class_name),
-            timestamp=time.time(),
-            debug={
-                "source": "yolov8_seg",
-                "depth_m": depth,
-                "image_size": (int(mask.shape[1]), int(mask.shape[0])),
-                "frame_id": color_msg.header.frame_id,
-            },
-        )
-
-    def _detect_with_rules(self, rules: Sequence[Dict[str, Any]], cameras: Sequence[str],
-                           max_targets: Optional[int], purpose: str) -> List[PerceptionTarget]:
-        if not rules or not self._ensure_cv():
-            return []
-
-        targets: List[PerceptionTarget] = []
-        for camera in cameras:
-            state = self.cameras.get(camera)
-            if not state:
-                continue
-            color_msg = state.get("color_msg")
-            info_msg = state.get("info_msg")
-            if color_msg is None or info_msg is None:
-                self.rospy.loginfo_throttle(
-                    1.0,
-                    "[%s][%s] %s 未就绪 color=%s info=%s",
-                    self.scene,
-                    purpose,
-                    camera,
-                    color_msg is not None,
-                    info_msg is not None,
-                )
-                continue
-
-            color = self._decode_color(color_msg)
-            if color is None:
-                continue
-            depth = self._decode_depth(state.get("depth_msg"))
-            if depth is None:
-                self.rospy.loginfo_throttle(
-                    1.0,
-                    "[%s][%s] %s 深度图未就绪或解码失败，候选将缺少 base_link 坐标",
-                    self.scene,
-                    purpose,
-                    camera,
-                )
-            targets.extend(self._detect_in_image(camera, color_msg, info_msg, color, depth, rules, purpose))
-
-        targets = self._dedupe_targets(targets)
-        targets.sort(key=lambda t: t.confidence, reverse=True)
-        if max_targets is not None:
-            targets = targets[:int(max_targets)]
-        debug_summary = " ".join(
-            "{}={}".format(rule["class_name"], sum(1 for t in targets if t.class_name == rule["class_name"]))
-            for rule in rules
-        )
-        log_stage(self.scene, purpose, "规则结果 %s", debug_summary or "empty")
-        return targets
 
     def _decode_color(self, msg: Any) -> Optional[Any]:
         try:
@@ -1282,126 +986,10 @@ class RuleBasedPerception:
             log_warn(self.scene, "感知", "深度解码失败: %s", exc)
         return None
 
-    def _detect_in_image(self, camera: str, color_msg: Any, info_msg: Any,
-                         color_bgr: Any, depth_m: Optional[Any],
-                         rules: Sequence[Dict[str, Any]], purpose: str) -> List[PerceptionTarget]:
-        hsv = self.cv2.cvtColor(color_bgr, self.cv2.COLOR_BGR2HSV)
-        height, width = color_bgr.shape[:2]
-        found: List[PerceptionTarget] = []
-
-        for rule in rules:
-            mask = self._mask_for_rule(hsv, rule)
-            mask = self._apply_workspace_roi(mask, purpose)
-            contours = self._find_contours(mask)
-            raw_count = len(contours)
-            kept_count = 0
-            for contour in contours:
-                candidate = self._contour_to_target(
-                    camera=camera,
-                    color_msg=color_msg,
-                    info_msg=info_msg,
-                    depth_m=depth_m,
-                    mask=mask,
-                    contour=contour,
-                    rule=rule,
-                    image_width=width,
-                    image_height=height,
-                )
-                if candidate is not None:
-                    kept_count += 1
-                    found.append(candidate)
-            self.rospy.loginfo_throttle(
-                1.0,
-                "[%s][%s] cam=%s class=%s raw_contours=%d kept=%d",
-                self.scene,
-                purpose,
-                camera,
-                rule["class_name"],
-                raw_count,
-                kept_count,
-            )
-        return found
-
-    def _mask_for_rule(self, hsv: Any, rule: Dict[str, Any]) -> Any:
-        mask = self.np.zeros(hsv.shape[:2], dtype=self.np.uint8)
-        for lower, upper in rule.get("hsv_ranges", []):
-            lo = self.np.array(lower, dtype=self.np.uint8)
-            hi = self.np.array(upper, dtype=self.np.uint8)
-            mask = self.cv2.bitwise_or(mask, self.cv2.inRange(hsv, lo, hi))
-        kernel = self.np.ones((5, 5), dtype=self.np.uint8)
-        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, kernel)
-        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel)
-        return mask
-
-    def _apply_workspace_roi(self, mask: Any, purpose: str) -> Any:
-        h, w = mask.shape[:2]
-        roi = self.np.zeros_like(mask)
-        top = int(h * 0.12)
-        bottom = int(h * 0.96)
-        left = int(w * 0.08)
-        right = int(w * 0.92)
-        roi[top:bottom, left:right] = 255
-        return self.cv2.bitwise_and(mask, roi)
-
     def _find_contours(self, mask: Any) -> List[Any]:
         result = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
         contours = result[0] if len(result) == 2 else result[1]
         return list(contours)
-
-    def _contour_to_target(self, camera: str, color_msg: Any, info_msg: Any,
-                           depth_m: Optional[Any], mask: Any, contour: Any,
-                           rule: Dict[str, Any], image_width: int,
-                           image_height: int) -> Optional[PerceptionTarget]:
-        area = float(self.cv2.contourArea(contour))
-        if area < float(rule.get("min_area_px", 0)) or area > float(rule.get("max_area_px", 1e9)):
-            return None
-        x, y, w, h = self.cv2.boundingRect(contour)
-        if w <= 0 or h <= 0:
-            return None
-        aspect = float(w) / float(h)
-        if aspect < float(rule.get("min_aspect", 0.0)) or aspect > float(rule.get("max_aspect", 999.0)):
-            return None
-        extent = area / float(max(1, w * h))
-        if extent < float(rule.get("min_extent", 0.0)):
-            return None
-
-        moments = self.cv2.moments(contour)
-        if abs(moments["m00"]) > 1e-6:
-            u = int(moments["m10"] / moments["m00"])
-            v = int(moments["m01"] / moments["m00"])
-        else:
-            u = int(x + w * 0.5)
-            v = int(y + h * 0.5)
-
-        depth = self._median_depth_for_contour(depth_m, mask, x, y, w, h)
-        pos_camera = None
-        pos_base = None
-        if depth is not None:
-            pos_camera = self._pixel_to_camera(u, v, depth, info_msg)
-            pos_base = self._transform_camera_to_base(pos_camera, color_msg.header.frame_id, color_msg.header.stamp)
-
-        yaw_rad = self._contour_yaw(contour)
-        confidence = self._confidence(area, image_width, image_height, depth, extent)
-        return PerceptionTarget(
-            class_name=rule["class_name"],
-            confidence=confidence,
-            center_uv=(u, v),
-            position_base=pos_base,
-            position_camera=pos_camera,
-            camera=camera,
-            area_px=area,
-            bbox=(int(x), int(y), int(w), int(h)),
-            yaw_rad=yaw_rad,
-            target_bin=rule.get("target_bin"),
-            timestamp=time.time(),
-            debug={
-                "aspect": aspect,
-                "extent": extent,
-                "depth_m": depth,
-                "image_size": (image_width, image_height),
-                "frame_id": color_msg.header.frame_id,
-            },
-        )
 
     def _median_depth_for_contour(self, depth_m: Optional[Any], mask: Any,
                                   x: int, y: int, w: int, h: int) -> Optional[float]:
@@ -1496,13 +1084,6 @@ class RuleBasedPerception:
             angle += 90.0
         return math.radians(angle)
 
-    def _confidence(self, area: float, width: int, height: int,
-                    depth: Optional[float], extent: float) -> float:
-        area_score = clamp(area / float(width * height) * 80.0, 0.0, 0.55)
-        depth_score = 0.30 if depth is not None else 0.10
-        extent_score = clamp(extent, 0.0, 0.25)
-        return clamp(area_score + depth_score + extent_score, 0.05, 0.99)
-
     def _dedupe_targets(self, targets: Sequence[PerceptionTarget]) -> List[PerceptionTarget]:
         kept: List[PerceptionTarget] = []
         for target in sorted(targets, key=lambda t: t.confidence, reverse=True):
@@ -1525,22 +1106,30 @@ class RuleBasedPerception:
         return kept
 
 
-class YoloScene1Perception(RuleBasedPerception):
-    def __init__(self, scene: str, base_frame: str = BASE_FRAME,
-                 model_path: str = DEFAULT_SCENE1_YOLO_MODEL,
-                 device: str = "auto",
-                 conf: float = SCENE1_YOLO_DEFAULT_CONF,
-                 imgsz: int = SCENE1_YOLO_DEFAULT_IMGSZ):
+class YoloWorldPerception(RGBDPerceptionBase):
+    def __init__(self, scene: str, base_frame: str,
+                 model_path: str,
+                 device: str,
+                 conf: float,
+                 imgsz: int,
+                 class_names: Sequence[str],
+                 class_aliases: Dict[str, str],
+                 target_bins: Dict[str, Optional[str]],
+                 world_prompts: Sequence[str],
+                 bin_class_names: Sequence[str]):
         super().__init__(scene=scene, base_frame=base_frame)
-        self.yolo_model_path = os.path.abspath(os.path.expanduser(model_path))
+        self.yolo_model_path = self._normalize_model_ref(model_path)
         self.yolo_device = device
         self.yolo_conf = float(conf)
         self.yolo_imgsz = int(imgsz)
-        self.yolo_class_name = SCENE1_YOLO_CLASS_NAME
-        self.yolo_target_bin = SCENE1_YOLO_TARGET_BIN
-        self.yolo_class_names = tuple(SCENE1_YOLO_CLASS_NAMES)
-        self.yolo_class_aliases = dict(SCENE1_YOLO_CLASS_ALIASES)
-        self.yolo_target_bins = dict(SCENE1_YOLO_TARGET_BINS)
+        self.yolo_class_names = tuple(class_names)
+        self.yolo_class_aliases = {
+            self._normalize_yolo_name(alias): canonical
+            for alias, canonical in class_aliases.items()
+        }
+        self.yolo_target_bins = dict(target_bins)
+        self.yolo_world_prompts = tuple(world_prompts)
+        self.yolo_bin_class_names = tuple(bin_class_names)
         self.yolo_center_depth_fraction = SCENE1_YOLO_CENTER_DEPTH_FRACTION
         self._yolo_model = None
         self._yolo_unavailable_reason: Optional[str] = None
@@ -1559,7 +1148,7 @@ class YoloScene1Perception(RuleBasedPerception):
         )
 
     def detect_bins(self, bin_names: Optional[Sequence[str]] = None) -> List[PerceptionTarget]:
-        wanted = self._wanted_yolo_classes(bin_names, allowed=("weighing_area", "drop_box"))
+        wanted = self._wanted_yolo_classes(bin_names, allowed=self.yolo_bin_class_names)
         return self._detect_yolo_classes(
             class_names=wanted,
             cameras=["head"],
@@ -1576,7 +1165,7 @@ class YoloScene1Perception(RuleBasedPerception):
             return []
         if not self._ensure_yolo():
             reason = self._yolo_unavailable_reason or "unknown"
-            self._report_yolo_unavailable("error", "YOLO 不可用: %s", reason)
+            self._report_yolo_unavailable("error", "YOLO-World 不可用: %s", reason)
             return []
 
         try:
@@ -1598,30 +1187,79 @@ class YoloScene1Perception(RuleBasedPerception):
         if not self._ensure_cv():
             self._yolo_unavailable_reason = "cv2/numpy import failed"
             return False
-        if not os.path.isfile(self.yolo_model_path):
-            self._yolo_unavailable_reason = "model not found: {}".format(self.yolo_model_path)
+        if (not os.path.isfile(self.yolo_model_path)
+                and not self._is_ultralytics_world_model_name(self.yolo_model_path)):
+            self._yolo_unavailable_reason = (
+                "model not found: {}; generate a scene-specific YOLO-World .pt "
+                "or pass yolov8s-worldv2.pt as --yolo-model"
+            ).format(self.yolo_model_path)
             return False
 
-        try:
-            from ultralytics import YOLO
+        load_errors: List[str] = []
+        if self._try_load_yolo_world(load_errors):
+            return True
 
-            self._yolo_model = YOLO(self.yolo_model_path)
-            if not self._yolo_ready_logged:
-                log_stage(
-                    self.scene,
-                    "YOLO",
-                    "已加载模型 %s device=%s conf=%.2f imgsz=%d",
-                    self.yolo_model_path,
-                    self.yolo_device,
-                    self.yolo_conf,
-                    self.yolo_imgsz,
-                )
-                self._yolo_ready_logged = True
+        self._yolo_unavailable_reason = "; ".join(load_errors) or "ultralytics/model load failed"
+        self._yolo_model = None
+        return False
+
+    def _try_load_yolo_world(self, load_errors: List[str]) -> bool:
+        try:
+            from ultralytics import YOLOWorld
+
+            model = YOLOWorld(self.yolo_model_path)
+            prompts_applied = self._apply_world_prompts(model)
+            self._yolo_model = model
+            self._log_yolo_ready("YOLOWorld", prompts_applied=prompts_applied)
             return True
         except Exception as exc:
-            self._yolo_unavailable_reason = "ultralytics/model load failed: {}".format(exc)
+            load_errors.append("YOLOWorld load failed: {}".format(exc))
             self._yolo_model = None
             return False
+
+    def _apply_world_prompts(self, model: Any) -> bool:
+        if not self._model_needs_prompts() or not hasattr(model, "set_classes"):
+            return False
+        model.set_classes(list(self.yolo_world_prompts))
+        return True
+
+    def _model_needs_prompts(self) -> bool:
+        basename = os.path.basename(self.yolo_model_path).lower()
+        return "world" in basename
+
+    def _is_ultralytics_world_model_name(self, model_path: str) -> bool:
+        basename = os.path.basename(model_path)
+        return (
+            basename == model_path
+            and basename.lower().endswith(".pt")
+            and "world" in basename.lower()
+        )
+
+    def _normalize_model_ref(self, model_path: str) -> str:
+        expanded = os.path.expanduser(model_path)
+        if os.path.isabs(expanded) or os.path.dirname(expanded):
+            return os.path.abspath(expanded)
+        return expanded
+
+    def _log_yolo_ready(self, backend: str, prompts_applied: bool) -> None:
+        if self._yolo_ready_logged:
+            return
+        prompt_summary = ",".join(
+            prompt or "<background>" for prompt in self.yolo_world_prompts
+        )
+        log_stage(
+            self.scene,
+            "YOLO",
+            "已加载%s模型 %s device=%s conf=%.2f imgsz=%d prompts_applied=%s prompts=%s",
+            backend,
+            self.yolo_model_path,
+            self.yolo_device,
+            self.yolo_conf,
+            self.yolo_imgsz,
+            prompts_applied,
+            prompt_summary,
+        )
+        self._yolo_ready_logged = True
 
     def _report_yolo_unavailable(self, level: str, message: str, *args: Any) -> None:
         if self._yolo_unavailable_reported:
@@ -1778,9 +1416,9 @@ class YoloScene1Perception(RuleBasedPerception):
         raw_name = names.get(class_id, str(class_id))
         area_px = float(w * h)
         yaw_rad = None
-        source = "yolo"
+        source = "yolo_world"
         if mask is not None:
-            source = "yolo_seg"
+            source = "yolo_world_seg"
             roi_mask = mask[y0:y1, x0:x1]
             area_px = float(self.cv2.countNonZero(roi_mask))
             contours = self._find_contours(roi_mask)
@@ -1955,7 +1593,49 @@ class YoloScene1Perception(RuleBasedPerception):
         return float(values[0])
 
 
-class YoloScene3Perception(YoloScene1Perception):
+class YoloScene1Perception(YoloWorldPerception):
+    def __init__(self, scene: str, base_frame: str = BASE_FRAME,
+                 model_path: str = DEFAULT_SCENE1_YOLO_MODEL,
+                 device: str = "auto",
+                 conf: float = SCENE1_YOLO_DEFAULT_CONF,
+                 imgsz: int = SCENE1_YOLO_DEFAULT_IMGSZ):
+        super().__init__(
+            scene=scene,
+            base_frame=base_frame,
+            model_path=model_path,
+            device=device,
+            conf=conf,
+            imgsz=imgsz,
+            class_names=SCENE1_YOLO_CLASS_NAMES,
+            class_aliases=SCENE1_YOLO_CLASS_ALIASES,
+            target_bins=SCENE1_YOLO_TARGET_BINS,
+            world_prompts=SCENE1_YOLO_WORLD_PROMPTS,
+            bin_class_names=("weighing_area", "drop_box"),
+        )
+
+
+class YoloScene2Perception(YoloWorldPerception):
+    def __init__(self, scene: str, base_frame: str = BASE_FRAME,
+                 model_path: str = DEFAULT_SCENE2_YOLO_MODEL,
+                 device: str = "auto",
+                 conf: float = SCENE1_YOLO_DEFAULT_CONF,
+                 imgsz: int = SCENE1_YOLO_DEFAULT_IMGSZ):
+        super().__init__(
+            scene=scene,
+            base_frame=base_frame,
+            model_path=model_path,
+            device=device,
+            conf=conf,
+            imgsz=imgsz,
+            class_names=SCENE2_YOLO_CLASS_NAMES,
+            class_aliases=SCENE2_YOLO_CLASS_ALIASES,
+            target_bins=SCENE2_YOLO_TARGET_BINS,
+            world_prompts=SCENE2_YOLO_WORLD_PROMPTS,
+            bin_class_names=("sorting_bin_a", "sorting_bin_b", "sorting_bin_c"),
+        )
+
+
+class YoloScene3Perception(YoloWorldPerception):
     def __init__(self, scene: str, base_frame: str = BASE_FRAME,
                  model_path: str = DEFAULT_SCENE3_YOLO_MODEL,
                  device: str = "auto",
@@ -1968,89 +1648,12 @@ class YoloScene3Perception(YoloScene1Perception):
             device=device,
             conf=conf,
             imgsz=imgsz,
+            class_names=(SCENE3_YOLO_CLASS_NAME,),
+            class_aliases=SCENE3_YOLO_CLASS_ALIASES,
+            target_bins={SCENE3_YOLO_CLASS_NAME: SCENE3_YOLO_TARGET_BIN},
+            world_prompts=SCENE3_YOLO_WORLD_PROMPTS,
+            bin_class_names=(),
         )
-        self.yolo_class_name = SCENE3_YOLO_CLASS_NAME
-        self.yolo_target_bin = SCENE3_YOLO_TARGET_BIN
-        self.yolo_class_names = (SCENE3_YOLO_CLASS_NAME,)
-        self.yolo_class_aliases = dict(SCENE3_YOLO_CLASS_ALIASES)
-        self.yolo_target_bins = {SCENE3_YOLO_CLASS_NAME: SCENE3_YOLO_TARGET_BIN}
-        self.yolo_world_prompts = tuple(SCENE3_YOLO_WORLD_PROMPTS)
-
-    def _ensure_yolo(self) -> bool:
-        if self._yolo_model is not None:
-            return True
-        if self._yolo_unavailable_reason is not None:
-            return False
-        if not self._ensure_cv():
-            self._yolo_unavailable_reason = "cv2/numpy import failed"
-            return False
-        if (not os.path.isfile(self.yolo_model_path)
-                and not self._is_ultralytics_world_model_name(self.yolo_model_path)):
-            self._yolo_unavailable_reason = (
-                "model not found: {}; generate scene3_smt_tray.pt with YOLOWorld "
-                "or pass yolov8s-worldv2.pt as --yolo-model"
-            ).format(self.yolo_model_path)
-            return False
-
-        load_errors: List[str] = []
-        if self._try_load_scene3_yolo_world(load_errors):
-            return True
-
-        self._yolo_unavailable_reason = "; ".join(load_errors) or "ultralytics/model load failed"
-        self._yolo_model = None
-        return False
-
-    def _try_load_scene3_yolo_world(self, load_errors: List[str]) -> bool:
-        try:
-            from ultralytics import YOLOWorld
-
-            model = YOLOWorld(self.yolo_model_path)
-            prompts_applied = self._apply_scene3_world_prompts(model)
-            self._yolo_model = model
-            self._log_scene3_yolo_ready("YOLOWorld", prompts_applied=prompts_applied)
-            return True
-        except Exception as exc:
-            load_errors.append("YOLOWorld load failed: {}".format(exc))
-            self._yolo_model = None
-            return False
-
-    def _apply_scene3_world_prompts(self, model: Any) -> bool:
-        if not self._scene3_model_needs_prompts() or not hasattr(model, "set_classes"):
-            return False
-        model.set_classes(list(self.yolo_world_prompts))
-        return True
-
-    def _scene3_model_needs_prompts(self) -> bool:
-        basename = os.path.basename(self.yolo_model_path).lower()
-        return "world" in basename
-
-    def _is_ultralytics_world_model_name(self, model_path: str) -> bool:
-        basename = os.path.basename(model_path)
-        return (
-            basename == model_path
-            and basename.lower().endswith(".pt")
-            and "world" in basename.lower()
-        )
-
-    def _log_scene3_yolo_ready(self, backend: str, prompts_applied: bool) -> None:
-        if self._yolo_ready_logged:
-            return
-        prompt_summary = ",".join(
-            prompt or "<background>" for prompt in self.yolo_world_prompts
-        )
-        log_stage(
-            self.scene,
-            "YOLO",
-            "已加载%s模型 %s device=%s conf=%.2f imgsz=%d prompts_applied=%s prompts=%s",
-            backend,
-            self.yolo_model_path,
-            self.yolo_device,
-            self.yolo_conf,
-            self.yolo_imgsz,
-            prompts_applied,
-            prompt_summary,
-        )
-        self._yolo_ready_logged = True
 
 
 # ---------------------------------------------------------------------------
@@ -2359,7 +1962,7 @@ class Skills:
 
 
 class BaseSceneController:
-    def __init__(self, scene: str, robot: RobotBase, perception: RuleBasedPerception,
+    def __init__(self, scene: str, robot: RobotBase, perception: RGBDPerceptionBase,
                  navigation: Navigation, skills: Skills):
         self.scene = scene
         self.robot = robot
@@ -2373,6 +1976,14 @@ class BaseSceneController:
     def wait_for_perception(self) -> bool:
         log_stage(self.scene, "等待传感器", "等待相机与 TF")
         return self.perception.wait_ready(timeout_sec=TARGET_WAIT_SEC)
+
+    def preload_yolo_model(self) -> None:
+        preload = getattr(self.perception, "preload_model", None)
+        if not callable(preload):
+            return
+        log_stage(self.scene, "YOLO", "预加载 YOLO-World 模型，避免首次检测时阻塞导航")
+        if not preload():
+            log_warn(self.scene, "YOLO", "模型预加载失败，后续检测会再次尝试并输出原因")
 
     def detect_targets(self, class_names: Optional[Sequence[str]] = None,
                        max_targets: Optional[int] = None) -> List[PerceptionTarget]:
@@ -2392,7 +2003,7 @@ class BaseSceneController:
         log_target_list(self.scene, "检测", targets)
         return targets
 
-    def resolve_place(self, name: str) -> Tuple[float, float, float]:
+    def resolve_place(self, name: str) -> Optional[Tuple[float, float, float]]:
         detected = self.perception.detect_bins(bin_names=[name])
         detected = [item for item in detected if item.position_base is not None]
         if detected:
@@ -2400,12 +2011,11 @@ class BaseSceneController:
             xyz = best.position_base
             assert xyz is not None
             place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
-            log_stage(self.scene, "目标区", "%s 使用感知检测位置 %s", name, _fmt_xyz(place))
+            log_stage(self.scene, "目标区", "%s 使用 YOLO-World 检测位置 %s", name, _fmt_xyz(place))
             return place
 
-        place = PLACE_TARGETS_BASE[self.scene][name]
-        log_warn(self.scene, "目标区", "%s 未检测到，使用预设兜底 %s", name, _fmt_xyz(place))
-        return place
+        log_error(self.scene, "目标区", "%s 未被 YOLO-World 检测到，不使用规则或几何兜底", name)
+        return None
 
     def make_target_at(self, class_name: str, xyz_base: Sequence[float],
                        target_bin: Optional[str] = None) -> PerceptionTarget:
@@ -2415,11 +2025,11 @@ class BaseSceneController:
             center_uv=None,
             position_base=(float(xyz_base[0]), float(xyz_base[1]), float(xyz_base[2])),
             position_camera=None,
-            camera="fallback",
+            camera="task_regrasp",
             area_px=0.0,
             target_bin=target_bin,
             timestamp=time.time(),
-            debug={"source": "nominal_place_regrasp"},
+            debug={"source": "known_place_regrasp"},
         )
 
     def _target_is_usable(self, target: PerceptionTarget) -> bool:
@@ -2503,13 +2113,13 @@ class Scene1Controller(BaseSceneController):
         detected = self.perception.detect_bins(bin_names=[name])
         detected = [item for item in detected if item.position_base is not None]
         if not detected:
-            log_error(self.scene, "目标区", "%s 未被 YOLO 检测到，场景一不再使用规则或几何兜底", name)
+            log_error(self.scene, "目标区", "%s 未被 YOLO-World 检测到，场景一不再使用规则或几何兜底", name)
             return None
         best = sorted(detected, key=lambda item: item.confidence, reverse=True)[0]
         xyz = best.position_base
         assert xyz is not None
         place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
-        log_stage(self.scene, "目标区", "%s 使用 YOLO 检测位置 %s", name, _fmt_xyz(place))
+        log_stage(self.scene, "目标区", "%s 使用 YOLO-World 检测位置 %s", name, _fmt_xyz(place))
         return place
 
 
@@ -2524,12 +2134,22 @@ class Scene2Controller(BaseSceneController):
     def run(self) -> ActionResult:
         start = time.time()
         self.wait_for_perception()
-        bin_places = {name: self.resolve_place(name) for name in ["sorting_bin_a", "sorting_bin_b", "sorting_bin_c"]}
-
         targets = self._stable_detect_parts()
         if not targets:
-            log_warn(self.scene, "检测", "视觉未得到可用零件，启用公开几何兜底点")
-            targets = self._nominal_parts()
+            reason = "no scene2 part detected by YOLO-World"
+            log_error(self.scene, "失败", reason)
+            return ActionResult(False, "scene2", reason, duration_sec=time.time() - start)
+
+        required_bins = sorted({self.PART_TO_BIN[target.class_name] for target in targets
+                                if target.class_name in self.PART_TO_BIN})
+        bin_places: Dict[str, Tuple[float, float, float]] = {}
+        for name in required_bins:
+            place = self.resolve_place(name)
+            if place is None:
+                reason = "scene2 YOLO-World place target missing: {}".format(name)
+                log_error(self.scene, "失败", reason)
+                return ActionResult(False, "scene2", reason, duration_sec=time.time() - start)
+            bin_places[name] = place
 
         targets.sort(key=self._part_sort_key)
         for index, part in enumerate(targets, start=1):
@@ -2614,24 +2234,6 @@ class Scene2Controller(BaseSceneController):
                 if distance3(old.position_base, new.position_base) > SCENE2_STABLE_POS_EPS_M:
                     return False
         return True
-
-    def _nominal_parts(self) -> List[PerceptionTarget]:
-        targets = []
-        for index, (class_name, xyz) in enumerate(SCENE2_NOMINAL_PARTS_BASE, start=1):
-            targets.append(PerceptionTarget(
-                class_name=class_name,
-                confidence=0.05,
-                center_uv=None,
-                position_base=(float(xyz[0]), float(xyz[1]), float(xyz[2])),
-                position_camera=None,
-                camera="fallback",
-                area_px=0.0,
-                yaw_rad=0.0,
-                target_bin=self.PART_TO_BIN[class_name],
-                timestamp=time.time(),
-                debug={"source": "scene2_nominal_fallback", "index": index},
-            ))
-        return targets
 
     def _part_sort_key(self, target: PerceptionTarget) -> Tuple[int, float, float]:
         xyz = target.position_base or (0.0, 0.0, 0.0)
@@ -2732,14 +2334,6 @@ class Scene3Controller(BaseSceneController):
             return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
-
-    def preload_yolo_model(self) -> None:
-        preload = getattr(self.perception, "preload_model", None)
-        if not callable(preload):
-            return
-        log_stage(self.scene, "YOLO", "预加载模型，避免首次检测时阻塞导航")
-        if not preload():
-            log_warn(self.scene, "YOLO", "模型预加载失败，后续检测会再次尝试并输出原因")
 
     def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> Optional[PerceptionTarget]:
         if tray.position_base is None:
@@ -2976,7 +2570,7 @@ def _load_launcher():
     return ChallengeSimLauncher
 
 
-def build_controller(scene: str, robot: RobotBase, perception: RuleBasedPerception,
+def build_controller(scene: str, robot: RobotBase, perception: RGBDPerceptionBase,
                      navigation: Navigation, skills: Skills) -> BaseSceneController:
     if scene == "scene1":
         return Scene1Controller(scene, robot, perception, navigation, skills)
@@ -2988,18 +2582,31 @@ def build_controller(scene: str, robot: RobotBase, perception: RuleBasedPercepti
 
 
 def default_yolo_model_for_scene(scene: str) -> str:
+    if scene == "scene1":
+        return DEFAULT_SCENE1_YOLO_MODEL
+    if scene == "scene2":
+        return DEFAULT_SCENE2_YOLO_MODEL
     if scene == "scene3":
         return DEFAULT_SCENE3_YOLO_MODEL
-    return DEFAULT_SCENE1_YOLO_MODEL
+    raise ValueError("unknown scene: {}".format(scene))
 
 
 def build_perception(scene: str, scene1_perception: str,
                      yolo_model: Optional[str], yolo_device: str,
-                     yolo_conf: float, yolo_imgsz: int) -> RuleBasedPerception:
+                     yolo_conf: float, yolo_imgsz: int) -> RGBDPerceptionBase:
     if scene == "scene1":
         if scene1_perception == "rule":
-            raise ValueError("scene1 rule-based perception has been removed; use YOLO classes parcel/weighing_area/drop_box")
+            raise ValueError("scene1 rule-based perception has been removed; use YOLO-World classes parcel/weighing_area/drop_box")
         return YoloScene1Perception(
+            scene=scene,
+            base_frame=BASE_FRAME,
+            model_path=yolo_model or default_yolo_model_for_scene(scene),
+            device=yolo_device,
+            conf=yolo_conf,
+            imgsz=yolo_imgsz,
+        )
+    if scene == "scene2":
+        return YoloScene2Perception(
             scene=scene,
             base_frame=BASE_FRAME,
             model_path=yolo_model or default_yolo_model_for_scene(scene),
@@ -3016,7 +2623,7 @@ def build_perception(scene: str, scene1_perception: str,
             conf=yolo_conf,
             imgsz=yolo_imgsz,
         )
-    return RuleBasedPerception(scene=scene, base_frame=BASE_FRAME)
+    raise ValueError("unknown scene: {}".format(scene))
 
 
 def run_scene(scene, seed, node_name=None, timeout=120,
@@ -3064,10 +2671,9 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     navigation = Navigation(robot)
     skills = Skills(scene=scene, robot=robot, navigation=navigation)
     controller = build_controller(scene, robot, perception, navigation, skills)
-    if scene == "scene3":
-        preload_yolo = getattr(controller, "preload_yolo_model", None)
-        if callable(preload_yolo):
-            preload_yolo()
+    preload_yolo = getattr(controller, "preload_yolo_model", None)
+    if callable(preload_yolo):
+        preload_yolo()
 
     result = ActionResult(False, "run_scene", "not started")
     try:
@@ -3099,15 +2705,15 @@ def main():
     parser.add_argument("--no-timer-gui", action="store_true",
                         help="不弹出计时器窗口，仅保留后台计时日志")
     parser.add_argument("--scene1-perception", choices=["auto", "yolo"], default="auto",
-                        help="场景一识别后端：auto/yolo 均使用 YOLO，不再支持规则识别")
+                        help="兼容旧参数；auto/yolo 均使用 YOLO-World，不再支持规则识别")
     parser.add_argument("--yolo-model", default=None,
-                        help="YOLO .pt 模型路径；未指定时按 scene 选择默认权重")
+                        help="YOLO-World .pt 模型路径；未指定时按 scene 选择默认权重")
     parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0", "cuda:1"], default="auto",
-                        help="YOLO 推理设备；auto 由 ultralytics 自动选择")
+                        help="YOLO-World 推理设备；auto 由 ultralytics 自动选择")
     parser.add_argument("--yolo-conf", type=float, default=SCENE1_YOLO_DEFAULT_CONF,
-                        help="YOLO 检测置信度阈值")
+                        help="YOLO-World 检测置信度阈值")
     parser.add_argument("--yolo-imgsz", type=int, default=SCENE1_YOLO_DEFAULT_IMGSZ,
-                        help="YOLO 推理输入尺寸")
+                        help="YOLO-World 推理输入尺寸")
     args = parser.parse_args()
 
     run_scene(
