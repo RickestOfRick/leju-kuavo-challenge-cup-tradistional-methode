@@ -439,6 +439,7 @@ SKILL_PLACE_RETREAT_DURATION_SEC = 1.20
 SKILL_RELOCALIZE_SETTLE_SEC = 0.20
 SCENE1_YOLO_RETRY = 5
 SCENE1_YOLO_RETRY_SETTLE_SEC = 0.25
+SCENE1_SYNC_INFER_INTERVAL_SEC = 0.30
 SCENE2_STABLE_TARGET_COUNT = 4
 SCENE2_STABLE_FRAMES = 2
 SCENE2_STABLE_POS_EPS_M = 0.03
@@ -631,6 +632,15 @@ class ActionResult:
     target: Optional[PerceptionTarget] = None
     duration_sec: float = 0.0
     retry_count: int = 0
+
+
+@dataclass
+class Scene1Observation:
+    parcels: List[PerceptionTarget] = field(default_factory=list)
+    places: Dict[str, PerceptionTarget] = field(default_factory=dict)
+    timestamp: float = 0.0
+    infer_duration_sec: float = 0.0
+    sequence: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1799,6 +1809,14 @@ class YoloScene1Perception(YoloWorldPerception):
             bin_class_names=("weighing_area", "drop_box"),
         )
 
+    def detect_scene1_all(self) -> List[PerceptionTarget]:
+        return self._detect_yolo_classes(
+            class_names=SCENE1_YOLO_CLASS_NAMES,
+            cameras=self._default_cameras_for_targets(),
+            max_targets=None,
+            purpose="同步推理",
+        )
+
 
 class YoloScene2Perception(YoloWorldPerception):
     def __init__(self, scene: str, base_frame: str = BASE_FRAME,
@@ -2686,30 +2704,48 @@ class BaseSceneController:
 
 
 class Scene1Controller(BaseSceneController):
+    def __init__(self, scene: str, robot: RobotBase, perception: RGBDPerceptionBase,
+                 navigation: Navigation, skills: Skills):
+        super().__init__(scene, robot, perception, navigation, skills)
+        self._scene1_observation = Scene1Observation()
+        self._scene1_last_infer_wall = 0.0
+        self._scene1_infer_sequence = 0
+
     def run(self) -> ActionResult:
         start = time.time()
         self.wait_for_perception()
-        weigh_xyz = self.resolve_scene1_yolo_place("weighing_area")
-        drop_xyz = self.resolve_scene1_yolo_place("drop_box")
-        if weigh_xyz is None or drop_xyz is None:
-            reason = "scene1 yolo place target missing"
-            log_error(self.scene, "失败", reason)
-            return ActionResult(False, "scene1", reason, duration_sec=time.time() - start)
 
-        targets = self.detect_scene1_targets_with_retry(
-            class_names=["parcel"],
-            max_targets=SCENE_TARGET_LIMIT["scene1"],
-            label="parcel",
-        )
-        if not targets:
-            reason = "no parcel detected"
-            log_error(self.scene, "失败", reason)
-            return ActionResult(False, "scene1", reason, duration_sec=time.time() - start)
+        completed_positions: List[Tuple[float, float, float]] = []
+        failed_positions: List[Tuple[float, float, float]] = []
+        for index in range(1, SCENE_TARGET_LIMIT["scene1"] + 1):
+            observation = self.wait_scene1_observation(
+                reason="parcel#{} start".format(index),
+                require_parcel=True,
+                require_places=True,
+            )
+            weigh_xyz = self.scene1_place_xyz("weighing_area", observation)
+            drop_xyz = self.scene1_place_xyz("drop_box", observation)
+            if weigh_xyz is None or drop_xyz is None:
+                reason = "scene1 yolo place target missing"
+                log_error(self.scene, "失败", reason)
+                return ActionResult(False, "scene1", reason, duration_sec=time.time() - start)
 
-        targets.sort(key=lambda t: (t.position_base[1], t.position_base[0]) if t.position_base else (0.0, 0.0))
-        for index, parcel in enumerate(targets, start=1):
+            parcel = self.select_scene1_parcel(
+                observation,
+                ignored_positions=completed_positions + failed_positions,
+            )
+            if parcel is None:
+                if index == 1:
+                    reason = "no parcel detected"
+                    log_error(self.scene, "失败", reason)
+                    return ActionResult(False, "scene1", reason, duration_sec=time.time() - start)
+                log_stage(self.scene, "完成", "未检测到更多未处理包裹，结束场景一流程")
+                break
+
             log_stage(self.scene, "流程", "快递 #%02d 抓取 -> 称重 -> 入箱", index)
             arm = self.skills.choose_arm(parcel)
+            observation = self.sync_scene1_observation(reason="parcel#{} before weigh".format(index))
+            weigh_xyz = self.scene1_place_xyz("weighing_area", observation) or weigh_xyz
             result = self.skills.pick_and_place(
                 parcel,
                 weigh_xyz,
@@ -2719,11 +2755,15 @@ class Scene1Controller(BaseSceneController):
             )
             if not result.ok:
                 log_warn(self.scene, "失败", "快递 #%02d 称重放置失败: %s", index, result.reason)
+                if parcel.position_base is not None:
+                    failed_positions.append(parcel.position_base)
                 continue
-            self.robot.rospy.sleep(0.7)
+
+            self.robot.rospy.sleep(SCENE1_SYNC_INFER_INTERVAL_SEC)
+            observation = self.sync_scene1_observation(reason="parcel#{} after weigh".format(index))
             regrasp_xyz = (weigh_xyz[0], weigh_xyz[1], weigh_xyz[2] - 0.04)
             weighed = self.make_target_at("parcel", regrasp_xyz, target_bin="drop_box")
-            refreshed_weighed = self.relocalize_pick_target(weighed)
+            refreshed_weighed = self.select_scene1_parcel_near(observation, regrasp_xyz)
             if refreshed_weighed is not None:
                 log_stage(
                     self.scene,
@@ -2734,6 +2774,8 @@ class Scene1Controller(BaseSceneController):
                 weighed = refreshed_weighed
             else:
                 log_warn(self.scene, "重新定位", "称重后未检测到包裹，沿用称重区估计坐标")
+            observation = self.sync_scene1_observation(reason="parcel#{} before box".format(index))
+            drop_xyz = self.scene1_place_xyz("drop_box", observation) or drop_xyz
             result = self.skills.pick_and_place(
                 weighed,
                 drop_xyz,
@@ -2743,8 +2785,218 @@ class Scene1Controller(BaseSceneController):
             )
             if not result.ok:
                 log_warn(self.scene, "失败", "快递 #%02d 入箱失败: %s", index, result.reason)
+                if weighed.position_base is not None:
+                    failed_positions.append(weighed.position_base)
+                continue
+            if parcel.position_base is not None:
+                completed_positions.append(parcel.position_base)
 
         return ActionResult(True, "scene1", "done", duration_sec=time.time() - start)
+
+    def sync_scene1_observation(self, reason: str = "tick",
+                                force: bool = False) -> Scene1Observation:
+        now = time.time()
+        if not force and self._scene1_last_infer_wall > 0.0:
+            wait_sec = SCENE1_SYNC_INFER_INTERVAL_SEC - (now - self._scene1_last_infer_wall)
+            if wait_sec > 0.0:
+                self.robot.rospy.sleep(wait_sec)
+
+        infer_start = time.time()
+        raw_targets = self._detect_scene1_all_raw()
+        usable: List[PerceptionTarget] = []
+        rejected: List[Tuple[PerceptionTarget, str]] = []
+        for target in raw_targets:
+            if target.class_name not in SCENE1_YOLO_CLASS_NAMES:
+                continue
+            reject_reason = self._target_reject_reason(target)
+            if reject_reason is None:
+                usable.append(target)
+            else:
+                rejected.append((target, reject_reason))
+        self._log_rejected_targets(rejected)
+
+        parcels = [target for target in usable if target.class_name == "parcel"]
+        parcels.sort(key=self._scene1_parcel_sort_key)
+
+        places: Dict[str, PerceptionTarget] = {}
+        for name in ("weighing_area", "drop_box"):
+            candidates = [
+                target for target in usable
+                if target.class_name == name and target.position_base is not None
+            ]
+            if not candidates:
+                previous_place = self._scene1_observation.places.get(name)
+                if previous_place is not None:
+                    places[name] = previous_place
+                continue
+            candidates.sort(key=lambda item: (
+                0 if item.camera == "head" else 1,
+                -float(item.confidence),
+                -float(item.area_px),
+            ))
+            places[name] = candidates[0]
+
+        self._scene1_infer_sequence += 1
+        observation = Scene1Observation(
+            parcels=parcels,
+            places=places,
+            timestamp=time.time(),
+            infer_duration_sec=time.time() - infer_start,
+            sequence=self._scene1_infer_sequence,
+        )
+        self._scene1_last_infer_wall = time.time()
+        self._scene1_observation = observation
+        log_stage(
+            self.scene,
+            "同步推理",
+            (
+                "#%d reason=%s dt=%.2fs parcels=%d weighing=%s drop=%s"
+            ),
+            observation.sequence,
+            reason,
+            observation.infer_duration_sec,
+            len(observation.parcels),
+            _fmt_xyz(observation.places.get("weighing_area").position_base)
+            if observation.places.get("weighing_area") else "None",
+            _fmt_xyz(observation.places.get("drop_box").position_base)
+            if observation.places.get("drop_box") else "None",
+        )
+        return observation
+
+    def wait_scene1_observation(self, reason: str,
+                                require_parcel: bool,
+                                require_places: bool) -> Scene1Observation:
+        best = self._scene1_observation
+        for attempt in range(1, SCENE1_YOLO_RETRY + 1):
+            observation = self.sync_scene1_observation(
+                reason="{} attempt {}/{}".format(reason, attempt, SCENE1_YOLO_RETRY),
+                force=(attempt == 1 and best.sequence == 0),
+            )
+            if len(observation.parcels) > len(best.parcels):
+                best = observation
+            elif observation.places and not best.places:
+                best = observation
+            missing: List[str] = []
+            if require_parcel and not observation.parcels:
+                missing.append("parcel")
+            if require_places:
+                for name in ("weighing_area", "drop_box"):
+                    if name not in observation.places:
+                        missing.append(name)
+            if not missing:
+                return observation
+            log_warn(
+                self.scene,
+                "同步推理",
+                "第 %d/%d 次缺少 %s，按 0.3s 节拍继续推理",
+                attempt,
+                SCENE1_YOLO_RETRY,
+                ",".join(missing),
+            )
+        return best
+
+    def _detect_scene1_all_raw(self) -> List[PerceptionTarget]:
+        detect_all = getattr(self.perception, "detect_scene1_all", None)
+        if callable(detect_all):
+            return list(detect_all())
+        targets: List[PerceptionTarget] = []
+        targets.extend(self.perception.detect_targets(class_names=["parcel"], max_targets=None))
+        targets.extend(self.perception.detect_bins(bin_names=["weighing_area", "drop_box"]))
+        return targets
+
+    def scene1_place_xyz(self, name: str,
+                         observation: Scene1Observation) -> Optional[Tuple[float, float, float]]:
+        target = observation.places.get(name)
+        if target is None or target.position_base is None:
+            return None
+        xyz = target.position_base
+        place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
+        log_stage(
+            self.scene,
+            "目标区",
+            "%s 使用同步推理 #%d 位置 %s",
+            name,
+            observation.sequence,
+            _fmt_xyz(place),
+        )
+        return place
+
+    def select_scene1_parcel(self, observation: Scene1Observation,
+                             ignored_positions: Sequence[Tuple[float, float, float]]) -> Optional[PerceptionTarget]:
+        candidates: List[PerceptionTarget] = []
+        for parcel in observation.parcels:
+            if parcel.position_base is None:
+                continue
+            if any(distance3(parcel.position_base, position) < 0.10 for position in ignored_positions):
+                continue
+            candidates.append(parcel)
+        if not candidates:
+            return None
+        best = sorted(candidates, key=self._scene1_parcel_sort_key)[0]
+        log_stage(
+            self.scene,
+            "指令",
+            "同步推理 #%d 选择包裹 class=%s conf=%.2f base=%s",
+            observation.sequence,
+            best.class_name,
+            best.confidence,
+            _fmt_xyz(best.position_base),
+        )
+        return best
+
+    def select_scene1_parcel_near(self, observation: Scene1Observation,
+                                  xyz_base: Sequence[float],
+                                  max_distance_m: float = 0.45) -> Optional[PerceptionTarget]:
+        candidates = [
+            parcel for parcel in observation.parcels
+            if parcel.position_base is not None
+        ]
+        if not candidates:
+            return None
+        origin = (float(xyz_base[0]), float(xyz_base[1]), float(xyz_base[2]))
+        best = sorted(candidates, key=lambda item: distance3(origin, item.position_base))[0]
+        assert best.position_base is not None
+        distance = distance3(origin, best.position_base)
+        if distance > max_distance_m:
+            log_warn(
+                self.scene,
+                "重新定位",
+                "最近包裹距离 %.3fm 超过 %.3fm，拒绝作为同一目标",
+                distance,
+                max_distance_m,
+            )
+            return None
+        log_stage(
+            self.scene,
+            "重新定位",
+            "同步推理 #%d 最近包裹 new=%s delta=%.3fm conf=%.2f",
+            observation.sequence,
+            _fmt_xyz(best.position_base),
+            distance,
+            best.confidence,
+        )
+        return best
+
+    def relocalize_pick_target(self, target: PerceptionTarget) -> Optional[PerceptionTarget]:
+        if target.class_name != "parcel":
+            return super().relocalize_pick_target(target)
+        observation = self.sync_scene1_observation(
+            reason="relocalize {}".format(target.class_name),
+        )
+        if target.position_base is not None:
+            refreshed = self.select_scene1_parcel_near(observation, target.position_base)
+            if refreshed is not None:
+                return refreshed
+        return self.select_scene1_parcel(observation, ignored_positions=[])
+
+    def _scene1_parcel_sort_key(self, target: PerceptionTarget) -> Tuple[float, float, float, float]:
+        xyz = target.position_base or (0.0, 0.0, 1.0)
+        return (
+            float(xyz[2]),
+            abs(float(xyz[1])),
+            float(xyz[0]),
+            -float(target.confidence),
+        )
 
     def detect_scene1_targets_with_retry(self, class_names: Sequence[str],
                                          max_targets: Optional[int],
