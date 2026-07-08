@@ -376,8 +376,8 @@ SCENE3_CLAW_CLOSE_SETTLE_SEC = 1.60
 SCENE3_POST_CLOSE_SETTLE_SEC = 0.80
 SCENE3_LIFT_DURATION_SEC = 2.00
 SCENE3_LIFT_SETTLE_SEC = 0.50
-SCENE3_PICK_RETRY = 40
-SCENE3_BEND_RETRY = 10
+SCENE3_SIDE_OBSERVE_RETRY = 10
+SCENE3_BEND_RETRY = 40
 SCENE3_PICK_RETRY_SETTLE_SEC = 1.20
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
@@ -2335,7 +2335,7 @@ class Skills:
     ) -> ActionResult:
         start = time.time()
         arm = self.single_arm(arm, target, "抓取重试")
-        # 场景三控制器已经有“平举 40 次，每次平举内头部复定位/弯臂 10 次”的外层循环，
+        # 场景三控制器已经有“平举 10 次，每次平举内头部复定位/弯臂 40 次”的外层循环，
         # 这里保持单次，避免每轮料盘抓取被嵌套放大到数百次。
         max_attempts = 1 if self.scene == "scene3" else SKILL_PICK_RETRY
         last_result = ActionResult(False, "pick", "not attempted", target)
@@ -3038,7 +3038,9 @@ class Scene3Controller(BaseSceneController):
             tray: Optional[PerceptionTarget] = None
             arm = "right"
             pick_result: Optional[ActionResult] = None
-            for side_attempt in range(1, SCENE3_PICK_RETRY + 1):
+            last_pick_result: Optional[ActionResult] = None
+            for side_attempt in range(1, SCENE3_SIDE_OBSERVE_RETRY + 1):
+                pick_result = None
                 targets = self.detect_reachable_trays(completed_positions)
                 if not targets:
                     log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
@@ -3054,7 +3056,7 @@ class Scene3Controller(BaseSceneController):
                         "料盘 #%02d 平举 #%d/%d 失败，重新检测后再平举",
                         index,
                         side_attempt,
-                        SCENE3_PICK_RETRY,
+                        SCENE3_SIDE_OBSERVE_RETRY,
                     )
                     self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
                     self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
@@ -3066,7 +3068,7 @@ class Scene3Controller(BaseSceneController):
                     "料盘 #%02d 平举 #%d/%d 成功，在当前平举姿态内最多尝试弯臂 %d 次",
                     index,
                     side_attempt,
-                    SCENE3_PICK_RETRY,
+                    SCENE3_SIDE_OBSERVE_RETRY,
                     SCENE3_BEND_RETRY,
                 )
                 current_observation = observation
@@ -3082,7 +3084,7 @@ class Scene3Controller(BaseSceneController):
                         "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d：保持平举，用头部相机复定位 rough=%s",
                         index,
                         side_attempt,
-                        SCENE3_PICK_RETRY,
+                        SCENE3_SIDE_OBSERVE_RETRY,
                         bend_attempt,
                         SCENE3_BEND_RETRY,
                         _fmt_xyz(current_target.position_base),
@@ -3095,7 +3097,7 @@ class Scene3Controller(BaseSceneController):
                             "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d 头部二次定位失败，保持平举继续",
                             index,
                             side_attempt,
-                            SCENE3_PICK_RETRY,
+                            SCENE3_SIDE_OBSERVE_RETRY,
                             bend_attempt,
                             SCENE3_BEND_RETRY,
                         )
@@ -3118,7 +3120,7 @@ class Scene3Controller(BaseSceneController):
                         "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d shelf=%s 出库，arm=%s base=%s",
                         index,
                         side_attempt,
-                        SCENE3_PICK_RETRY,
+                        SCENE3_SIDE_OBSERVE_RETRY,
                         bend_attempt,
                         SCENE3_BEND_RETRY,
                         shelf,
@@ -3127,6 +3129,7 @@ class Scene3Controller(BaseSceneController):
                     )
                     pick_result = self.skills.pick(tray, arm=arm)
                     pick_result.retry_count = (side_attempt - 1) * SCENE3_BEND_RETRY + bend_attempt - 1
+                    last_pick_result = pick_result
                     if pick_result.ok:
                         break
                     log_warn(
@@ -3135,7 +3138,7 @@ class Scene3Controller(BaseSceneController):
                         "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d 失败: %s",
                         index,
                         side_attempt,
-                        SCENE3_PICK_RETRY,
+                        SCENE3_SIDE_OBSERVE_RETRY,
                         bend_attempt,
                         SCENE3_BEND_RETRY,
                         pick_result.reason,
@@ -3165,20 +3168,36 @@ class Scene3Controller(BaseSceneController):
                 if pick_result is not None and pick_result.ok:
                     break
 
-                log_warn(
-                    self.scene,
-                    "抓取",
-                    "料盘 #%02d 平举 #%d/%d 内 %d 次头部复定位/弯臂未成功，重新尝试平举",
-                    index,
-                    side_attempt,
-                    SCENE3_PICK_RETRY,
-                    SCENE3_BEND_RETRY,
-                )
+                if pick_result is not None and not self._is_scene3_bend_failure(pick_result):
+                    log_warn(
+                        self.scene,
+                        "抓取",
+                        "料盘 #%02d 平举 #%d/%d 因 %s 提前结束当前平举，重新尝试平举",
+                        index,
+                        side_attempt,
+                        SCENE3_SIDE_OBSERVE_RETRY,
+                        pick_result.reason,
+                    )
+                else:
+                    log_warn(
+                        self.scene,
+                        "抓取",
+                        "料盘 #%02d 平举 #%d/%d 内 %d 次头部复定位/弯臂未成功，重新尝试平举",
+                        index,
+                        side_attempt,
+                        SCENE3_SIDE_OBSERVE_RETRY,
+                        SCENE3_BEND_RETRY,
+                    )
                 self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
                 self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
 
             if pick_result is None or not pick_result.ok or tray is None:
-                reason = pick_result.reason if pick_result is not None else "no target after retry"
+                reason = (
+                    pick_result.reason
+                    if pick_result is not None
+                    else last_pick_result.reason if last_pick_result is not None
+                    else "no target after retry"
+                )
                 log_warn(self.scene, "失败", "料盘 #%02d 抓取失败: %s", index, reason)
                 break
 
