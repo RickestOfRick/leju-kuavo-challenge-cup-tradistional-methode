@@ -15,7 +15,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +426,11 @@ SCENE_REACH_X_MAX_M = {
 TARGET_WAIT_SEC = 8.0
 SKILL_PICK_RETRY = 10
 SKILL_PICK_RETRY_SETTLE_SEC = 0.30
+SKILL_PRE_GRASP_DURATION_SEC = 1.80
+SKILL_GRASP_DURATION_SEC = 1.50
+SKILL_POST_GRASP_SETTLE_SEC = 0.35
+SKILL_LIFT_DURATION_SEC = 1.50
+SKILL_RELOCALIZE_SETTLE_SEC = 0.20
 SCENE1_YOLO_RETRY = 5
 SCENE1_YOLO_RETRY_SETTLE_SEC = 0.25
 SCENE2_STABLE_TARGET_COUNT = 4
@@ -1962,16 +1967,26 @@ class Skills:
         log_stage(
             self.scene,
             "抓取",
-            "class=%s arm=%s pre=%s grasp=%s yaw=%.1fdeg",
+            "class=%s arm=%s pre=%s grasp=%s yaw=%.1fdeg duration(pre/grasp/lift)=%.1f/%.1f/%.1fs settle=%.2fs",
             target.class_name,
             arm,
             _fmt_xyz(pre),
             _fmt_xyz(grasp),
             math.degrees(yaw),
+            SKILL_PRE_GRASP_DURATION_SEC,
+            SKILL_GRASP_DURATION_SEC,
+            SKILL_LIFT_DURATION_SEC,
+            SKILL_POST_GRASP_SETTLE_SEC,
         )
         self.navigation.fine_align_to_image_target(target)
         self.robot.open_claw(arm)
-        pre_ok = self.robot.move_hand_ik(arm, pre, yaw_rad=yaw, duration=1.2, label="pre_grasp")
+        pre_ok = self.robot.move_hand_ik(
+            arm,
+            pre,
+            yaw_rad=yaw,
+            duration=SKILL_PRE_GRASP_DURATION_SEC,
+            label="pre_grasp",
+        )
         if not pre_ok:
             reason = "pre_grasp IK failed"
             self._log_pick_failure_detail(
@@ -1990,7 +2005,13 @@ class Skills:
             )
             return ActionResult(False, "pick", reason, target, time.time() - start)
 
-        grasp_ok = self.robot.move_hand_ik(arm, grasp, yaw_rad=yaw, duration=1.0, label="grasp")
+        grasp_ok = self.robot.move_hand_ik(
+            arm,
+            grasp,
+            yaw_rad=yaw,
+            duration=SKILL_GRASP_DURATION_SEC,
+            label="grasp",
+        )
         if not grasp_ok:
             reason = "grasp IK failed"
             self._log_pick_failure_detail(
@@ -2010,6 +2031,7 @@ class Skills:
             log_warn(self.scene, "抓取", "%s，不闭爪，等待重试", reason)
             return ActionResult(False, "pick", reason, target, time.time() - start)
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
+        self.robot.hold_arm(SKILL_POST_GRASP_SETTLE_SEC, label="post_grasp_settle")
         lift_targets = [lift]
         lift_ok = False
         for lift_attempt, lift_target in enumerate(lift_targets, start=1):
@@ -2025,7 +2047,7 @@ class Skills:
                 arm,
                 lift_target,
                 yaw_rad=yaw,
-                duration=1.0,
+                duration=SKILL_LIFT_DURATION_SEC,
                 label="lift#{}".format(lift_attempt),
             )
             if lift_ok:
@@ -2165,8 +2187,12 @@ class Skills:
 
         return ActionResult(True, "pick", "", target, time.time() - start)
 
-    def pick_with_retry(self, target: PerceptionTarget,
-                        arm: Optional[str] = None) -> ActionResult:
+    def pick_with_retry(
+        self,
+        target: PerceptionTarget,
+        arm: Optional[str] = None,
+        relocalize: Optional[Callable[[PerceptionTarget], Optional[PerceptionTarget]]] = None,
+    ) -> ActionResult:
         start = time.time()
         arm = self.single_arm(arm, target, "抓取重试")
         # 场景三控制器已经有按“重新检测 -> 腕部复检 -> 抓取”的 40 次外层循环，
@@ -2217,6 +2243,34 @@ class Skills:
             if attempt < max_attempts:
                 self.robot.open_claw(arm)
                 self.robot.rospy.sleep(SKILL_PICK_RETRY_SETTLE_SEC)
+                if relocalize is not None:
+                    log_stage(
+                        self.scene,
+                        "重新定位",
+                        "抓取失败后重新 YOLO 定位 class=%s old=%s",
+                        target.class_name,
+                        _fmt_xyz(target.position_base),
+                    )
+                    refreshed = relocalize(target)
+                    if refreshed is not None and refreshed.position_base is not None:
+                        distance = (
+                            distance3(target.position_base, refreshed.position_base)
+                            if target.position_base is not None
+                            else 0.0
+                        )
+                        log_stage(
+                            self.scene,
+                            "重新定位",
+                            "使用新目标 old=%s new=%s delta=%.3fm conf=%.2f",
+                            _fmt_xyz(target.position_base),
+                            _fmt_xyz(refreshed.position_base),
+                            distance,
+                            refreshed.confidence,
+                        )
+                        target = refreshed
+                    else:
+                        log_warn(self.scene, "重新定位", "未获得可用新坐标，下一次沿用旧目标")
+                    self.robot.rospy.sleep(SKILL_RELOCALIZE_SETTLE_SEC)
 
         reason = "pick failed after {} attempts; last: {}".format(
             max_attempts,
@@ -2245,10 +2299,16 @@ class Skills:
         self.robot.move_hand_ik(arm, retreat, duration=0.9, label=label + "_retreat")
         return ActionResult(True, "place", "", None, time.time() - start)
 
-    def pick_and_place(self, target: PerceptionTarget, place_xyz_base: Sequence[float],
-                       arm: Optional[str] = None, label: str = "pick_place") -> ActionResult:
+    def pick_and_place(
+        self,
+        target: PerceptionTarget,
+        place_xyz_base: Sequence[float],
+        arm: Optional[str] = None,
+        label: str = "pick_place",
+        relocalize: Optional[Callable[[PerceptionTarget], Optional[PerceptionTarget]]] = None,
+    ) -> ActionResult:
         arm = self.single_arm(arm, target, "抓放")
-        pick_result = self.pick_with_retry(target, arm=arm)
+        pick_result = self.pick_with_retry(target, arm=arm, relocalize=relocalize)
         if not pick_result.ok:
             return pick_result
         place_result = self.place(arm, place_xyz_base, label=label)
@@ -2256,7 +2316,7 @@ class Skills:
             place_result.ok,
             "pick_place",
             place_result.reason,
-            target,
+            pick_result.target or target,
             pick_result.duration_sec + place_result.duration_sec,
             pick_result.retry_count,
         )
@@ -2335,6 +2395,55 @@ class BaseSceneController:
             targets = targets[:int(max_targets)]
         log_target_list(self.scene, "检测", targets)
         return targets
+
+    def relocalize_pick_target(self, target: PerceptionTarget) -> Optional[PerceptionTarget]:
+        log_stage(
+            self.scene,
+            "重新定位",
+            "按同类别重新检测 class=%s old=%s",
+            target.class_name,
+            _fmt_xyz(target.position_base),
+        )
+        candidates = self.detect_targets(class_names=[target.class_name], max_targets=None)
+        candidates = [
+            item for item in candidates
+            if item.class_name == target.class_name and item.position_base is not None
+        ]
+        if not candidates:
+            log_warn(self.scene, "重新定位", "class=%s 没有可用 YOLO-World 坐标", target.class_name)
+            return None
+
+        if target.position_base is None:
+            best = sorted(candidates, key=lambda item: item.confidence, reverse=True)[0]
+            log_stage(
+                self.scene,
+                "重新定位",
+                "旧目标无坐标，使用最高置信度候选 new=%s conf=%.2f",
+                _fmt_xyz(best.position_base),
+                best.confidence,
+            )
+            return best
+
+        best = sorted(
+            candidates,
+            key=lambda item: (
+                distance3(target.position_base, item.position_base)
+                if item.position_base is not None
+                else float("inf"),
+                -float(item.confidence),
+            ),
+        )[0]
+        assert best.position_base is not None
+        log_stage(
+            self.scene,
+            "重新定位",
+            "候选=%d 最近同类 new=%s delta=%.3fm conf=%.2f",
+            len(candidates),
+            _fmt_xyz(best.position_base),
+            distance3(target.position_base, best.position_base),
+            best.confidence,
+        )
+        return best
 
     def resolve_place(self, name: str) -> Optional[Tuple[float, float, float]]:
         detected = self.perception.detect_bins(bin_names=[name])
@@ -2433,14 +2542,26 @@ class Scene1Controller(BaseSceneController):
         for index, parcel in enumerate(targets, start=1):
             log_stage(self.scene, "流程", "快递 #%02d 抓取 -> 称重 -> 入箱", index)
             arm = self.skills.choose_arm(parcel)
-            result = self.skills.pick_and_place(parcel, weigh_xyz, arm=arm, label="parcel{}_to_weigh".format(index))
+            result = self.skills.pick_and_place(
+                parcel,
+                weigh_xyz,
+                arm=arm,
+                label="parcel{}_to_weigh".format(index),
+                relocalize=self.relocalize_pick_target,
+            )
             if not result.ok:
                 log_warn(self.scene, "失败", "快递 #%02d 称重放置失败: %s", index, result.reason)
                 continue
             self.robot.rospy.sleep(0.7)
             regrasp_xyz = (weigh_xyz[0], weigh_xyz[1], weigh_xyz[2] - 0.04)
             weighed = self.make_target_at("parcel", regrasp_xyz, target_bin="drop_box")
-            result = self.skills.pick_and_place(weighed, drop_xyz, arm=arm, label="parcel{}_to_box".format(index))
+            result = self.skills.pick_and_place(
+                weighed,
+                drop_xyz,
+                arm=arm,
+                label="parcel{}_to_box".format(index),
+                relocalize=self.relocalize_pick_target,
+            )
             if not result.ok:
                 log_warn(self.scene, "失败", "快递 #%02d 入箱失败: %s", index, result.reason)
 
@@ -2564,6 +2685,7 @@ class Scene2Controller(BaseSceneController):
                 bin_places[bin_name],
                 arm=self.skills.choose_arm(part),
                 label="{}_to_{}".format(part.class_name, bin_name),
+                relocalize=self.relocalize_pick_target,
             )
             if not result.ok:
                 log_warn(self.scene, "失败", "零件 #%02d 分拣失败: %s", index, result.reason)
