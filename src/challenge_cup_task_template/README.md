@@ -67,9 +67,13 @@ src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt
 权重文件使用场景三同名模型 `scene3_smt_tray.pt`。程序加载后会重新设置场景一 prompts，因此同一个模型文件可在场景一使用不同词表。
 
 ```text
-parcel, package, delivery package, cardboard box
-small cardboard parcel, thin cardboard package, rectangular cardboard package
-yellow parcel with tape, brown parcel with tape, mailing box, shipping box
+parcel, colored rectangular cuboid, different colored rectangular cuboid
+long rectangular cuboid, thin rectangular cuboid, small rectangular cuboid
+rectangular prism, colored rectangular prism
+colored rectangular block, long rectangular block
+yellow rectangular cuboid, brown rectangular cuboid
+orange rectangular cuboid, white rectangular cuboid, gray rectangular cuboid
+taped rectangular cuboid, rectangular box with tape
 vivid green mat, bright green mat, neon green mat, flat green mat
 green rectangular mat, flat green rectangular mat, bright green rectangular mat
 green table mat, green floor mat, green target mat, green target area
