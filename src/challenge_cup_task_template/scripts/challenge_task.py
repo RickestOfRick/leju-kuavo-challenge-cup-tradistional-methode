@@ -424,6 +424,8 @@ SCENE_REACH_X_MAX_M = {
     "scene3": 0.94,
 }
 TARGET_WAIT_SEC = 8.0
+SCENE1_YOLO_RETRY = 5
+SCENE1_YOLO_RETRY_SETTLE_SEC = 0.25
 SCENE2_STABLE_TARGET_COUNT = 4
 SCENE2_STABLE_FRAMES = 2
 SCENE2_STABLE_POS_EPS_M = 0.03
@@ -1856,6 +1858,25 @@ class Skills:
         )
         return arm
 
+    def single_arm(self, arm: Optional[str], target: Optional[PerceptionTarget],
+                   purpose: str) -> str:
+        if arm in ("left", "right"):
+            return arm
+        if arm == "both":
+            chosen = self.choose_arm(target) if target is not None else "right"
+            log_warn(
+                self.scene,
+                "选臂",
+                "%s 收到 both，抓放动作不使用双手，改为%s手",
+                purpose,
+                "左" if chosen == "left" else "右",
+            )
+            return chosen
+        if arm is None:
+            return self.choose_arm(target) if target is not None else "right"
+        log_warn(self.scene, "选臂", "%s 收到未知手臂 %s，默认使用右手", purpose, arm)
+        return "right"
+
     def pick(self, target: PerceptionTarget, arm: Optional[str] = None) -> ActionResult:
         start = time.time()
         if target.position_base is None:
@@ -1863,7 +1884,7 @@ class Skills:
             log_warn(self.scene, "抓取", "%s class=%s", reason, target.class_name)
             return ActionResult(False, "pick", reason, target, time.time() - start)
 
-        arm = arm or self.choose_arm(target)
+        arm = self.single_arm(arm, target, "抓取")
         xyz = self._reachable_xyz(self._grasp_xyz(target))
         yaw = float(target.yaw_rad or 0.0)
         scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
@@ -2035,6 +2056,7 @@ class Skills:
     def place(self, arm: str, place_xyz_base: Sequence[float],
               label: str = "place") -> ActionResult:
         start = time.time()
+        arm = self.single_arm(arm, None, "放置")
         place = self._reachable_xyz(place_xyz_base)
         pre = (place[0], place[1], place[2] + SAFE_PLACE_DZ_M)
         retreat = (place[0], place[1], place[2] + SAFE_LIFT_DZ_M)
@@ -2047,7 +2069,7 @@ class Skills:
 
     def pick_and_place(self, target: PerceptionTarget, place_xyz_base: Sequence[float],
                        arm: Optional[str] = None, label: str = "pick_place") -> ActionResult:
-        arm = arm or self.choose_arm(target)
+        arm = self.single_arm(arm, target, "抓放")
         pick_result = self.pick(target, arm=arm)
         if not pick_result.ok:
             return pick_result
@@ -2218,7 +2240,11 @@ class Scene1Controller(BaseSceneController):
             log_error(self.scene, "失败", reason)
             return ActionResult(False, "scene1", reason, duration_sec=time.time() - start)
 
-        targets = self.detect_targets(class_names=["parcel"], max_targets=SCENE_TARGET_LIMIT["scene1"])
+        targets = self.detect_scene1_targets_with_retry(
+            class_names=["parcel"],
+            max_targets=SCENE_TARGET_LIMIT["scene1"],
+            label="parcel",
+        )
         if not targets:
             reason = "no parcel detected"
             log_error(self.scene, "失败", reason)
@@ -2241,18 +2267,75 @@ class Scene1Controller(BaseSceneController):
 
         return ActionResult(True, "scene1", "done", duration_sec=time.time() - start)
 
+    def detect_scene1_targets_with_retry(self, class_names: Sequence[str],
+                                         max_targets: Optional[int],
+                                         label: str) -> List[PerceptionTarget]:
+        best: List[PerceptionTarget] = []
+        for attempt in range(1, SCENE1_YOLO_RETRY + 1):
+            targets = self.detect_targets(class_names=class_names, max_targets=max_targets)
+            if len(targets) > len(best):
+                best = list(targets)
+            if targets:
+                if attempt > 1:
+                    log_stage(self.scene, "检测", "%s 第 %d 次 YOLO-World 检测成功", label, attempt)
+                return targets
+            log_warn(
+                self.scene,
+                "检测",
+                "%s 第 %d/%d 次未检测到，等待后重试",
+                label,
+                attempt,
+                SCENE1_YOLO_RETRY,
+            )
+            self.robot.rospy.sleep(SCENE1_YOLO_RETRY_SETTLE_SEC)
+        return best
+
     def resolve_scene1_yolo_place(self, name: str) -> Optional[Tuple[float, float, float]]:
-        detected = self.perception.detect_bins(bin_names=[name])
-        detected = [item for item in detected if item.position_base is not None]
-        if not detected:
-            log_error(self.scene, "目标区", "%s 未被 YOLO-World 检测到，场景一不再使用规则或几何兜底", name)
-            return None
-        best = sorted(detected, key=lambda item: item.confidence, reverse=True)[0]
-        xyz = best.position_base
-        assert xyz is not None
-        place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
-        log_stage(self.scene, "目标区", "%s 使用 YOLO-World 检测位置 %s", name, _fmt_xyz(place))
-        return place
+        best_seen: Optional[PerceptionTarget] = None
+        for attempt in range(1, SCENE1_YOLO_RETRY + 1):
+            detected = self.perception.detect_bins(bin_names=[name])
+            if detected:
+                best_seen = sorted(detected, key=lambda item: item.confidence, reverse=True)[0]
+            usable = [item for item in detected if item.position_base is not None]
+            if usable:
+                best = sorted(usable, key=lambda item: item.confidence, reverse=True)[0]
+                xyz = best.position_base
+                assert xyz is not None
+                place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
+                log_stage(
+                    self.scene,
+                    "目标区",
+                    "%s 第 %d 次使用 YOLO-World 检测位置 %s",
+                    name,
+                    attempt,
+                    _fmt_xyz(place),
+                )
+                return place
+
+            if best_seen is not None:
+                log_warn(
+                    self.scene,
+                    "目标区",
+                    "%s 第 %d/%d 次有候选但缺少 base_link 坐标 depth=%s frame=%s，等待后重试",
+                    name,
+                    attempt,
+                    SCENE1_YOLO_RETRY,
+                    best_seen.debug.get("depth_m") if best_seen.debug else None,
+                    best_seen.debug.get("frame_id") if best_seen.debug else None,
+                )
+            else:
+                log_warn(
+                    self.scene,
+                    "目标区",
+                    "%s 第 %d/%d 次未被 YOLO-World 检测到，等待后重试",
+                    name,
+                    attempt,
+                    SCENE1_YOLO_RETRY,
+                )
+            self.robot.rospy.sleep(SCENE1_YOLO_RETRY_SETTLE_SEC)
+
+        log_error(self.scene, "目标区", "%s 未被 YOLO-World 检测到，场景一不再使用规则或几何兜底", name)
+        return None
 
 
 class Scene2Controller(BaseSceneController):
