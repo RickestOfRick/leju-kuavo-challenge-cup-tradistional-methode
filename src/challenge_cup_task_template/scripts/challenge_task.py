@@ -353,6 +353,7 @@ SCENE3_WRIST_REFINE_RETRY = 2
 SCENE3_WRIST_REFINE_MAX_DELTA_M = 0.45
 SCENE3_WRIST_OBSERVE_DZ_M = 0.06
 SCENE3_WRIST_OBSERVE_BACKOFF_X_M = 0.14
+SCENE3_SIDE_RELOCALIZE_SETTLE_SEC = 0.35
 SCENE3_TRAY_GRASP_OFFSET_BASE = (0.025, 0.0, -0.015)
 SCENE3_CLAW_CLOSE_PERCENT = 92.0
 # 场景三货架内抓取不从上方垂直抬手：平举/插入高度使用料盘中心高度，
@@ -631,6 +632,16 @@ class ActionResult:
     target: Optional[PerceptionTarget] = None
     duration_sec: float = 0.0
     retry_count: int = 0
+
+
+@dataclass
+class Scene3TrayObservation:
+    rough_target: PerceptionTarget
+    arm: str
+    camera: str
+    side_observe_xyz: Tuple[float, float, float]
+    level_z: float
+    shelf: str
 
 
 # ---------------------------------------------------------------------------
@@ -1981,6 +1992,72 @@ class Skills:
             self._target_debug_summary(target),
         )
 
+    def scene3_tray_observation(self, target: PerceptionTarget,
+                                arm: str) -> Optional[Scene3TrayObservation]:
+        if self.scene != "scene3" or target.class_name != "smt_tray":
+            return None
+        if target.position_base is None:
+            return None
+        arm = self.single_arm(arm, target, "料盘侧方观察")
+        xyz = target.position_base
+        level_z = float(xyz[2])
+        side_sign = arm_side_sign(arm)
+        entry_x = float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M
+        side_observe_xyz = self._reachable_xyz((
+            entry_x,
+            float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M,
+            level_z,
+        ))
+        return Scene3TrayObservation(
+            rough_target=target,
+            arm=arm,
+            camera="{}_wrist".format(arm),
+            side_observe_xyz=side_observe_xyz,
+            level_z=level_z,
+            shelf=scene3_shelf_name_from_z(level_z),
+        )
+
+    def stage_scene3_tray_side_observe(self,
+                                       observation: Scene3TrayObservation) -> ActionResult:
+        start = time.time()
+        target = observation.rough_target
+        log_stage(
+            self.scene,
+            "平举定位",
+            "初定位 base=%s shelf=%s arm=%s camera=%s -> 侧方同高观察位 %s",
+            _fmt_xyz(target.position_base),
+            observation.shelf,
+            observation.arm,
+            observation.camera,
+            _fmt_xyz(observation.side_observe_xyz),
+        )
+        self.robot.stop_base(duration=SCENE3_PRE_PICK_BASE_SETTLE_SEC)
+        self.robot.set_claw(
+            observation.arm,
+            CLAW_OPEN_PERCENT,
+            settle_sec=SCENE3_CLAW_OPEN_SETTLE_SEC,
+        )
+        side_ok = self.robot.move_hand_ik(
+            observation.arm,
+            observation.side_observe_xyz,
+            duration=SCENE3_SHELF_SIDE_DURATION_SEC,
+            label="tray_side_observe",
+        )
+        if not side_ok:
+            reason = "side observe IK failed"
+            log_warn(
+                self.scene,
+                "平举定位",
+                "%s，不进入货架，等待重新检测",
+                reason,
+            )
+            return ActionResult(False, "side_observe", reason, target, time.time() - start)
+        self.robot.hold_arm(
+            SCENE3_SIDE_RELOCALIZE_SETTLE_SEC,
+            label="tray_side_observe_settle",
+        )
+        return ActionResult(True, "side_observe", "", target, time.time() - start)
+
     def pick(self, target: PerceptionTarget, arm: Optional[str] = None,
              attempt_index: int = 0, attempt_total: int = 0) -> ActionResult:
         start = time.time()
@@ -2167,7 +2244,7 @@ class Skills:
         log_stage(
             self.scene,
             "抓取",
-            "先侧方平举，再水平插入；闭爪后先水平抽出，离开货架后再抬升",
+            "复定位后从侧方同高位调整，再水平插入并弯臂抓取；闭爪后先水平抽出，离开货架后再抬升",
         )
 
         log_stage(
@@ -2972,7 +3049,7 @@ class Scene3Controller(BaseSceneController):
                     log_warn(
                         self.scene,
                         "抓取",
-                        "料盘 #%02d 尝试 #%d/%d 腕部复检失败，重新检测",
+                        "料盘 #%02d 尝试 #%d/%d 平举/二次定位失败，重新检测",
                         index,
                         pick_attempt,
                         SCENE3_PICK_RETRY,
@@ -3031,61 +3108,36 @@ class Scene3Controller(BaseSceneController):
                             duration_sec=time.time() - start)
 
     def refine_tray_with_wrist(self, tray: PerceptionTarget, arm: str) -> Optional[PerceptionTarget]:
-        if tray.position_base is None:
+        observation = self.skills.scene3_tray_observation(tray, arm)
+        if observation is None:
             return None
-        camera = "{}_wrist".format(arm)
-        xyz = tray.position_base
-        observe_z = float(xyz[2])
-        side_sign = arm_side_sign(arm)
-        entry_x = float(xyz[0]) - SCENE3_WRIST_OBSERVE_BACKOFF_X_M
-        side_observe_xyz = (
-            entry_x,
-            float(xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M,
-            observe_z,
-        )
-        observe_xyz = (
-            entry_x,
-            float(xyz[1]),
-            observe_z,
-        )
-        log_stage(
-            self.scene,
-            "腕部复检",
-            "arm=%s camera=%s rough=%s side=%s observe=%s",
-            arm,
-            camera,
-            _fmt_xyz(xyz),
-            _fmt_xyz(side_observe_xyz),
-            _fmt_xyz(observe_xyz),
-        )
-        self.robot.open_claw(arm)
-        side_ok = self.robot.move_hand_ik(
-            arm,
-            side_observe_xyz,
-            duration=SCENE3_SHELF_SIDE_DURATION_SEC,
-            label="wrist_refine_side",
-        )
-        if not side_ok:
-            log_warn(self.scene, "腕部复检", "侧方观察位 IK 失败，跳过腕部复检，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
-            return tray
-        observe_ok = self.robot.move_hand_ik(
-            arm,
-            observe_xyz,
-            duration=SCENE3_SHELF_ENTRY_DURATION_SEC,
-            label="wrist_refine_view",
-        )
-        if not observe_ok:
-            log_warn(self.scene, "腕部复检", "观察位 IK 失败，跳过腕部复检，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
-            return tray
-        self.robot.rospy.sleep(0.25)
 
+        staged = self.skills.stage_scene3_tray_side_observe(observation)
+        if not staged.ok:
+            return None
+        return self._relocalize_tray_from_side_observe(observation)
+
+    def _relocalize_tray_from_side_observe(
+        self,
+        observation: Scene3TrayObservation,
+    ) -> Optional[PerceptionTarget]:
+        rough = observation.rough_target
         for attempt in range(1, SCENE3_WRIST_REFINE_RETRY + 1):
+            log_stage(
+                self.scene,
+                "二次定位",
+                "侧方同高观察后第 %d/%d 次腕部 YOLO-World 检测 camera=%s rough=%s",
+                attempt,
+                SCENE3_WRIST_REFINE_RETRY,
+                observation.camera,
+                _fmt_xyz(rough.position_base),
+            )
             candidates = self.perception.detect_targets(
                 class_names=["smt_tray"],
-                cameras=[camera],
+                cameras=[observation.camera],
                 max_targets=None,
             )
-            log_target_list(self.scene, "腕部复检", candidates)
+            log_target_list(self.scene, "二次定位", candidates)
             usable: List[PerceptionTarget] = []
             rejected: List[Tuple[PerceptionTarget, str]] = []
             for candidate in candidates:
@@ -3094,29 +3146,43 @@ class Scene3Controller(BaseSceneController):
                     rejected.append((candidate, reason))
                     continue
                 if (candidate.position_base is not None
-                        and distance3(candidate.position_base, tray.position_base) <= SCENE3_WRIST_REFINE_MAX_DELTA_M):
+                        and rough.position_base is not None
+                        and distance3(candidate.position_base, rough.position_base) <= SCENE3_WRIST_REFINE_MAX_DELTA_M):
                     usable.append(candidate)
                 else:
                     rejected.append((candidate, "too far from rough target"))
             self._log_rejected_targets(rejected)
             if usable:
                 usable.sort(key=lambda item: (
-                    distance3(item.position_base, tray.position_base) if item.position_base is not None else 99.0,
+                    distance3(item.position_base, rough.position_base)
+                    if item.position_base is not None and rough.position_base is not None
+                    else 99.0,
                     -float(item.confidence),
                 ))
                 refined = usable[0]
                 log_stage(
                     self.scene,
-                    "腕部复检",
-                    "使用腕部相机修正 base %s -> %s",
-                    _fmt_xyz(tray.position_base),
+                    "二次定位",
+                    "使用腕部 YOLO-World 修正 base %s -> %s delta=%.3fm conf=%.2f",
+                    _fmt_xyz(rough.position_base),
                     _fmt_xyz(refined.position_base),
+                    (
+                        distance3(rough.position_base, refined.position_base)
+                        if rough.position_base is not None and refined.position_base is not None
+                        else 0.0
+                    ),
+                    refined.confidence,
                 )
                 return refined
             self.robot.rospy.sleep(0.25)
 
-        log_warn(self.scene, "腕部复检", "未获得可用腕部复检结果，沿用头部相机坐标 %s", _fmt_xyz(tray.position_base))
-        return tray
+        log_warn(
+            self.scene,
+            "二次定位",
+            "未获得可用腕部复定位结果，不再直接抓初定位目标 rough=%s",
+            _fmt_xyz(rough.position_base),
+        )
+        return None
 
     def detect_reachable_trays(self, completed_positions: Sequence[Tuple[float, float, float]]) -> List[PerceptionTarget]:
         miss_count = 0
