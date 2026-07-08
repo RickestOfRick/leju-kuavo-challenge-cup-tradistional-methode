@@ -74,11 +74,19 @@ colored rectangular block, long rectangular block
 yellow rectangular cuboid, brown rectangular cuboid
 orange rectangular cuboid, white rectangular cuboid, gray rectangular cuboid
 taped rectangular cuboid, rectangular box with tape
-vivid green mat, bright green mat, neon green mat, flat green mat
-green rectangular mat, flat green rectangular mat, bright green rectangular mat
-green table mat, green floor mat, green target mat, green target area
-green rectangular target, green rectangular patch
-bright green rectangle, neon green rectangle, colored rectangular mat
+vivid colored rectangle area, vivid colored square area
+bright colored rectangular area, bright colored square area
+different colored rectangular area, different colored square area
+colored rectangular region, colored square region
+colored rectangular patch, colored square patch
+flat colored rectangle, flat colored square
+green rectangular area, green square area
+bright green rectangular area, bright green square area
+vivid green rectangular area, vivid green square area
+green rectangular target, green square target
+green rectangular patch, green square patch
+bright green rectangle, bright green square
+vivid green mat, bright green mat, green rectangular mat, green square mat
 weighing mat, weighing pad
 drop box, sorting box, destination box, green sorting box
 open green box, open dark green box, green open bin
@@ -105,7 +113,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --s
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --scene1-perception yolo
 
 # 指定专用权重和 GPU
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt --yolo-device cuda --yolo-conf 0.35 --yolo-imgsz 640
 
 # 直接使用原始 YOLO-World 权重并套用 prompts
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --yolo-model yolov8s-worldv2.pt --yolo-device cuda --yolo-conf 0.25 --yolo-imgsz 640
@@ -118,7 +126,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --y
 | `--scene1-perception` | `auto` | 兼容旧参数；`auto` 和 `yolo` 均使用 YOLO-World。 |
 | `--yolo-model` | 按场景选择 | YOLO-World `.pt` 权重路径；场景一默认 `src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt`。 |
 | `--yolo-device` | `auto` | 可选 `auto`、`cpu`、`cuda`、`cuda:0`、`cuda:1`。 |
-| `--yolo-conf` | `0.45` | YOLO-World 检测置信度阈值。 |
+| `--yolo-conf` | `0.35` | YOLO-World 检测置信度阈值。 |
 | `--yolo-imgsz` | `640` | YOLO-World 推理输入尺寸。 |
 
 ## 场景二 YOLO-World 识别
@@ -157,7 +165,7 @@ sorting bin c, purple sorting bin
 rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3
 
 # 指定同名模型和 GPU
-rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt --yolo-device cuda --yolo-conf 0.45 --yolo-imgsz 640
+rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --yolo-model /root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt --yolo-device cuda --yolo-conf 0.35 --yolo-imgsz 640
 
 # 直接使用原始 YOLO-World 权重并套用 prompts
 rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --yolo-model yolov8s-worldv2.pt --yolo-device cuda --yolo-conf 0.25 --yolo-imgsz 640
@@ -235,7 +243,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3 --y
 | --- | --- | --- |
 | `--yolo-model` | `src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt` | 场景三 YOLO-World `.pt` 权重路径；也可临时传 `yolov8s-worldv2.pt`。 |
 | `--yolo-device` | `auto` | 可选 `auto`、`cpu`、`cuda`、`cuda:0`、`cuda:1`。 |
-| `--yolo-conf` | `0.45` | YOLO-World 检测置信度阈值；调试初期可试 `0.20` 到 `0.30`，误检多时提高到 `0.35` 到 `0.45`。 |
+| `--yolo-conf` | `0.35` | YOLO-World 检测置信度阈值；调试初期可试 `0.20` 到 `0.30`，误检多时提高到 `0.35` 到 `0.45`。 |
 | `--yolo-imgsz` | `640` | YOLO-World 推理输入尺寸。 |
 
 ## 比赛计时
