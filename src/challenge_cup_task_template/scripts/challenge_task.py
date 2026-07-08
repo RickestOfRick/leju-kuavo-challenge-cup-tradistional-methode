@@ -405,7 +405,9 @@ ARM_MODE_EXTERNAL_CONTROL = 2
 ARM_MODE_AUTO_SWING = 1
 ARM_TRAJ_HZ = 50.0
 CLAW_OPEN_PERCENT = 5.0
-CLAW_CLOSE_PERCENT = 88.0
+CLAW_CLOSE_PERCENT = 96.0
+CLAW_EFFORT_A = 2.0
+CLAW_VELOCITY_PERCENT = 70.0
 
 SAFE_PRE_GRASP_DZ_M = 0.14
 SAFE_LIFT_DZ_M = 0.18
@@ -428,7 +430,8 @@ SKILL_PICK_RETRY = 10
 SKILL_PICK_RETRY_SETTLE_SEC = 0.30
 SKILL_PRE_GRASP_DURATION_SEC = 1.80
 SKILL_GRASP_DURATION_SEC = 1.50
-SKILL_POST_GRASP_SETTLE_SEC = 0.35
+SKILL_POST_GRASP_SETTLE_SEC = 0.90
+SKILL_INITIAL_LIFT_DZ_M = 0.08
 SKILL_LIFT_DURATION_SEC = 1.50
 SKILL_PLACE_PRE_DURATION_SEC = 1.60
 SKILL_PLACE_DURATION_SEC = 1.30
@@ -899,7 +902,7 @@ class RobotBase:
         return self.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=0.45)
 
     def close_claw(self, arm: str, percent: float = CLAW_CLOSE_PERCENT) -> bool:
-        return self.set_claw(arm, percent, settle_sec=0.65)
+        return self.set_claw(arm, percent, settle_sec=0.90)
 
     def set_claw(self, arm: str, percent: float, settle_sec: float = 0.2) -> bool:
         from kuavo_msgs.msg import endEffectorData, lejuClawCommand
@@ -909,8 +912,17 @@ class RobotBase:
         data = endEffectorData()
         data.name = names
         data.position = positions
-        data.velocity = [70.0] * len(names)
-        data.effort = [1.5] * len(names)
+        data.velocity = [CLAW_VELOCITY_PERCENT] * len(names)
+        data.effort = [CLAW_EFFORT_A] * len(names)
+        log_stage(
+            self.scene,
+            "夹爪",
+            "arm=%s position=%s velocity=%.1f effort=%.1fA",
+            arm,
+            ["%.1f" % item for item in positions],
+            CLAW_VELOCITY_PERCENT,
+            CLAW_EFFORT_A,
+        )
 
         ok = False
         try:
@@ -1995,6 +2007,7 @@ class Skills:
 
         pre = (xyz[0], xyz[1], xyz[2] + SAFE_PRE_GRASP_DZ_M)
         grasp = (xyz[0], xyz[1], xyz[2])
+        initial_lift = (xyz[0], xyz[1], xyz[2] + SKILL_INITIAL_LIFT_DZ_M)
         lift = (xyz[0], xyz[1], xyz[2] + SAFE_LIFT_DZ_M)
 
         log_stage(
@@ -2065,27 +2078,42 @@ class Skills:
             return ActionResult(False, "pick", reason, target, time.time() - start)
         self.robot.close_claw(arm, percent=self._close_percent(target.class_name))
         self.robot.hold_arm(SKILL_POST_GRASP_SETTLE_SEC, label="post_grasp_settle")
-        lift_targets = [lift]
-        lift_ok = False
-        for lift_attempt, lift_target in enumerate(lift_targets, start=1):
+        lift_targets = [
+            ("initial_lift", initial_lift, True),
+            ("lift", lift, False),
+        ]
+        mandatory_lift_ok = False
+        for lift_attempt, (lift_label, lift_target, required) in enumerate(lift_targets, start=1):
             log_stage(
                 self.scene,
                 "抓取",
-                "lift attempt #%d/%d target=%s",
+                "%s attempt #%d/%d target=%s required=%s",
+                lift_label,
                 lift_attempt,
                 len(lift_targets),
                 _fmt_xyz(lift_target),
+                required,
             )
-            lift_ok = self.robot.move_hand_ik(
+            ok = self.robot.move_hand_ik(
                 arm,
                 lift_target,
                 yaw_rad=yaw,
                 duration=SKILL_LIFT_DURATION_SEC,
-                label="lift#{}".format(lift_attempt),
+                label="{}#{}".format(lift_label, lift_attempt),
             )
-            if lift_ok:
-                break
-        if not lift_ok:
+            if required:
+                mandatory_lift_ok = ok
+                if not ok:
+                    break
+                continue
+            if not ok:
+                log_warn(
+                    self.scene,
+                    "抓取",
+                    "二段抬升到安全高度失败，但初段抬升已成功，继续后续放置",
+                )
+            break
+        if not mandatory_lift_ok:
             reason = "lift IK failed"
             self._log_pick_failure_detail(
                 target,
