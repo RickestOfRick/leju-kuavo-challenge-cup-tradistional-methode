@@ -282,6 +282,7 @@ SCENE2_YOLO_TARGET_BINS = {
 SCENE1_YOLO_DEFAULT_CONF = 0.35
 SCENE1_YOLO_DEFAULT_IMGSZ = 640
 SCENE1_YOLO_CENTER_DEPTH_FRACTION = 0.45
+SCENE3_YOLO_CENTER_DEPTH_FRACTION = 0.28
 SCENE3_YOLO_CLASS_NAME = "smt_tray"
 SCENE3_YOLO_TARGET_BIN = "outbound_box"
 SCENE3_YOLO_WORLD_PROMPTS = (
@@ -301,6 +302,10 @@ SCENE3_YOLO_WORLD_PROMPTS = (
     "black plastic tray",
     "industrial plastic tray",
     "tray on shelf",
+    "front lip of tray",
+    "front edge of tray",
+    "tray front edge",
+    "tray handle edge",
     "",
 )
 SCENE3_YOLO_CLASS_ALIASES = {
@@ -337,12 +342,20 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "industrial plastic tray": SCENE3_YOLO_CLASS_NAME,
     "tray_on_shelf": SCENE3_YOLO_CLASS_NAME,
     "tray on shelf": SCENE3_YOLO_CLASS_NAME,
+    "smt_tray_front_lip": SCENE3_YOLO_CLASS_NAME,
+    "smt tray front lip": SCENE3_YOLO_CLASS_NAME,
+    "tray_front_lip": SCENE3_YOLO_CLASS_NAME,
+    "tray front lip": SCENE3_YOLO_CLASS_NAME,
+    "tray_front_edge": SCENE3_YOLO_CLASS_NAME,
+    "tray front edge": SCENE3_YOLO_CLASS_NAME,
+    "front_lip_of_tray": SCENE3_YOLO_CLASS_NAME,
+    "front lip of tray": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
 SCENE3_TRAY_DETECT_MIN_Z_M = 0.08
 SCENE3_TRAY_GRASP_MIN_Z_M = 0.10
 SCENE3_INITIAL_APPROACH_DURATION_SEC = 0.85
-SCENE3_APPROACH_TARGET_X_M = 0.68
+SCENE3_APPROACH_TARGET_X_M = 0.56
 SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
 SCENE3_APPROACH_SPEED_MPS = 0.16
 SCENE3_APPROACH_MIN_DURATION_SEC = 0.20
@@ -352,25 +365,35 @@ SCENE3_APPROACH_RETRY = 48
 SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
 SCENE3_APPROACH_MAX_MISSES = 12
 SCENE3_HEAD_RELOCALIZE_RETRY = 1
-SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M = 0.45
-SCENE3_RELOCALIZE_X_MARGIN_M = 0.05
-SCENE3_RELOCALIZE_MAX_DZ_M = 0.10
+SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M = 0.14
+SCENE3_RELOCALIZE_MIN_CONF = 0.35
+SCENE3_RELOCALIZE_MAX_DY_M = 0.08
+SCENE3_RELOCALIZE_SIDE_DEADBAND_Y_M = 0.04
+SCENE3_RELOCALIZE_X_MARGIN_M = 0.00
+SCENE3_RELOCALIZE_MAX_DZ_M = 0.07
 SCENE3_SIDE_OBSERVE_DZ_M = 0.06
 SCENE3_SIDE_OBSERVE_BACKOFF_X_M = 0.14
 SCENE3_SIDE_RELOCALIZE_SETTLE_SEC = 0.35
 SCENE3_BEND_RELOCALIZE_HOLD_SEC = 0.35
-SCENE3_TRAY_GRASP_OFFSET_BASE = (-0.025, 0.0, -0.010)
+SCENE3_TRAY_GRASP_OFFSET_BASE = (-0.085, 0.0, -0.005)
 SCENE3_TRAY_GRASP_OFFSET_CANDIDATES_BASE = (
-    (-0.055, 0.0, -0.005),
-    (-0.035, 0.0, -0.015),
-    (-0.015, 0.0, 0.000),
-    (0.005, 0.0, -0.015),
+    (-0.120, 0.0, 0.000),
+    (-0.095, 0.0, -0.005),
+    (-0.070, 0.0, -0.010),
+    (-0.045, 0.0, 0.000),
 )
 SCENE3_CLAW_PULL_PERCENT = 68.0
 SCENE3_CLAW_REGRIP_OPEN_PERCENT = 38.0
 SCENE3_CLAW_CLOSE_PERCENT = 82.0
-# 场景三货架内抓取不从上方垂直抬手：平举/插入高度使用料盘中心高度，
-# 抓取点再由 SCENE3_TRAY_GRASP_OFFSET_BASE 做轻微下探。
+# 场景三优先抓料盘前缘并水平拉出，不再依赖平举后反复弯臂。
+SCENE3_GRASP_SWEET_X_M = 0.56
+SCENE3_GRASP_X_TOL_M = 0.06
+SCENE3_GRASP_ALIGN_MIN_DURATION_SEC = 0.18
+SCENE3_GRASP_ALIGN_MAX_DURATION_SEC = 0.85
+SCENE3_FRONT_PRE_BACKOFF_X_M = 0.10
+SCENE3_FRONT_PULL_OUT_X_M = 0.16
+SCENE3_FRONT_REGRIP_FORWARD_X_M = 0.035
+SCENE3_FRONT_PRE_DZ_M = 0.035
 SCENE3_SHELF_SIDE_CLEARANCE_Y_M = 0.035
 SCENE3_SHELF_ENTRY_BACKOFF_X_M = 0.14
 SCENE3_SHELF_ENTRY_MIN_X_M = 0.52
@@ -1184,7 +1207,7 @@ class RobotBase:
 
 
 # ---------------------------------------------------------------------------
-# 感知层：YOLO-World 检测、深度投影和 TF 变换
+# 感知层：YOLO/YOLO-World 检测、深度投影和 TF 变换
 # ---------------------------------------------------------------------------
 
 
@@ -1500,7 +1523,7 @@ class YoloWorldPerception(RGBDPerceptionBase):
             return []
         if not self._ensure_yolo():
             reason = self._yolo_unavailable_reason or "unknown"
-            self._report_yolo_unavailable("error", "YOLO-World 不可用: %s", reason)
+            self._report_yolo_unavailable("error", "YOLO 不可用: %s", reason)
             return []
 
         try:
@@ -1523,16 +1546,24 @@ class YoloWorldPerception(RGBDPerceptionBase):
             self._yolo_unavailable_reason = "cv2/numpy import failed"
             return False
         if (not os.path.isfile(self.yolo_model_path)
-                and not self._is_ultralytics_world_model_name(self.yolo_model_path)):
+                and not self._is_ultralytics_builtin_model_name(self.yolo_model_path)):
             self._yolo_unavailable_reason = (
-                "model not found: {}; generate a scene-specific YOLO-World .pt "
-                "or pass yolov8s-worldv2.pt as --yolo-model"
+                "model not found: {}; generate a scene-specific YOLO/YOLO-seg .pt "
+                "or pass an Ultralytics builtin model name"
             ).format(self.yolo_model_path)
             return False
 
         load_errors: List[str] = []
-        if self._try_load_yolo_world(load_errors):
-            return True
+        if self._is_ultralytics_world_model_name(self.yolo_model_path):
+            if self._try_load_yolo_world(load_errors):
+                return True
+            if self._try_load_yolo_standard(load_errors):
+                return True
+        else:
+            if self._try_load_yolo_standard(load_errors):
+                return True
+            if self._try_load_yolo_world(load_errors):
+                return True
 
         self._yolo_unavailable_reason = "; ".join(load_errors) or "ultralytics/model load failed"
         self._yolo_model = None
@@ -1552,6 +1583,19 @@ class YoloWorldPerception(RGBDPerceptionBase):
             self._yolo_model = None
             return False
 
+    def _try_load_yolo_standard(self, load_errors: List[str]) -> bool:
+        try:
+            from ultralytics import YOLO
+
+            model = YOLO(self.yolo_model_path)
+            self._yolo_model = model
+            self._log_yolo_ready("YOLO", prompts_applied=False)
+            return True
+        except Exception as exc:
+            load_errors.append("YOLO load failed: {}".format(exc))
+            self._yolo_model = None
+            return False
+
     def _apply_world_prompts(self, model: Any) -> bool:
         if not hasattr(model, "set_classes"):
             return False
@@ -1564,6 +1608,13 @@ class YoloWorldPerception(RGBDPerceptionBase):
             basename == model_path
             and basename.lower().endswith(".pt")
             and "world" in basename.lower()
+        )
+
+    def _is_ultralytics_builtin_model_name(self, model_path: str) -> bool:
+        basename = os.path.basename(model_path)
+        return (
+            basename == model_path
+            and basename.lower().endswith(".pt")
         )
 
     def _normalize_model_ref(self, model_path: str) -> str:
@@ -1985,6 +2036,7 @@ class YoloScene3Perception(YoloWorldPerception):
             world_prompts=SCENE3_YOLO_WORLD_PROMPTS,
             bin_class_names=(),
         )
+        self.yolo_center_depth_fraction = SCENE3_YOLO_CENTER_DEPTH_FRACTION
 
 
 # ---------------------------------------------------------------------------
@@ -2377,14 +2429,18 @@ class Skills:
             )
             return ActionResult(False, "pick", reason, target, time.time() - start)
         shelf = scene3_shelf_name_from_z(tray_center_z)
-        side_sign = arm_side_sign(arm)
-        pose_candidates = self._scene3_tray_pose_candidates(arm)
+        base_yaw = 0.0 if arm == "left" else math.pi
+        pose_candidates = [
+            ("front_down", quat_down(base_yaw), 2),
+            ("front_yaw_in", quat_down(base_yaw + arm_side_sign(arm) * math.radians(12.0)), 2),
+            ("front_yaw_out", quat_down(base_yaw - arm_side_sign(arm) * math.radians(12.0)), 2),
+        ]
         last_reason = "no tray grasp candidate attempted"
 
         log_stage(
             self.scene,
             "抓取",
-            "料盘候选抓取 shelf=%s arm=%s raw=%s offsets=%d poses=%d",
+            "料盘前缘拉出抓取 shelf=%s arm=%s raw=%s offsets=%d poses=%d",
             shelf,
             arm,
             _fmt_xyz(raw_xyz),
@@ -2394,7 +2450,7 @@ class Skills:
         log_stage(
             self.scene,
             "抓取",
-            "策略：侧向水平姿态候选 -> 中等闭爪拉出 -> 轻微松爪复夹 -> 夹爪反馈确认 -> 离架抬升",
+            "策略：前缘预抓 -> 低位夹前缘 -> 水平拉出 -> 轻微复夹 -> 离架抬升",
         )
         log_stage(
             self.scene,
@@ -2410,11 +2466,6 @@ class Skills:
                 float(raw_xyz[1]) + float(offset[1]),
                 float(raw_xyz[2]) + float(offset[2]),
             )
-            entry_x = max(
-                float(raw_xyz[0]) - SCENE3_SHELF_ENTRY_BACKOFF_X_M,
-                SCENE3_SHELF_ENTRY_MIN_X_M,
-            )
-            side_y = float(raw_xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M
             raw_level_z = float(grasp_seed[2])
             level_z = max(raw_level_z, SCENE3_TRAY_GRASP_MIN_Z_M)
             if level_z > raw_level_z:
@@ -2428,19 +2479,21 @@ class Skills:
                     _fmt_xyz(offset),
                 )
 
-            side_ready = self._reachable_xyz((entry_x, side_y, level_z))
-            shelf_entry = self._reachable_xyz((entry_x, raw_xyz[1], level_z))
-            insert_pre = self._reachable_xyz((
-                grasp_seed[0] - SCENE3_INSERT_PRE_BACKOFF_X_M,
-                grasp_seed[1],
-                level_z,
+            grasp = self._reachable_xyz((grasp_seed[0], grasp_seed[1], level_z))
+            pre_grasp = self._reachable_xyz((
+                grasp[0] - SCENE3_FRONT_PRE_BACKOFF_X_M,
+                grasp[1],
+                grasp[2] + SCENE3_FRONT_PRE_DZ_M,
             ))
-            grasp = self._reachable_xyz(grasp_seed)
-            pull_out = self._reachable_xyz((entry_x, grasp[1], grasp[2]))
-            regrip = self._reachable_xyz((
-                entry_x + SCENE3_TRAY_REGRIP_FORWARD_X_M,
+            pull_out = self._reachable_xyz((
+                grasp[0] - SCENE3_FRONT_PULL_OUT_X_M,
                 grasp[1],
                 grasp[2],
+            ))
+            regrip = self._reachable_xyz((
+                pull_out[0] + SCENE3_FRONT_REGRIP_FORWARD_X_M,
+                pull_out[1],
+                pull_out[2],
             ))
 
             for pose_index, (pose_label, pose_quat, pose_mode) in enumerate(pose_candidates, start=1):
@@ -2449,25 +2502,21 @@ class Skills:
                     "抓取",
                     (
                         "候选 offset#%d/%d pose#%d/%d %s "
-                        "side=%s entry=%s insert=%s grasp=%s pull=%s regrip=%s"
+                        "pre=%s grasp=%s pull=%s regrip=%s"
                     ),
                     offset_index,
                     len(SCENE3_TRAY_GRASP_OFFSET_CANDIDATES_BASE),
                     pose_index,
                     len(pose_candidates),
                     pose_label,
-                    _fmt_xyz(side_ready),
-                    _fmt_xyz(shelf_entry),
-                    _fmt_xyz(insert_pre),
+                    _fmt_xyz(pre_grasp),
                     _fmt_xyz(grasp),
                     _fmt_xyz(pull_out),
                     _fmt_xyz(regrip),
                 )
                 self.robot.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=SCENE3_CLAW_OPEN_SETTLE_SEC)
                 waypoints = [
-                    ("side_ready", side_ready, SCENE3_SHELF_SIDE_DURATION_SEC),
-                    ("shelf_entry", shelf_entry, SCENE3_SHELF_ENTRY_DURATION_SEC),
-                    ("shelf_insert", insert_pre, SCENE3_SHELF_INSERT_DURATION_SEC),
+                    ("front_pre", pre_grasp, SCENE3_PRE_GRASP_DURATION_SEC),
                     ("grasp", grasp, SCENE3_GRASP_DURATION_SEC),
                 ]
                 path_ok = True
@@ -2503,12 +2552,12 @@ class Skills:
                     arm,
                     pull_out,
                     duration=SCENE3_TRAY_PULL_OUT_DURATION_SEC,
-                    label="tray_pull_out_{}".format(pose_label),
+                    label="tray_front_pull_out_{}".format(pose_label),
                     quat_xyzw=pose_quat,
                     constraint_mode=pose_mode,
                 )
                 if not pull_ok:
-                    reason = "tray pull-out IK failed"
+                    reason = "front_pull IK failed"
                     log_warn(self.scene, "抓取", "%s，料盘可能仍在货架内", reason)
                     return ActionResult(False, "pick", reason, target, time.time() - start)
 
@@ -2525,12 +2574,12 @@ class Skills:
                     arm,
                     regrip,
                     duration=SCENE3_TRAY_REGRIP_DURATION_SEC,
-                    label="tray_regrip_{}".format(pose_label),
+                    label="tray_front_regrip_{}".format(pose_label),
                     quat_xyzw=pose_quat,
                     constraint_mode=pose_mode,
                 )
                 if not regrip_ok:
-                    reason = "tray regrip IK failed"
+                    reason = "front_regrip IK failed"
                     log_warn(self.scene, "抓取", "%s，重新检测后再试", reason)
                     return ActionResult(False, "pick", reason, target, time.time() - start)
 
@@ -2591,7 +2640,7 @@ class Skills:
     ) -> ActionResult:
         start = time.time()
         arm = self.single_arm(arm, target, "抓取重试")
-        # 场景三控制器已经有“平举 + 头部复定位/弯臂”的外层循环，
+        # 场景三控制器已经有“甜区调整 + 头部复定位”的外层循环，
         # 这里保持单次，避免每轮料盘抓取被嵌套放大到数百次。
         max_attempts = 1 if self.scene == "scene3" else SKILL_PICK_RETRY
         last_result = ActionResult(False, "pick", "not attempted", target)
@@ -2877,7 +2926,7 @@ class BaseSceneController:
         preload = getattr(self.perception, "preload_model", None)
         if not callable(preload):
             return
-        log_stage(self.scene, "YOLO", "预加载 YOLO-World 模型，避免首次检测时阻塞导航")
+        log_stage(self.scene, "YOLO", "预加载 YOLO 模型，避免首次检测时阻塞导航")
         if not preload():
             log_warn(self.scene, "YOLO", "模型预加载失败，后续检测会再次尝试并输出原因")
 
@@ -3295,7 +3344,7 @@ class Scene3Controller(BaseSceneController):
             arm = "right"
             pick_result: Optional[ActionResult] = None
             last_pick_result: Optional[ActionResult] = None
-            for side_attempt in range(1, SCENE3_SIDE_OBSERVE_RETRY + 1):
+            for attempt in range(1, SCENE3_SIDE_OBSERVE_RETRY + 1):
                 pick_result = None
                 targets = self.detect_reachable_trays(completed_positions)
                 if not targets:
@@ -3303,147 +3352,60 @@ class Scene3Controller(BaseSceneController):
                     break
                 targets.sort(key=self._tray_sort_key)
                 tray_candidate = targets[0]
-                arm = self.skills.choose_arm(tray_candidate)
-                observation = self.stage_tray_side_observe(tray_candidate, arm)
-                if observation is None:
-                    log_warn(
-                        self.scene,
-                        "抓取",
-                        "料盘 #%02d 平举 #%d/%d 失败，重新检测后再平举",
-                        index,
-                        side_attempt,
-                        SCENE3_SIDE_OBSERVE_RETRY,
-                    )
-                    self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
-                    self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                if self._adjust_base_for_tray_sweet_spot(tray_candidate, attempt):
                     continue
 
                 log_stage(
                     self.scene,
-                    "抓取",
-                    "料盘 #%02d 平举 #%d/%d 成功，在当前平举姿态内最多尝试弯臂 %d 次",
+                    "二次定位",
+                    "料盘 #%02d 尝试 #%d/%d：头部近距离复定位 rough=%s",
                     index,
-                    side_attempt,
+                    attempt,
                     SCENE3_SIDE_OBSERVE_RETRY,
-                    SCENE3_BEND_RETRY,
+                    _fmt_xyz(tray_candidate.position_base),
                 )
-                current_observation = observation
-                current_target = tray_candidate
-                for bend_attempt in range(1, SCENE3_BEND_RETRY + 1):
-                    relocalize_observation = self._retarget_tray_observation(
-                        current_observation,
-                        current_target,
-                    )
-                    log_stage(
+                tray = self._relocalize_tray_from_head(tray_candidate)
+                if tray is None:
+                    log_warn(
                         self.scene,
                         "二次定位",
-                        "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d：保持平举，用头部相机复定位 rough=%s",
+                        "料盘 #%02d 尝试 #%d/%d 头部复定位失败，重新检测",
                         index,
-                        side_attempt,
+                        attempt,
                         SCENE3_SIDE_OBSERVE_RETRY,
-                        bend_attempt,
-                        SCENE3_BEND_RETRY,
-                        _fmt_xyz(current_target.position_base),
                     )
-                    refined = self._relocalize_tray_from_side_observe(relocalize_observation)
-                    if refined is None:
-                        log_warn(
-                            self.scene,
-                            "二次定位",
-                            "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d 头部二次定位失败，保持平举继续",
-                            index,
-                            side_attempt,
-                            SCENE3_SIDE_OBSERVE_RETRY,
-                            bend_attempt,
-                            SCENE3_BEND_RETRY,
-                        )
-                        self.robot.hold_arm(
-                            SCENE3_BEND_RELOCALIZE_HOLD_SEC,
-                            label="tray_relocalize_failed_hold",
-                        )
-                        continue
+                    self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                    continue
 
-                    tray = refined
-                    current_target = tray
-                    current_observation = self._retarget_tray_observation(
-                        current_observation,
-                        tray,
-                    )
-                    shelf = self._tray_shelf(tray)
-                    log_stage(
-                        self.scene,
-                        "流程",
-                        "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d shelf=%s 出库，arm=%s base=%s",
-                        index,
-                        side_attempt,
-                        SCENE3_SIDE_OBSERVE_RETRY,
-                        bend_attempt,
-                        SCENE3_BEND_RETRY,
-                        shelf,
-                        arm,
-                        _fmt_xyz(tray.position_base),
-                    )
-                    pick_result = self.skills.pick(tray, arm=arm)
-                    pick_result.retry_count = (side_attempt - 1) * SCENE3_BEND_RETRY + bend_attempt - 1
-                    last_pick_result = pick_result
-                    if pick_result.ok:
-                        break
-                    log_warn(
-                        self.scene,
-                        "抓取",
-                        "料盘 #%02d 平举 #%d/%d 弯臂 #%d/%d 失败: %s",
-                        index,
-                        side_attempt,
-                        SCENE3_SIDE_OBSERVE_RETRY,
-                        bend_attempt,
-                        SCENE3_BEND_RETRY,
-                        pick_result.reason,
-                    )
-                    if self._is_scene3_bend_failure(pick_result):
-                        log_warn(
-                            self.scene,
-                            "抓取",
-                            "弯臂/插入失败，保持当前平举姿态不放下，继续头部二次定位: %s",
-                            pick_result.reason,
-                        )
-                        self.robot.hold_arm(
-                            SCENE3_BEND_RELOCALIZE_HOLD_SEC,
-                            label="tray_bend_failed_hold",
-                        )
-                        continue
-
-                    log_warn(
-                        self.scene,
-                        "抓取",
-                        "非弯臂阶段失败，退出当前平举姿态后重新平举: %s",
-                        pick_result.reason,
-                    )
-                    self.robot.open_claw(arm)
+                arm = self.skills.choose_arm(tray)
+                shelf = self._tray_shelf(tray)
+                log_stage(
+                    self.scene,
+                    "流程",
+                    "料盘 #%02d 尝试 #%d/%d shelf=%s 前缘拉出，arm=%s base=%s",
+                    index,
+                    attempt,
+                    SCENE3_SIDE_OBSERVE_RETRY,
+                    shelf,
+                    arm,
+                    _fmt_xyz(tray.position_base),
+                )
+                pick_result = self.skills.pick(tray, arm=arm)
+                pick_result.retry_count = attempt - 1
+                last_pick_result = pick_result
+                if pick_result.ok:
                     break
 
-                if pick_result is not None and pick_result.ok:
-                    break
-
-                if pick_result is not None and not self._is_scene3_bend_failure(pick_result):
-                    log_warn(
-                        self.scene,
-                        "抓取",
-                        "料盘 #%02d 平举 #%d/%d 因 %s 提前结束当前平举，重新尝试平举",
-                        index,
-                        side_attempt,
-                        SCENE3_SIDE_OBSERVE_RETRY,
-                        pick_result.reason,
-                    )
-                else:
-                    log_warn(
-                        self.scene,
-                        "抓取",
-                        "料盘 #%02d 平举 #%d/%d 内 %d 次头部复定位/弯臂未成功，重新尝试平举",
-                        index,
-                        side_attempt,
-                        SCENE3_SIDE_OBSERVE_RETRY,
-                        SCENE3_BEND_RETRY,
-                    )
+                log_warn(
+                    self.scene,
+                    "抓取",
+                    "料盘 #%02d 尝试 #%d/%d 前缘拉出失败: %s",
+                    index,
+                    attempt,
+                    SCENE3_SIDE_OBSERVE_RETRY,
+                    pick_result.reason,
+                )
+                self.robot.open_claw(arm)
                 self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
                 self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
 
@@ -3471,6 +3433,53 @@ class Scene3Controller(BaseSceneController):
             return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
+
+    def _adjust_base_for_tray_sweet_spot(self, tray: PerceptionTarget, attempt: int) -> bool:
+        if tray.position_base is None:
+            return False
+        x = float(tray.position_base[0])
+        error = x - SCENE3_GRASP_SWEET_X_M
+        if abs(error) <= SCENE3_GRASP_X_TOL_M:
+            return False
+
+        duration = clamp(
+            abs(error) / SCENE3_APPROACH_SPEED_MPS,
+            SCENE3_GRASP_ALIGN_MIN_DURATION_SEC,
+            SCENE3_GRASP_ALIGN_MAX_DURATION_SEC,
+        )
+        linear_x = SCENE3_APPROACH_SPEED_MPS if error > 0.0 else -SCENE3_APPROACH_SPEED_MPS
+        log_stage(
+            self.scene,
+            "导航",
+            "料盘尝试 #%d base_x=%.3fm 不在甜区 %.3f±%.3fm，%s %.2fs 后重新检测",
+            attempt,
+            x,
+            SCENE3_GRASP_SWEET_X_M,
+            SCENE3_GRASP_X_TOL_M,
+            "前进" if linear_x > 0.0 else "后退",
+            duration,
+        )
+        self.navigation.drive_for(
+            linear_x=linear_x,
+            duration=duration,
+            label="scene3_grasp_sweet_spot",
+        )
+        self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+        return True
+
+    def _relocalize_tray_from_head(self, tray: PerceptionTarget) -> Optional[PerceptionTarget]:
+        if tray.position_base is None:
+            return None
+        arm = self.skills.choose_arm(tray)
+        observation = Scene3TrayObservation(
+            rough_target=tray,
+            arm=arm,
+            camera="head",
+            side_observe_xyz=tray.position_base,
+            level_z=float(tray.position_base[2]),
+            shelf=self._tray_shelf(tray),
+        )
+        return self._relocalize_tray_from_side_observe(observation)
 
     def _retarget_tray_observation(
         self,
@@ -3519,7 +3528,7 @@ class Scene3Controller(BaseSceneController):
             log_stage(
                 self.scene,
                 "二次定位",
-                "侧方同高观察后第 %d/%d 次头部 YOLO-World 检测 camera=%s rough=%s",
+                "头部近距离第 %d/%d 次 YOLO 检测 camera=%s rough=%s",
                 attempt,
                 SCENE3_HEAD_RELOCALIZE_RETRY,
                 observation.camera,
@@ -3548,6 +3557,20 @@ class Scene3Controller(BaseSceneController):
 
                 delta = distance3(candidate.position_base, rough.position_base)
                 dz = abs(float(candidate.position_base[2]) - float(rough.position_base[2]))
+                dy = abs(float(candidate.position_base[1]) - float(rough.position_base[1]))
+                rough_y = float(rough.position_base[1])
+                candidate_y = float(candidate.position_base[1])
+                if float(candidate.confidence) < SCENE3_RELOCALIZE_MIN_CONF:
+                    rejected.append((candidate, "confidence too low {:.2f}".format(candidate.confidence)))
+                    continue
+                if dy > SCENE3_RELOCALIZE_MAX_DY_M:
+                    rejected.append((candidate, "y jump from rough target dy={:.3f}m".format(dy)))
+                    continue
+                if (abs(rough_y) > SCENE3_RELOCALIZE_SIDE_DEADBAND_Y_M
+                        and abs(candidate_y) > SCENE3_RELOCALIZE_SIDE_DEADBAND_Y_M
+                        and rough_y * candidate_y < 0.0):
+                    rejected.append((candidate, "side changed from rough target"))
+                    continue
                 if delta > SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M:
                     rejected.append((candidate, "too far from rough target delta={:.3f}m".format(delta)))
                     continue
@@ -3602,7 +3625,7 @@ class Scene3Controller(BaseSceneController):
                 log_stage(
                     self.scene,
                     "二次定位",
-                    "使用头部 YOLO-World 修正 base %s -> %s delta=%.3fm dz=%.3fm conf=%.2f",
+                    "使用头部 YOLO 修正 base %s -> %s delta=%.3fm dz=%.3fm conf=%.2f",
                     _fmt_xyz(rough.position_base),
                     _fmt_xyz(refined.position_base),
                     refined_delta,
@@ -3902,15 +3925,15 @@ def main():
     parser.add_argument("--no-timer-gui", action="store_true",
                         help="不弹出计时器窗口，仅保留后台计时日志")
     parser.add_argument("--scene1-perception", choices=["auto", "yolo"], default="auto",
-                        help="兼容旧参数；auto/yolo 均使用 YOLO-World，不再支持规则识别")
+                        help="兼容旧参数；auto/yolo 均使用 YOLO，不再支持规则识别")
     parser.add_argument("--yolo-model", default=None,
-                        help="YOLO-World .pt 模型路径；未指定时按 scene 选择默认权重")
+                        help="YOLO/YOLO-World .pt 模型路径；未指定时按 scene 选择默认权重")
     parser.add_argument("--yolo-device", choices=["auto", "cpu", "cuda", "cuda:0", "cuda:1"], default="auto",
-                        help="YOLO-World 推理设备；auto 由 ultralytics 自动选择")
+                        help="YOLO 推理设备；auto 由 ultralytics 自动选择")
     parser.add_argument("--yolo-conf", type=float, default=SCENE1_YOLO_DEFAULT_CONF,
-                        help="YOLO-World 检测置信度阈值")
+                        help="YOLO 检测置信度阈值")
     parser.add_argument("--yolo-imgsz", type=int, default=SCENE1_YOLO_DEFAULT_IMGSZ,
-                        help="YOLO-World 推理输入尺寸")
+                        help="YOLO 推理输入尺寸")
     args = parser.parse_args()
 
     run_scene(
