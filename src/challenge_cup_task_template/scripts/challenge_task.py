@@ -399,6 +399,10 @@ SCENE3_BEND_RETRY = 8
 SCENE3_PICK_RETRY_SETTLE_SEC = 1.20
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
+SCENE3_IK_INACTIVE_HAND_POS_BASE = {
+    "left": (0.30, 0.28, 0.18),
+    "right": (0.30, -0.28, 0.18),
+}
 
 ARM_JOINT_NAMES = [
     "l_arm_pitch", "l_arm_roll", "l_arm_yaw", "l_forearm_pitch",
@@ -1110,6 +1114,24 @@ class RobotBase:
         req.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
         req.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
         req.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
+
+        if self.scene == "scene3":
+            inactive_arm = "right" if arm == "left" else "left"
+            inactive_pos = SCENE3_IK_INACTIVE_HAND_POS_BASE[inactive_arm]
+            inactive_quat = quat_down(0.0 if inactive_arm == "left" else math.pi)
+            if inactive_arm == "left":
+                req.hand_poses.left_pose.pos_xyz = [float(v) for v in inactive_pos]
+                req.hand_poses.left_pose.quat_xyzw = inactive_quat
+            else:
+                req.hand_poses.right_pose.pos_xyz = [float(v) for v in inactive_pos]
+                req.hand_poses.right_pose.quat_xyzw = inactive_quat
+            self.rospy.loginfo_throttle(
+                2.0,
+                "[%s][IK] 场景三非目标%s手使用停车占位 pose=%s",
+                self.scene,
+                "左" if inactive_arm == "left" else "右",
+                _fmt_xyz(inactive_pos),
+            )
 
         yaw = 0.0 if arm == "left" else math.pi
         quat = list(quat_xyzw) if quat_xyzw is not None else quat_down(yaw)
