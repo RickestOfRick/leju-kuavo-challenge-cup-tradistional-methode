@@ -351,6 +351,8 @@ SCENE3_APPROACH_SEARCH_DURATION_SEC = 0.45
 SCENE3_APPROACH_MAX_MISSES = 12
 SCENE3_HEAD_RELOCALIZE_RETRY = 1
 SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M = 0.45
+SCENE3_RELOCALIZE_X_MARGIN_M = 0.05
+SCENE3_RELOCALIZE_MAX_DZ_M = 0.10
 SCENE3_SIDE_OBSERVE_DZ_M = 0.06
 SCENE3_SIDE_OBSERVE_BACKOFF_X_M = 0.14
 SCENE3_SIDE_RELOCALIZE_SETTLE_SEC = 0.35
@@ -369,6 +371,7 @@ SCENE3_CLAW_CLOSE_PERCENT = 82.0
 # 抓取点再由 SCENE3_TRAY_GRASP_OFFSET_BASE 做轻微下探。
 SCENE3_SHELF_SIDE_CLEARANCE_Y_M = 0.035
 SCENE3_SHELF_ENTRY_BACKOFF_X_M = 0.14
+SCENE3_SHELF_ENTRY_MIN_X_M = 0.52
 SCENE3_INSERT_PRE_BACKOFF_X_M = 0.035
 SCENE3_TRAY_REGRIP_FORWARD_X_M = 0.025
 SCENE3_SHELF_SIDE_DURATION_SEC = 1.80
@@ -2370,7 +2373,10 @@ class Skills:
                 float(raw_xyz[1]) + float(offset[1]),
                 float(raw_xyz[2]) + float(offset[2]),
             )
-            entry_x = float(raw_xyz[0]) - SCENE3_SHELF_ENTRY_BACKOFF_X_M
+            entry_x = max(
+                float(raw_xyz[0]) - SCENE3_SHELF_ENTRY_BACKOFF_X_M,
+                SCENE3_SHELF_ENTRY_MIN_X_M,
+            )
             side_y = float(raw_xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M
             level_z = float(grasp_seed[2])
 
@@ -3480,36 +3486,79 @@ class Scene3Controller(BaseSceneController):
             usable: List[PerceptionTarget] = []
             rejected: List[Tuple[PerceptionTarget, str]] = []
             for candidate in candidates:
-                reason = self._target_reject_reason(candidate)
-                if reason is not None:
+                if candidate.position_base is None:
+                    reason = self._target_reject_reason(candidate) or "no base_link position"
                     rejected.append((candidate, reason))
                     continue
-                if (candidate.position_base is not None
-                        and rough.position_base is not None
-                        and distance3(candidate.position_base, rough.position_base) <= SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M):
-                    usable.append(candidate)
-                else:
-                    rejected.append((candidate, "too far from rough target"))
+                if rough.position_base is None:
+                    reason = self._target_reject_reason(candidate)
+                    if reason is None:
+                        usable.append(candidate)
+                    else:
+                        rejected.append((candidate, reason))
+                    continue
+
+                delta = distance3(candidate.position_base, rough.position_base)
+                dz = abs(float(candidate.position_base[2]) - float(rough.position_base[2]))
+                if delta > SCENE3_HEAD_RELOCALIZE_MAX_DELTA_M:
+                    rejected.append((candidate, "too far from rough target delta={:.3f}m".format(delta)))
+                    continue
+                if dz > SCENE3_RELOCALIZE_MAX_DZ_M:
+                    rejected.append((candidate, "z jump from rough target dz={:.3f}m".format(dz)))
+                    continue
+
+                reason = self._target_reject_reason(candidate)
+                if reason is not None:
+                    bounds = TARGET_BOUNDS_BASE["scene3"]
+                    x = float(candidate.position_base[0])
+                    allow_x_margin = (
+                        reason.startswith("x out of range")
+                        and bounds["x_min"] <= x <= bounds["x_max"] + SCENE3_RELOCALIZE_X_MARGIN_M
+                    )
+                    if not allow_x_margin:
+                        rejected.append((candidate, reason))
+                        continue
+                    log_warn(
+                        self.scene,
+                        "二次定位",
+                        "保留接近粗定位但略超 x 边界候选 base=%s delta=%.3fm dz=%.3fm reason=%s",
+                        _fmt_xyz(candidate.position_base),
+                        delta,
+                        dz,
+                        reason,
+                    )
+                usable.append(candidate)
             self._log_rejected_targets(rejected)
             if usable:
-                usable.sort(key=lambda item: (
-                    distance3(item.position_base, rough.position_base)
-                    if item.position_base is not None and rough.position_base is not None
-                    else 99.0,
-                    -float(item.confidence),
-                ))
+                def relocalize_sort_key(item: PerceptionTarget) -> Tuple[float, float, float]:
+                    if item.position_base is None or rough.position_base is None:
+                        return (99.0, 99.0, -float(item.confidence))
+                    return (
+                        distance3(item.position_base, rough.position_base),
+                        abs(float(item.position_base[2]) - float(rough.position_base[2])),
+                        -float(item.confidence),
+                    )
+
+                usable.sort(key=relocalize_sort_key)
                 refined = usable[0]
+                refined_delta = (
+                    distance3(rough.position_base, refined.position_base)
+                    if rough.position_base is not None and refined.position_base is not None
+                    else 0.0
+                )
+                refined_dz = (
+                    abs(float(refined.position_base[2]) - float(rough.position_base[2]))
+                    if rough.position_base is not None and refined.position_base is not None
+                    else 0.0
+                )
                 log_stage(
                     self.scene,
                     "二次定位",
-                    "使用头部 YOLO-World 修正 base %s -> %s delta=%.3fm conf=%.2f",
+                    "使用头部 YOLO-World 修正 base %s -> %s delta=%.3fm dz=%.3fm conf=%.2f",
                     _fmt_xyz(rough.position_base),
                     _fmt_xyz(refined.position_base),
-                    (
-                        distance3(rough.position_base, refined.position_base)
-                        if rough.position_base is not None and refined.position_base is not None
-                        else 0.0
-                    ),
+                    refined_delta,
+                    refined_dz,
                     refined.confidence,
                 )
                 return refined
