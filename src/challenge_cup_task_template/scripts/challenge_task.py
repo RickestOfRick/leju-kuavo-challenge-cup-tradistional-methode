@@ -339,6 +339,8 @@ SCENE3_YOLO_CLASS_ALIASES = {
     "tray on shelf": SCENE3_YOLO_CLASS_NAME,
 }
 SCENE3_SHELF_SPLIT_Z_M = 0.95
+SCENE3_TRAY_DETECT_MIN_Z_M = 0.08
+SCENE3_TRAY_GRASP_MIN_Z_M = 0.10
 SCENE3_INITIAL_APPROACH_DURATION_SEC = 0.85
 SCENE3_APPROACH_TARGET_X_M = 0.68
 SCENE3_APPROACH_MAX_DETECT_X_M = 2.60
@@ -473,7 +475,7 @@ TARGET_BOUNDS_BASE = {
     "scene3": {
         "x_min": -0.20,
         "x_max": 0.72,
-        "z_min": -0.25,
+        "z_min": SCENE3_TRAY_DETECT_MIN_Z_M,
         "z_max": 1.35,
     },
 }
@@ -2339,6 +2341,19 @@ class Skills:
                           xyz: Sequence[float], yaw: float, start: float) -> ActionResult:
         raw_xyz = target.position_base if target.position_base is not None else xyz
         tray_center_z = float(raw_xyz[2])
+        if tray_center_z < SCENE3_TRAY_DETECT_MIN_Z_M:
+            reason = "tray z below scene3 min {:.3f}m < {:.3f}m".format(
+                tray_center_z,
+                SCENE3_TRAY_DETECT_MIN_Z_M,
+            )
+            log_warn(
+                self.scene,
+                "抓取",
+                "%s raw=%s，跳过该候选避免低位空夹",
+                reason,
+                _fmt_xyz(raw_xyz),
+            )
+            return ActionResult(False, "pick", reason, target, time.time() - start)
         shelf = scene3_shelf_name_from_z(tray_center_z)
         side_sign = arm_side_sign(arm)
         pose_candidates = self._scene3_tray_pose_candidates(arm)
@@ -2378,7 +2393,18 @@ class Skills:
                 SCENE3_SHELF_ENTRY_MIN_X_M,
             )
             side_y = float(raw_xyz[1]) + side_sign * SCENE3_SHELF_SIDE_CLEARANCE_Y_M
-            level_z = float(grasp_seed[2])
+            raw_level_z = float(grasp_seed[2])
+            level_z = max(raw_level_z, SCENE3_TRAY_GRASP_MIN_Z_M)
+            if level_z > raw_level_z:
+                log_warn(
+                    self.scene,
+                    "抓取",
+                    "料盘抓取高度 %.3fm 低于下限 %.3fm，按下限生成轨迹 raw=%s offset=%s",
+                    raw_level_z,
+                    SCENE3_TRAY_GRASP_MIN_Z_M,
+                    _fmt_xyz(raw_xyz),
+                    _fmt_xyz(offset),
+                )
 
             side_ready = self._reachable_xyz((entry_x, side_y, level_z))
             shelf_entry = self._reachable_xyz((entry_x, raw_xyz[1], level_z))
