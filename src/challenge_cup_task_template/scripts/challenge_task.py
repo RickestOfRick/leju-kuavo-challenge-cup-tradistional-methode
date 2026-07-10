@@ -284,8 +284,43 @@ SCENE1_YOLO_DEFAULT_IMGSZ = 640
 SCENE1_YOLO_CENTER_DEPTH_FRACTION = 0.45
 SCENE3_YOLO_CENTER_DEPTH_FRACTION = 0.28
 SCENE3_YOLO_CLASS_NAME = "smt_tray"
-SCENE3_YOLO_TARGET_BIN = "outbound_box"
+SCENE3_YOLO_UPPER_TRAY_CLASS_NAME = "smt_tray_upper"
+SCENE3_YOLO_LOWER_TRAY_CLASS_NAME = "smt_tray_lower"
+SCENE3_YOLO_OUTBOUND_CLASS_NAME = "outbound_area"
+SCENE3_ORDERED_TRAY_CLASS_NAMES = (
+    SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+)
+SCENE3_TRAY_CLASS_NAMES = (
+    SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    SCENE3_YOLO_CLASS_NAME,
+)
+SCENE3_YOLO_CLASS_NAMES = SCENE3_TRAY_CLASS_NAMES + (SCENE3_YOLO_OUTBOUND_CLASS_NAME,)
+SCENE3_YOLO_TARGET_BIN = SCENE3_YOLO_OUTBOUND_CLASS_NAME
+SCENE3_YOLO_TARGET_BINS = {
+    SCENE3_YOLO_UPPER_TRAY_CLASS_NAME: SCENE3_YOLO_TARGET_BIN,
+    SCENE3_YOLO_LOWER_TRAY_CLASS_NAME: SCENE3_YOLO_TARGET_BIN,
+    SCENE3_YOLO_CLASS_NAME: SCENE3_YOLO_TARGET_BIN,
+    SCENE3_YOLO_OUTBOUND_CLASS_NAME: None,
+}
+SCENE3_TRAY_CLASS_TO_SHELF = {
+    SCENE3_YOLO_UPPER_TRAY_CLASS_NAME: "upper",
+    SCENE3_YOLO_LOWER_TRAY_CLASS_NAME: "lower",
+}
 SCENE3_YOLO_WORLD_PROMPTS = (
+    "smt_tray_upper",
+    "upper smt tray",
+    "upper layer smt tray",
+    "upper shelf smt tray",
+    "smt_tray_lower",
+    "lower smt tray",
+    "lower layer smt tray",
+    "lower shelf smt tray",
+    "outbound_area",
+    "outbound area",
+    "outbound target area",
+    "outbound square area",
     "smt tray",
     "smt component tray",
     "smt material tray",
@@ -309,6 +344,28 @@ SCENE3_YOLO_WORLD_PROMPTS = (
     "",
 )
 SCENE3_YOLO_CLASS_ALIASES = {
+    "smt_tray_upper": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "smt tray upper": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "upper_smt_tray": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "upper smt tray": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "upper_layer_smt_tray": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "upper layer smt tray": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "upper_shelf_smt_tray": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "upper shelf smt tray": SCENE3_YOLO_UPPER_TRAY_CLASS_NAME,
+    "smt_tray_lower": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "smt tray lower": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "lower_smt_tray": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "lower smt tray": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "lower_layer_smt_tray": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "lower layer smt tray": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "lower_shelf_smt_tray": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "lower shelf smt tray": SCENE3_YOLO_LOWER_TRAY_CLASS_NAME,
+    "outbound_area": SCENE3_YOLO_OUTBOUND_CLASS_NAME,
+    "outbound area": SCENE3_YOLO_OUTBOUND_CLASS_NAME,
+    "outbound_target_area": SCENE3_YOLO_OUTBOUND_CLASS_NAME,
+    "outbound target area": SCENE3_YOLO_OUTBOUND_CLASS_NAME,
+    "outbound_square_area": SCENE3_YOLO_OUTBOUND_CLASS_NAME,
+    "outbound square area": SCENE3_YOLO_OUTBOUND_CLASS_NAME,
     "tray": SCENE3_YOLO_CLASS_NAME,
     "charging_tray": SCENE3_YOLO_CLASS_NAME,
     "smt_tray": SCENE3_YOLO_CLASS_NAME,
@@ -422,6 +479,18 @@ SCENE3_BEND_RETRY = 8
 SCENE3_PICK_RETRY_SETTLE_SEC = 1.20
 SCENE3_LIFT_RETRY = 3
 SCENE3_LIFT_RETRY_BACKOFF_X_M = 0.04
+SCENE3_TURN_AROUND_ANGULAR_Z_RADPS = 0.45
+SCENE3_TURN_AROUND_DURATION_SEC = math.pi / SCENE3_TURN_AROUND_ANGULAR_Z_RADPS
+SCENE3_RACK_OUTBOUND_TRAVEL_DURATION_SEC = 3.40
+SCENE3_OUTBOUND_RACK_TRAVEL_DURATION_SEC = 3.40
+SCENE3_OUTBOUND_DETECT_RETRY = 4
+SCENE3_OUTBOUND_DETECT_SETTLE_SEC = 0.25
+SCENE3_DROP_ABOVE_DZ_M = 0.24
+SCENE3_DROP_MIN_Z_BASE_M = 0.38
+SCENE3_DROP_PRE_DZ_M = 0.10
+SCENE3_DROP_RETREAT_DZ_M = 0.20
+SCENE3_DROP_DURATION_SEC = 1.60
+SCENE3_DROP_RELEASE_SETTLE_SEC = 0.60
 SCENE3_IK_INACTIVE_HAND_POS_BASE = {
     "left": (0.30, 0.28, 0.18),
     "right": (0.30, -0.28, 0.18),
@@ -541,6 +610,7 @@ SCENE2_GRASP_OFFSETS_BASE = {
 PLACE_TARGETS_BASE = {
     "scene3": {
         "outbound_box": (0.58, 0.00, 0.22),
+        "outbound_area": (0.58, 0.00, 0.22),
     },
 }
 
@@ -597,6 +667,10 @@ def _fmt_xyz(xyz: Optional[Sequence[float]]) -> str:
 
 def scene3_shelf_name_from_z(z_base: float) -> str:
     return "lower" if float(z_base) < SCENE3_SHELF_SPLIT_Z_M else "upper"
+
+
+def is_scene3_tray_class(class_name: str) -> bool:
+    return class_name in SCENE3_TRAY_CLASS_NAMES
 
 
 def arm_side_sign(arm: str) -> float:
@@ -2030,11 +2104,11 @@ class YoloScene3Perception(YoloWorldPerception):
             device=device,
             conf=conf,
             imgsz=imgsz,
-            class_names=(SCENE3_YOLO_CLASS_NAME,),
+            class_names=SCENE3_YOLO_CLASS_NAMES,
             class_aliases=SCENE3_YOLO_CLASS_ALIASES,
-            target_bins={SCENE3_YOLO_CLASS_NAME: SCENE3_YOLO_TARGET_BIN},
+            target_bins=SCENE3_YOLO_TARGET_BINS,
             world_prompts=SCENE3_YOLO_WORLD_PROMPTS,
-            bin_class_names=(),
+            bin_class_names=(SCENE3_YOLO_OUTBOUND_CLASS_NAME,),
         )
         self.yolo_center_depth_fraction = SCENE3_YOLO_CENTER_DEPTH_FRACTION
 
@@ -2180,7 +2254,7 @@ class Skills:
 
     def scene3_tray_observation(self, target: PerceptionTarget,
                                 arm: str) -> Optional[Scene3TrayObservation]:
-        if self.scene != "scene3" or target.class_name != "smt_tray":
+        if self.scene != "scene3" or not is_scene3_tray_class(target.class_name):
             return None
         if target.position_base is None:
             return None
@@ -2264,7 +2338,7 @@ class Skills:
         requested_xyz = self._grasp_xyz(target)
         xyz = self._reachable_xyz(requested_xyz)
         yaw = float(target.yaw_rad or 0.0)
-        scene3_tray = self.scene == "scene3" and target.class_name == "smt_tray"
+        scene3_tray = self.scene == "scene3" and is_scene3_tray_class(target.class_name)
         if scene3_tray:
             return self._pick_scene3_tray(target, arm, xyz, yaw, start)
 
@@ -2428,7 +2502,7 @@ class Skills:
                 _fmt_xyz(raw_xyz),
             )
             return ActionResult(False, "pick", reason, target, time.time() - start)
-        shelf = scene3_shelf_name_from_z(tray_center_z)
+        shelf = SCENE3_TRAY_CLASS_TO_SHELF.get(target.class_name, scene3_shelf_name_from_z(tray_center_z))
         base_yaw = 0.0 if arm == "left" else math.pi
         pose_candidates = [
             ("front_down", quat_down(base_yaw), 2),
@@ -2851,6 +2925,95 @@ class Skills:
         log_warn(self.scene, "放置", "label=%s 失败: %s", label, reason)
         return ActionResult(False, "place", reason, None, time.time() - start)
 
+    def _scene3_drop_above_candidates(
+        self,
+        place_xyz_base: Sequence[float],
+        arm: str,
+        label: str,
+    ) -> List[Tuple[float, float, float]]:
+        surface_candidates = self._place_candidates(place_xyz_base, arm, label)
+        drop_candidates: List[Tuple[float, float, float]] = []
+        seen = set()
+        for surface in surface_candidates:
+            drop_z = max(
+                float(surface[2]) + SCENE3_DROP_ABOVE_DZ_M,
+                SCENE3_DROP_MIN_Z_BASE_M,
+            )
+            candidate = self._reachable_xyz((surface[0], surface[1], drop_z))
+            key = tuple(round(value, 3) for value in candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            drop_candidates.append(candidate)
+        return drop_candidates
+
+    def drop_above_place(self, arm: str, place_xyz_base: Sequence[float],
+                         label: str = "drop_above") -> ActionResult:
+        start = time.time()
+        arm = self.single_arm(arm, None, "上方释放")
+        candidates = self._scene3_drop_above_candidates(place_xyz_base, arm, label)
+        last_reason = "no drop candidate"
+        for index, drop in enumerate(candidates, start=1):
+            pre = self._reachable_xyz((drop[0], drop[1], drop[2] + SCENE3_DROP_PRE_DZ_M))
+            retreat = self._reachable_xyz((drop[0], drop[1], drop[2] + SCENE3_DROP_RETREAT_DZ_M))
+            log_stage(
+                self.scene,
+                "上方释放",
+                "arm=%s label=%s candidate=#%d/%d drop=%s pre=%s retreat=%s",
+                arm,
+                label,
+                index,
+                len(candidates),
+                _fmt_xyz(drop),
+                _fmt_xyz(pre),
+                _fmt_xyz(retreat),
+            )
+            pre_ok = self.robot.move_hand_ik(
+                arm,
+                pre,
+                duration=SKILL_PLACE_PRE_DURATION_SEC,
+                label=label + "_pre#{}".format(index),
+            )
+            if not pre_ok:
+                last_reason = "drop pre IK failed"
+                self._log_place_failure_detail(
+                    arm, label, "pre", last_reason, index, len(candidates), drop, pre, retreat
+                )
+                continue
+
+            drop_ok = self.robot.move_hand_ik(
+                arm,
+                drop,
+                duration=SCENE3_DROP_DURATION_SEC,
+                label=label + "#{}".format(index),
+            )
+            if not drop_ok:
+                last_reason = "drop IK failed"
+                self._log_place_failure_detail(
+                    arm, label, "drop", last_reason, index, len(candidates), drop, pre, retreat
+                )
+                continue
+
+            self.robot.set_claw(arm, CLAW_OPEN_PERCENT, settle_sec=SCENE3_DROP_RELEASE_SETTLE_SEC)
+            retreat_ok = self.robot.move_hand_ik(
+                arm,
+                retreat,
+                duration=SKILL_PLACE_RETREAT_DURATION_SEC,
+                label=label + "_retreat#{}".format(index),
+            )
+            if not retreat_ok:
+                log_warn(
+                    self.scene,
+                    "上方释放",
+                    "%s 已在目标区上方松爪，但 retreat IK failed，按已释放继续",
+                    label,
+                )
+            return ActionResult(True, "drop_above", "", None, time.time() - start)
+
+        reason = "{} after {} candidates".format(last_reason, len(candidates))
+        log_warn(self.scene, "上方释放", "label=%s 失败: %s", label, reason)
+        return ActionResult(False, "drop_above", reason, None, time.time() - start)
+
     def pick_and_place(
         self,
         target: PerceptionTarget,
@@ -2889,12 +3052,12 @@ class Skills:
         if self.scene == "scene2":
             offset = SCENE2_GRASP_OFFSETS_BASE.get(target.class_name, (0.0, 0.0, 0.0))
             xyz = [float(xyz[i]) + float(offset[i]) for i in range(3)]
-        elif self.scene == "scene3" and target.class_name == "smt_tray":
+        elif self.scene == "scene3" and is_scene3_tray_class(target.class_name):
             xyz = [float(xyz[i]) + float(SCENE3_TRAY_GRASP_OFFSET_BASE[i]) for i in range(3)]
         return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
 
     def _close_percent(self, class_name: str) -> float:
-        if class_name == "smt_tray":
+        if is_scene3_tray_class(class_name):
             return SCENE3_CLAW_CLOSE_PERCENT
         if class_name == "part_type_c":
             return 82.0
@@ -3324,115 +3487,230 @@ class Scene3Controller(BaseSceneController):
         start = time.time()
         if not self.wait_for_perception():
             return ActionResult(False, "scene3", "sensor not ready", duration_sec=time.time() - start)
-        outbound_xyz = self.resolve_outbound_place()
 
-        moved_to_rack = False
         completed = 0
         completed_positions: List[Tuple[float, float, float]] = []
-        max_trays = SCENE_TARGET_LIMIT["scene3"]
-        for index in range(1, max_trays + 1):
-            if not moved_to_rack:
-                self.navigation.drive_for(
-                    linear_x=SCENE3_APPROACH_SPEED_MPS,
-                    duration=SCENE3_INITIAL_APPROACH_DURATION_SEC,
-                    label="approach_smt_rack",
-                )
-                moved_to_rack = True
-                self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+        at_rack_front = False
+        tray_plan = (
+            (SCENE3_YOLO_UPPER_TRAY_CLASS_NAME, "上层料盘"),
+            (SCENE3_YOLO_LOWER_TRAY_CLASS_NAME, "下层料盘"),
+        )
 
-            tray: Optional[PerceptionTarget] = None
-            arm = "right"
-            pick_result: Optional[ActionResult] = None
-            last_pick_result: Optional[ActionResult] = None
-            for attempt in range(1, SCENE3_SIDE_OBSERVE_RETRY + 1):
-                pick_result = None
-                targets = self.detect_reachable_trays(completed_positions)
-                if not targets:
-                    log_warn(self.scene, "检测", "未检测到更多料盘，结束出库循环")
-                    break
-                targets.sort(key=self._tray_sort_key)
-                tray_candidate = targets[0]
-                if self._adjust_base_for_tray_sweet_spot(tray_candidate, attempt):
-                    continue
-
-                log_stage(
-                    self.scene,
-                    "二次定位",
-                    "料盘 #%02d 尝试 #%d/%d：头部近距离复定位 rough=%s",
-                    index,
-                    attempt,
-                    SCENE3_SIDE_OBSERVE_RETRY,
-                    _fmt_xyz(tray_candidate.position_base),
+        for index, (desired_class, level_label) in enumerate(tray_plan, start=1):
+            if not at_rack_front:
+                self._drive_to_rack_front(
+                    from_outbound=index > 1,
+                    label="approach_rack_for_{}".format(desired_class),
                 )
-                tray = self._relocalize_tray_from_head(tray_candidate)
-                if tray is None:
-                    log_warn(
-                        self.scene,
-                        "二次定位",
-                        "料盘 #%02d 尝试 #%d/%d 头部复定位失败，重新检测",
-                        index,
-                        attempt,
-                        SCENE3_SIDE_OBSERVE_RETRY,
-                    )
-                    self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
-                    continue
+                at_rack_front = True
 
-                arm = self.skills.choose_arm(tray)
-                shelf = self._tray_shelf(tray)
-                log_stage(
-                    self.scene,
-                    "流程",
-                    "料盘 #%02d 尝试 #%d/%d shelf=%s 前缘拉出，arm=%s base=%s",
-                    index,
-                    attempt,
-                    SCENE3_SIDE_OBSERVE_RETRY,
-                    shelf,
-                    arm,
-                    _fmt_xyz(tray.position_base),
-                )
-                pick_result = self.skills.pick(tray, arm=arm)
-                pick_result.retry_count = attempt - 1
-                last_pick_result = pick_result
-                if pick_result.ok:
-                    break
+            tray, arm, pick_result = self._detect_and_pick_requested_tray(
+                index=index,
+                desired_class=desired_class,
+                level_label=level_label,
+                completed_positions=completed_positions,
+            )
+            if pick_result is None or not pick_result.ok or tray is None:
+                reason = pick_result.reason if pick_result is not None else "no target after retry"
+                log_warn(self.scene, "失败", "%s 抓取失败: %s，继续尝试后续目标", level_label, reason)
+                continue
 
-                log_warn(
-                    self.scene,
-                    "抓取",
-                    "料盘 #%02d 尝试 #%d/%d 前缘拉出失败: %s",
-                    index,
-                    attempt,
-                    SCENE3_SIDE_OBSERVE_RETRY,
-                    pick_result.reason,
-                )
+            self._turn_around("turn_to_outbound_after_{}".format(desired_class))
+            at_rack_front = False
+            self._drive_to_outbound_front(label="move_to_outbound_for_{}".format(desired_class))
+            outbound_xyz = self.resolve_outbound_place()
+            place_result = self.skills.drop_above_place(
+                arm,
+                outbound_xyz,
+                label="{}_drop_above_outbound".format(desired_class),
+            )
+            if not place_result.ok:
+                log_warn(self.scene, "失败", "%s 上方释放失败: %s", level_label, place_result.reason)
                 self.robot.open_claw(arm)
                 self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
-                self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                if index < len(tray_plan):
+                    self._turn_around("turn_back_to_rack_after_failed_drop_{}".format(desired_class))
+                    self._drive_to_rack_front(
+                        from_outbound=True,
+                        label="return_to_rack_after_failed_drop",
+                    )
+                    at_rack_front = True
+                continue
 
-            if pick_result is None or not pick_result.ok or tray is None:
-                reason = (
-                    pick_result.reason
-                    if pick_result is not None
-                    else last_pick_result.reason if last_pick_result is not None
-                    else "no target after retry"
-                )
-                log_warn(self.scene, "失败", "料盘 #%02d 抓取失败: %s", index, reason)
-                break
-
-            self.navigation.drive_for(linear_x=-0.16, duration=3.4, label="return_to_outbound_box")
-            moved_to_rack = False
-            place_result = self.skills.place(arm, outbound_xyz, label="tray{}_outbound".format(index))
-            if not place_result.ok:
-                log_warn(self.scene, "失败", "料盘 #%02d 放置失败: %s", index, place_result.reason)
-                break
+            self.robot.open_claw("both")
+            self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
             if tray.position_base is not None:
                 completed_positions.append(tray.position_base)
             completed += 1
+
+            if index < len(tray_plan):
+                self._turn_around("turn_back_to_rack_after_{}".format(desired_class))
+                self._drive_to_rack_front(
+                    from_outbound=True,
+                    label="return_to_rack_for_next_tray",
+                )
+                at_rack_front = True
 
         if completed == 0:
             return ActionResult(False, "scene3", "no tray moved", duration_sec=time.time() - start)
         return ActionResult(True, "scene3", "moved {} tray(s)".format(completed),
                             duration_sec=time.time() - start)
+
+    def _drive_to_rack_front(self, from_outbound: bool, label: str) -> None:
+        duration = (
+            SCENE3_OUTBOUND_RACK_TRAVEL_DURATION_SEC
+            if from_outbound
+            else SCENE3_INITIAL_APPROACH_DURATION_SEC
+        )
+        log_stage(
+            self.scene,
+            "导航",
+            "%s 前往货架前 from_outbound=%s duration=%.2fs",
+            label,
+            from_outbound,
+            duration,
+        )
+        self.navigation.drive_for(
+            linear_x=SCENE3_APPROACH_SPEED_MPS,
+            duration=duration,
+            label=label,
+        )
+        self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+
+    def _drive_to_outbound_front(self, label: str) -> None:
+        log_stage(
+            self.scene,
+            "导航",
+            "%s 回头前往出库区 duration=%.2fs",
+            label,
+            SCENE3_RACK_OUTBOUND_TRAVEL_DURATION_SEC,
+        )
+        self.navigation.drive_for(
+            linear_x=SCENE3_APPROACH_SPEED_MPS,
+            duration=SCENE3_RACK_OUTBOUND_TRAVEL_DURATION_SEC,
+            label=label,
+        )
+        self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+
+    def _turn_around(self, label: str) -> None:
+        log_stage(
+            self.scene,
+            "导航",
+            "%s 原地转半圈 wz=%.2frad/s duration=%.2fs",
+            label,
+            SCENE3_TURN_AROUND_ANGULAR_Z_RADPS,
+            SCENE3_TURN_AROUND_DURATION_SEC,
+        )
+        self.navigation.drive_for(
+            angular_z=SCENE3_TURN_AROUND_ANGULAR_Z_RADPS,
+            duration=SCENE3_TURN_AROUND_DURATION_SEC,
+            label=label,
+        )
+        self.robot.rospy.sleep(SCENE3_APPROACH_SETTLE_SEC)
+
+    def _detect_and_pick_requested_tray(
+        self,
+        index: int,
+        desired_class: str,
+        level_label: str,
+        completed_positions: Sequence[Tuple[float, float, float]],
+    ) -> Tuple[Optional[PerceptionTarget], str, Optional[ActionResult]]:
+        arm = "right"
+        last_pick_result: Optional[ActionResult] = None
+        for attempt in range(1, SCENE3_SIDE_OBSERVE_RETRY + 1):
+            targets = self.detect_reachable_trays(
+                completed_positions,
+                desired_class_name=desired_class,
+            )
+            if not targets:
+                log_warn(
+                    self.scene,
+                    "检测",
+                    "%s 第 %d/%d 轮未检测到可抓候选，等待后重试",
+                    level_label,
+                    attempt,
+                    SCENE3_SIDE_OBSERVE_RETRY,
+                )
+                self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                continue
+
+            targets.sort(key=lambda item: self._tray_sort_key(item, desired_class))
+            tray_candidate = targets[0]
+            if self._adjust_base_for_tray_sweet_spot(tray_candidate, attempt):
+                continue
+
+            log_stage(
+                self.scene,
+                "二次定位",
+                "%s #%02d 尝试 #%d/%d：头部近距离复定位 rough=%s class=%s",
+                level_label,
+                index,
+                attempt,
+                SCENE3_SIDE_OBSERVE_RETRY,
+                _fmt_xyz(tray_candidate.position_base),
+                tray_candidate.class_name,
+            )
+            tray = self._relocalize_tray_from_head(tray_candidate)
+            if tray is None:
+                log_warn(
+                    self.scene,
+                    "二次定位",
+                    "%s #%02d 尝试 #%d/%d 复定位失败，重新检测",
+                    level_label,
+                    index,
+                    attempt,
+                    SCENE3_SIDE_OBSERVE_RETRY,
+                )
+                self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                continue
+            if not self._target_matches_requested_tray(tray, desired_class):
+                log_warn(
+                    self.scene,
+                    "二次定位",
+                    "%s 复定位结果 class=%s shelf=%s 与期望 %s 不符，重新检测",
+                    level_label,
+                    tray.class_name,
+                    self._tray_shelf(tray),
+                    desired_class,
+                )
+                self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+                continue
+
+            arm = self.skills.choose_arm(tray)
+            shelf = self._tray_shelf(tray)
+            log_stage(
+                self.scene,
+                "流程",
+                "%s #%02d 尝试 #%d/%d shelf=%s 前缘拉出，arm=%s base=%s",
+                level_label,
+                index,
+                attempt,
+                SCENE3_SIDE_OBSERVE_RETRY,
+                shelf,
+                arm,
+                _fmt_xyz(tray.position_base),
+            )
+            pick_result = self.skills.pick(tray, arm=arm)
+            pick_result.retry_count = attempt - 1
+            last_pick_result = pick_result
+            if pick_result.ok:
+                return tray, arm, pick_result
+
+            log_warn(
+                self.scene,
+                "抓取",
+                "%s #%02d 尝试 #%d/%d 前缘拉出失败: %s",
+                level_label,
+                index,
+                attempt,
+                SCENE3_SIDE_OBSERVE_RETRY,
+                pick_result.reason,
+            )
+            self.robot.open_claw(arm)
+            self.robot.set_arm_mode(ARM_MODE_AUTO_SWING, warn_only=True)
+            self.robot.rospy.sleep(SCENE3_PICK_RETRY_SETTLE_SEC)
+
+        return None, arm, last_pick_result
 
     def _adjust_base_for_tray_sweet_spot(self, tray: PerceptionTarget, attempt: int) -> bool:
         if tray.position_base is None:
@@ -3535,7 +3813,7 @@ class Scene3Controller(BaseSceneController):
                 _fmt_xyz(rough.position_base),
             )
             candidates = self.perception.detect_targets(
-                class_names=["smt_tray"],
+                class_names=self._relocalize_class_names(rough),
                 cameras=[observation.camera],
                 max_targets=None,
             )
@@ -3543,6 +3821,15 @@ class Scene3Controller(BaseSceneController):
             usable: List[PerceptionTarget] = []
             rejected: List[Tuple[PerceptionTarget, str]] = []
             for candidate in candidates:
+                if not self._target_matches_relocalized_level(candidate, rough):
+                    rejected.append((
+                        candidate,
+                        "class/shelf mismatch from rough target {} -> {}".format(
+                            rough.class_name,
+                            candidate.class_name,
+                        ),
+                    ))
+                    continue
                 if candidate.position_base is None:
                     reason = self._target_reject_reason(candidate) or "no base_link position"
                     rejected.append((candidate, reason))
@@ -3643,20 +3930,52 @@ class Scene3Controller(BaseSceneController):
         )
         return None
 
-    def detect_reachable_trays(self, completed_positions: Sequence[Tuple[float, float, float]]) -> List[PerceptionTarget]:
+    def _relocalize_class_names(self, rough: PerceptionTarget) -> List[str]:
+        if rough.class_name in SCENE3_ORDERED_TRAY_CLASS_NAMES:
+            return [rough.class_name, SCENE3_YOLO_CLASS_NAME]
+        return list(SCENE3_TRAY_CLASS_NAMES)
+
+    def _target_matches_relocalized_level(self, candidate: PerceptionTarget,
+                                          rough: PerceptionTarget) -> bool:
+        if rough.class_name in SCENE3_ORDERED_TRAY_CLASS_NAMES:
+            return self._target_matches_requested_tray(candidate, rough.class_name)
+        return is_scene3_tray_class(candidate.class_name)
+
+    def _target_matches_requested_tray(self, target: PerceptionTarget,
+                                       desired_class_name: Optional[str]) -> bool:
+        if desired_class_name is None:
+            return is_scene3_tray_class(target.class_name)
+        if target.class_name == desired_class_name:
+            return True
+        if target.class_name == SCENE3_YOLO_CLASS_NAME:
+            desired_shelf = SCENE3_TRAY_CLASS_TO_SHELF.get(desired_class_name)
+            return desired_shelf is not None and self._tray_shelf(target) == desired_shelf
+        return False
+
+    def detect_reachable_trays(
+        self,
+        completed_positions: Sequence[Tuple[float, float, float]],
+        desired_class_name: Optional[str] = None,
+    ) -> List[PerceptionTarget]:
         miss_count = 0
         attempt = 0
         approach_count = 0
+        detect_classes = (
+            [desired_class_name, SCENE3_YOLO_CLASS_NAME]
+            if desired_class_name in SCENE3_ORDERED_TRAY_CLASS_NAMES
+            else list(SCENE3_TRAY_CLASS_NAMES)
+        )
         while not self.robot.rospy.is_shutdown() and attempt < SCENE3_APPROACH_RETRY:
             attempt += 1
             raw_targets = self.perception.detect_targets(
-                class_names=["smt_tray"],
+                class_names=detect_classes,
                 cameras=["head"],
                 max_targets=None,
             )
             raw_targets = [
                 target for target in raw_targets
                 if not self._is_near_completed_position(target, completed_positions)
+                and self._target_matches_requested_tray(target, desired_class_name)
             ]
             log_target_list(self.scene, "检测", raw_targets)
 
@@ -3756,18 +4075,71 @@ class Scene3Controller(BaseSceneController):
                 return True
         return False
 
-    def _tray_sort_key(self, target: PerceptionTarget) -> Tuple[int, float, float, float]:
+    def _tray_sort_key(
+        self,
+        target: PerceptionTarget,
+        desired_class_name: Optional[str] = None,
+    ) -> Tuple[int, int, float, float, float]:
         xyz = target.position_base or (99.0, 99.0, 99.0)
-        shelf_priority = 0 if self._tray_shelf(target) == "lower" else 1
-        return (shelf_priority, abs(float(xyz[1])), float(xyz[0]), -float(target.confidence))
+        exact_priority = 0 if desired_class_name is not None and target.class_name == desired_class_name else 1
+        shelf_priority = 0 if self._tray_shelf(target) == "upper" else 1
+        return (
+            exact_priority,
+            shelf_priority,
+            abs(float(xyz[1])),
+            float(xyz[0]),
+            -float(target.confidence),
+        )
 
     def _tray_shelf(self, target: PerceptionTarget) -> str:
+        shelf = SCENE3_TRAY_CLASS_TO_SHELF.get(target.class_name)
+        if shelf is not None:
+            return shelf
         xyz = target.position_base or (99.0, 99.0, 99.0)
         return "lower" if float(xyz[2]) < SCENE3_SHELF_SPLIT_Z_M else "upper"
 
     def resolve_outbound_place(self) -> Tuple[float, float, float]:
-        place = PLACE_TARGETS_BASE[self.scene]["outbound_box"]
-        log_stage(self.scene, "目标区", "outbound_box 使用预设出库区 %s", _fmt_xyz(place))
+        best_seen: Optional[PerceptionTarget] = None
+        for attempt in range(1, SCENE3_OUTBOUND_DETECT_RETRY + 1):
+            detected = self.perception.detect_bins(bin_names=[SCENE3_YOLO_OUTBOUND_CLASS_NAME])
+            if detected:
+                best_seen = sorted(detected, key=lambda item: item.confidence, reverse=True)[0]
+            usable = [item for item in detected if item.position_base is not None]
+            if usable:
+                best = sorted(usable, key=lambda item: item.confidence, reverse=True)[0]
+                xyz = best.position_base
+                assert xyz is not None
+                place = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + 0.08)
+                log_stage(
+                    self.scene,
+                    "目标区",
+                    "outbound_area 第 %d 次使用 YOLO 检测位置 %s",
+                    attempt,
+                    _fmt_xyz(place),
+                )
+                return place
+            if best_seen is not None:
+                log_warn(
+                    self.scene,
+                    "目标区",
+                    "outbound_area 第 %d/%d 次有候选但缺少 base_link 坐标 depth=%s frame=%s",
+                    attempt,
+                    SCENE3_OUTBOUND_DETECT_RETRY,
+                    best_seen.debug.get("depth_m") if best_seen.debug else None,
+                    best_seen.debug.get("frame_id") if best_seen.debug else None,
+                )
+            else:
+                log_warn(
+                    self.scene,
+                    "目标区",
+                    "outbound_area 第 %d/%d 次未检测到，等待后重试",
+                    attempt,
+                    SCENE3_OUTBOUND_DETECT_RETRY,
+                )
+            self.robot.rospy.sleep(SCENE3_OUTBOUND_DETECT_SETTLE_SEC)
+
+        place = PLACE_TARGETS_BASE[self.scene][SCENE3_YOLO_OUTBOUND_CLASS_NAME]
+        log_warn(self.scene, "目标区", "outbound_area 检测失败，使用公开预设出库区 %s", _fmt_xyz(place))
         return place
 
 

@@ -173,9 +173,9 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --y
 
 执行前会尝试连续检测 4 个零件，并要求连续帧位置变化小于 3cm；未达到稳定时只使用本轮 YOLO-World 最佳检测结果，不启用任何非视觉兜底。
 
-## 场景三 YOLO-World 识别
+## 场景三 YOLO/YOLO-World 识别
 
-场景三使用 Ultralytics YOLO-World 识别 SMT 料盘。YOLO-World 只负责输出料盘检测框，三维位置仍由相机深度图、CameraInfo 和 TF 转换到 `base_link`，不读取仿真真值或禁用接口。出库区使用公开预设放置点；默认按当前赛题规则执行上下层各 1 个料盘，下层优先。
+场景三使用 Ultralytics YOLO/YOLO-World 识别 SMT 料盘和出库区。YOLO 只负责输出检测框，三维位置仍由相机深度图、CameraInfo 和 TF 转换到 `base_link`，不读取仿真真值或禁用接口。默认按“上层料盘 -> 转半圈去出库区 -> 上方松手释放 -> 转半圈回货架 -> 下层料盘 -> 转半圈去出库区 -> 上方松手释放”的流程执行，并对检测、近距离复定位、抓取和出库区定位进行多次尝试。
 
 默认权重路径：
 
@@ -183,7 +183,7 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3 --y
 src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt
 ```
 
-模板中不包含 `.pt` 模型。推荐先用 YOLO-World 零样本方式生成带场景三词表的专用权重；比赛运行时直接加载 `scene3_smt_tray.pt`，避免现场依赖外网。程序会把 `smt tray`、`smt_tray`、`tray`、`charging_tray`、`electronics_tray`、`component_tray`、`plastic_tray` 等输出统一映射为 `smt_tray`。
+模板中不包含 `.pt` 模型。当前推荐在官方 Docker 内训练或放置标准 YOLO 权重，默认路径为 `/root/kuavo_ws/src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt`。标准模型类别应与数据集一致：`smt_tray_upper`、`smt_tray_lower`、`outbound_area`。如果临时使用 YOLO-World 权重，程序会套用对应 prompts，并仍兼容旧的通用 `smt_tray` 料盘输出。
 
 在官方 Docker 容器中安装依赖：
 
@@ -206,6 +206,12 @@ from ultralytics import YOLOWorld
 out = Path("src/challenge_cup_task_template/models/yolo")
 model = YOLOWorld("yolov8s-worldv2.pt")
 model.set_classes([
+    "smt_tray_upper",
+    "upper smt tray",
+    "smt_tray_lower",
+    "lower smt tray",
+    "outbound_area",
+    "outbound area",
     "smt tray",
     "tray",
     "electronics tray",
@@ -221,7 +227,7 @@ PY
 运行示例：
 
 ```bash
-# 默认就是 YOLO-World；模型或依赖不可用时会直接报错并返回无目标
+# 默认加载 scene3_smt_tray.pt；标准 YOLO 或 YOLO-World 权重均可
 rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 
 # 指定专用权重和 GPU，调试初期建议使用较低置信度观察候选
@@ -241,10 +247,10 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3 --y
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--yolo-model` | `src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt` | 场景三 YOLO-World `.pt` 权重路径；也可临时传 `yolov8s-worldv2.pt`。 |
+| `--yolo-model` | `src/challenge_cup_task_template/models/yolo/scene3_smt_tray.pt` | 场景三 YOLO/YOLO-World `.pt` 权重路径；也可临时传 `yolov8s-worldv2.pt`。 |
 | `--yolo-device` | `auto` | 可选 `auto`、`cpu`、`cuda`、`cuda:0`、`cuda:1`。 |
-| `--yolo-conf` | `0.35` | YOLO-World 检测置信度阈值；调试初期可试 `0.20` 到 `0.30`，误检多时提高到 `0.35` 到 `0.45`。 |
-| `--yolo-imgsz` | `640` | YOLO-World 推理输入尺寸。 |
+| `--yolo-conf` | `0.35` | YOLO 检测置信度阈值；调试初期可试 `0.20` 到 `0.30`，误检多时提高到 `0.35` 到 `0.45`。 |
+| `--yolo-imgsz` | `640` | YOLO 推理输入尺寸。 |
 
 ## 比赛计时
 
