@@ -113,9 +113,6 @@ float64[3] right_r6_offset
 ## 运行
 
 ```bash
-cd /home/zwx/ChallengeCup/leju-kuavo-challenge-cup-2026/
-./docker/run_with_gpu_for_challenge.sh
-
 catkin build kuavo_msgs challenge_cup_task_template
 source devel/setup.zsh
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 8
