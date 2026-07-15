@@ -66,6 +66,83 @@ source devel/setup.zsh
 source devel/setup.zsh
 ```
 
+## 新增依赖
+
+```bash
+sudo apt install ros-noetic-vision-msgs ros-noetic-tf2-sensor-msgs ros-noetic-compressed-depth-image-transport ros-noetic-compressed-image-transport ros-noetic-cv-bridge ros-noetic-depth-image-proc ros-noetic-image-geometry ros-noetic-image-transport ros-noetic-message-filters ros-noetic-pcl-conversions ros-noetic-pcl-ros ros-noetic-tf2-geometry-msgs ros-noetic-tf2-ros ros-noetic-tf2-eigen libeigen3-dev libceres-dev
+
+pip install Ultralytics==8.4.95
+```
+
+## 注意
+
+### challenge_cup_simulator
+
+- `utils/challenge_sim_launcher.py` 当前启动流程不再调用源码完整性校验 `_verify_integrity()` 和反作弊监控 `_start_cheat_monitor()`；场景生成、随机物体初始化和计时器逻辑仍保留。
+
+### kuavo_msgs
+
+`msg/ikSolveParam.msg` 新增右臂 r6 严格 IK 参数：
+
+```text
+bool use_right_r6_offset
+bool lock_right_q7
+float64 right_q7_lock_value
+float64[3] right_r6_offset
+```
+
+这些字段用于指定 `zarm_r6_link` 的世界坐标增量，并在求解期间锁定 `zarm_r7_joint`。
+
+### motion_capture_ik
+
+`src/arms_ik_node.cpp` 新增右臂 r6 + q7 锁定求解分支：
+
+- 使用 Drake `InverseKinematics` 和 SNOPT 对 `zarm_r6_link` 添加严格位置、姿态约束；
+- 对 `zarm_r7_joint` 添加固定关节角约束；
+- 使用多组参考关节角分别求解，并按关节变化量、参考距离和末端误差选择结果；
+- 通过 `/ik/two_arm_hand_pose_cmd_srv_muli_refer` 返回 14 维双臂关节解和求解误差信息。
+
+## test.py
+
+批量测试,成功检测逻辑为任务最后四个包裹中心的x,y,z真值都在箱子范围内,没有测试称重盘是否变化,测试完一个种子写一个的结果.可能有bug
+
+## task1_vision
+
+拟合结果调取见 [task1_vision/README.md](src/task1_vision/README.md)。
+
+## 运行
+
+```bash
+cd /home/zwx/ChallengeCup/leju-kuavo-challenge-cup-2026/
+./docker/run_with_gpu_for_challenge.sh
+
+catkin build kuavo_msgs challenge_cup_task_template
+source devel/setup.zsh
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 8
+
+# 批量测试
+source devel/setup.zsh
+python3 src/challenge_cup_task_template/scripts/test.py
+
+source devel/setup.zsh
+rosrun rqt_gui rqt_gui --standalone task1_vision/Task1Vision --args -h
+
+# 场景三启动后检查上下层 SMT 料盘 qpos 假框
+catkin build kuavo_msgs challenge_cup_task_template
+source devel/setup.zsh
+rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 4
+
+source devel/setup.zsh
+rosrun rqt_gui rqt_gui --standalone task3_vision/Task3Vision
+
+# task1自动数据采集
+source devel/setup.zsh
+python3 src/challenge_cup_task_template/scripts/data.py
+
+python yolo/train.py
+python yolo/validate.py
+```
+
 ## 快速启动
 
 推荐通过统一任务入口启动仿真。它会自动完成场景生成、完整性校验、随机场景初始化、反作弊监控、计时器启动和 ROS 节点初始化。

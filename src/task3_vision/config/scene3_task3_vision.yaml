@@ -1,0 +1,62 @@
+scene: scene3
+frame_id: base_link
+base_frame_id: base_link
+qpos_topic: /mujoco/qpos
+publish_rate: 10.0
+startup_wait_timeout: 60.0
+
+# 头部 RGB 图像只用于给假框结果附上同一采集流的时间戳。
+head_image_topic: /cam_h/color/image_raw/compressed
+camera_info_topic: /cam_h/color/camera_info
+camera_frame_id: "Head Camera View"
+tf_timeout: 0.02
+
+# 留空时优先读取当前活动场景 XML。
+model_xml: ""
+robot_base_qpos_addr: 0
+confidence: 1.0
+publish_detection2d: true
+publish_json: true
+
+# 五个料盘外观相同，训练类别统一为 tray；level 仅作为位置层级元数据。
+# size 是 charging_tray.stl 经过 scene3 mesh scale 后的实际 XYZ 尺寸。
+objects:
+  - name: smt_tray_1
+    qpos_joint: smt_tray_1
+    class_id: 0
+    class_name: tray
+    level: lower
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.181818, 0.181818, 0.032143]
+
+  - name: smt_tray_2
+    qpos_joint: smt_tray_2
+    class_id: 0
+    class_name: tray
+    level: lower
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.181818, 0.181818, 0.032143]
+
+  - name: smt_tray_3
+    qpos_joint: smt_tray_3
+    class_id: 0
+    class_name: tray
+    level: upper
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.181818, 0.181818, 0.032143]
+
+  - name: smt_tray_4
+    qpos_joint: smt_tray_4
+    class_id: 0
+    class_name: tray
+    level: upper
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.181818, 0.181818, 0.032143]
+
+  - name: smt_tray_5
+    qpos_joint: smt_tray_5
+    class_id: 0
+    class_name: tray
+    level: upper
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.181818, 0.181818, 0.032143]

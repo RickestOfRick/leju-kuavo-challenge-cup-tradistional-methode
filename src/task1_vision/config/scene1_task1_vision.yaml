@@ -1,0 +1,131 @@
+# 任务一视觉模式由 launch 的 vision_mode 覆盖：0=qpos 假框，1=YOLO 部署框。
+vision_mode: 0
+scene: scene1
+frame_id: base_link
+truth_frame_id: world
+output_frame_id: base_link
+base_frame_id: base_link
+qpos_topic: /mujoco/qpos
+publish_rate: 10.0
+startup_wait_timeout: 60.0
+
+# 头部 RGB-D 输入与坐标变换。
+head_image_topic: /cam_h/color/image_raw/compressed
+head_image_type: compressed
+camera_info_topic: /cam_h/color/camera_info
+depth_image_topic: /cam_h/depth/image_raw/compressedDepth
+depth_image_type: compressedDepth
+camera_frame_id: "Head Camera View"
+require_camera_tf: true
+tf_timeout: 0.02
+
+# 模式 1 的单类别包裹 YOLO 推理参数。相对路径以 task1_vision 包根目录为准。
+yolo_model_path: models/parcel_best.pt
+yolo_confidence_threshold: 0.25
+yolo_iou_threshold: 0.70
+yolo_image_size: 960
+yolo_class_id: 0
+yolo_device: ""
+yolo_half: false
+# 动作模块完成 10 帧中值后停止 YOLO，并持续发布锁定结果供 RQT 显示。
+yolo_freeze_after_used_objects: true
+used_objects_topic: /task1_vision/used_objects_json
+
+# 模式 0 使用 qpos 生成假框；模式 1 中 qpos 只用于仿真误差显示。
+model_xml: ""
+robot_base_qpos_addr: 0
+mujoco_head_camera_pos: [0.121, 0.0, 0.0345]
+mujoco_head_camera_quat_wxyz: [0.612372, 0.353553, -0.353553, -0.612372]
+
+# 头部相机初始姿态。
+head_control:
+  enabled: true
+  yaw_deg: 0.0
+  pitch_deg: 8.0
+  topic: /robot_head_motion_data
+  repeats: 5
+  interval: 0.1
+  settle_time: 0.8
+  wait_timeout: 3.0
+  wait_for_subscriber: true
+  strict: false
+  sensors_topic: /sensors_data_raw
+  actual_yaw_index: -2
+  actual_pitch_index: -1
+  actual_wait_timeout: 1.0
+
+# qpos 二维框内的深度点云与 RGB 颜色过滤。
+depth_min_m: 0.05
+depth_max_m: 4.0
+depth_roi_expand: 1.05
+depth_roi_stride: 1
+depth_min_points: 40
+depth_color_filter_enabled: true
+depth_color_min_points: 40
+depth_color_target_chroma_threshold: 0.24
+depth_color_target_rgb_threshold: 0.45
+depth_color_reject_table_for_parcels: true
+depth_table_color_rgba: [0.10, 0.30, 0.10, 1.0]
+depth_color_table_chroma_threshold: 0.18
+depth_color_min_value: 0.05
+depth_color_morphology: true
+depth_foreground_filter: false
+depth_front_percentile: 8.0
+depth_front_margin_m: 0.10
+
+# 点云主簇、RANSAC 顶面和已知尺寸中心恢复。
+depth_cluster_enabled: true
+depth_cluster_tolerance_m: 0.015
+depth_cluster_min_points: 30
+depth_cluster_max_points: 7000
+top_plane_ransac_iterations: 250
+top_plane_ransac_distance_threshold_m: 0.004
+top_plane_ransac_max_tilt_deg: 12.0
+top_plane_ransac_min_inliers: 30
+top_plane_ransac_min_inlier_ratio: 0.08
+top_plane_ransac_max_sample_points: 5000
+top_plane_ransac_seed: 42
+top_plane_xy_low_percentile: 5.0
+top_plane_xy_high_percentile: 95.0
+top_plane_yaw_candidates_deg: [0.0, 90.0]
+top_plane_yaw_search_step_deg: 15.0
+
+confidence: 1.0
+publish_detection2d: true
+publish_detection3d: true
+publish_markers: true
+publish_json: true
+
+# 当前任务只检测四个包裹，不发布称重区和收纳箱。
+objects:
+  - name: parcel_1
+    class_id: 0
+    class_name: parcel
+    qpos_joint: parcel_1
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.045, 0.120, 0.100]
+    color_rgba: [0.88, 0.84, 0.73, 0.55]
+
+  - name: parcel_2
+    class_id: 0
+    class_name: parcel
+    qpos_joint: parcel_2
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.045, 0.120, 0.100]
+    color_rgba: [0.92, 0.78, 0.38, 0.55]
+
+  - name: parcel_3
+    class_id: 0
+    class_name: parcel
+    qpos_joint: parcel_3
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.045, 0.120, 0.100]
+    color_rgba: [0.90, 0.55, 0.28, 0.55]
+
+  - name: parcel_4
+    class_id: 0
+    class_name: parcel
+    qpos_joint: parcel_4
+    center_offset: [0.0, 0.0, 0.0]
+    size: [0.045, 0.120, 0.100]
+    color_rgba: [0.78, 0.84, 0.92, 0.55]

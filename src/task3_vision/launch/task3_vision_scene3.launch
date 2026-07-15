@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="start_rqt" default="false"/>
+  <arg name="config" default="$(find task3_vision)/config/scene3_task3_vision.yaml"/>
+
+  <node name="task3_vision" pkg="task3_vision" type="task3_vision_node.py" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+  </node>
+
+  <node if="$(arg start_rqt)"
+        name="task3_vision_rqt"
+        pkg="rqt_gui"
+        type="rqt_gui"
+        args="--standalone task3_vision/Task3Vision"
+        output="screen"/>
+</launch>

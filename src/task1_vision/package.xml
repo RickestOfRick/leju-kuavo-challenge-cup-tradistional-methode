@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>task1_vision</name>
+  <version>0.0.1</version>
+  <description>任务一 qpos/YOLO 二维框与 RGB-D RANSAC 顶面拟合视觉功能包。</description>
+  <maintainer email="zwx@example.com">zwx</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>kuavo_msgs</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>compressed_depth_image_transport</build_depend>
+  <build_depend>tf2_ros</build_depend>
+  <build_depend>vision_msgs</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>kuavo_msgs</exec_depend>
+  <exec_depend>compressed_depth_image_transport</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>vision_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>rqt_gui</exec_depend>
+  <exec_depend>rqt_gui_py</exec_depend>
+  <exec_depend>python_qt_binding</exec_depend>
+
+  <export>
+    <rqt_gui plugin="${prefix}/plugin.xml"/>
+  </export>
+</package>

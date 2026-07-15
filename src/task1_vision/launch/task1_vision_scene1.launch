@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="start_rqt" default="false"/>
+  <arg name="rqt_camera" default="-h"/>
+  <arg name="vision_mode" default="0"/>
+  <arg name="config" default="$(find task1_vision)/config/scene1_task1_vision.yaml"/>
+
+  <node name="task1_vision" pkg="task1_vision" type="task1_vision_node.py" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="vision_mode" value="$(arg vision_mode)"/>
+  </node>
+
+  <node if="$(arg start_rqt)"
+        name="task1_vision_rqt"
+        pkg="rqt_gui"
+        type="rqt_gui"
+        args="--standalone task1_vision/Task1Vision --args $(arg rqt_camera)"
+        output="screen"/>
+</launch>

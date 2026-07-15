@@ -25,9 +25,12 @@
 #include "drake/systems/framework/leaf_system.h"
 #include "drake/multibody/plant/multibody_plant.h"
 #include "drake/multibody/parsing/parser.h"
+#include "drake/multibody/inverse_kinematics/inverse_kinematics.h"
 #include "drake/geometry/scene_graph.h"
 #include "drake/geometry/drake_visualizer.h"
 #include "drake/multibody/tree/revolute_joint.h"
+#include "drake/solvers/snopt_solver.h"
+#include "drake/solvers/solve.h"
 #include "drake/lcm/drake_lcm.h"
 #include <drake/systems/lcm/lcm_interface_system.h>
 #include "drake/systems/lcm/lcm_publisher_system.h"
@@ -698,6 +701,113 @@ class ArmsIKNode
             return user_q0;
         }
 
+        bool solveRightR6StrictWithLockedQ7(
+            const Eigen::Vector3d& left_pos,
+            const Eigen::Quaterniond& left_quat,
+            const Eigen::Vector3d& right_r6_pos,
+            const Eigen::Quaterniond& right_r6_quat,
+            const Eigen::VectorXd& reference_q,
+            double right_q7_lock_value,
+            Eigen::VectorXd& q,
+            double& position_error_mm,
+            double& orientation_error_deg)
+        {
+            if (reference_q.size() != plant_ptr_->num_positions())
+                return false;
+
+            try
+            {
+                const auto& right_q7_joint =
+                    plant_ptr_->GetJointByName<drake::multibody::RevoluteJoint>(
+                        "zarm_r7_joint");
+                const int right_q7_index = right_q7_joint.position_start();
+                if (right_q7_index < 0 || right_q7_index >= reference_q.size())
+                    return false;
+
+                Eigen::VectorXd initial_guess = reference_q;
+                initial_guess[right_q7_index] = right_q7_lock_value;
+
+                drake::multibody::InverseKinematics ik(*plant_ptr_, true);
+                const auto& world = plant_ptr_->world_frame();
+                const auto& left_eef = plant_ptr_->GetFrameByName(end_frames_name_[1]);
+                const auto& right_r6 = plant_ptr_->GetFrameByName("zarm_r6_link");
+                const double pos_tol = std::max(1e-6, ik_solve_params_.pos_constraint_tol);
+                const double ori_tol =
+                    std::max(1e-6, ik_solve_params_.oritation_constraint_tol);
+
+                auto addStrictPose = [&](const drake::multibody::Frame<double>& frame,
+                                         const Eigen::Vector3d& position,
+                                         const Eigen::Quaterniond& quaternion)
+                {
+                    ik.AddPositionConstraint(
+                        frame,
+                        Eigen::Vector3d::Zero(),
+                        world,
+                        position - pos_tol * Eigen::Vector3d::Ones(),
+                        position + pos_tol * Eigen::Vector3d::Ones());
+                    ik.AddOrientationConstraint(
+                        world,
+                        drake::math::RotationMatrix<double>(quaternion.normalized()),
+                        frame,
+                        drake::math::RotationMatrix<double>::Identity(),
+                        ori_tol);
+                };
+
+                addStrictPose(left_eef, left_pos, left_quat);
+                addStrictPose(right_r6, right_r6_pos, right_r6_quat);
+
+                const Eigen::VectorXd q7_bound =
+                    Eigen::VectorXd::Constant(1, right_q7_lock_value);
+                ik.get_mutable_prog()->AddBoundingBoxConstraint(
+                    q7_bound,
+                    q7_bound,
+                    ik.q().segment(right_q7_index, 1));
+
+                const Eigen::MatrixXd reference_weight =
+                    1e-4 * Eigen::MatrixXd::Identity(
+                        initial_guess.size(), initial_guess.size());
+                ik.get_mutable_prog()->AddQuadraticErrorCost(
+                    reference_weight, initial_guess, ik.q());
+
+                drake::solvers::SnoptSolver snopt;
+                const auto solver_id = snopt.solver_id();
+                ik.get_mutable_prog()->SetSolverOption(
+                    solver_id,
+                    "Major Optimality Tolerance",
+                    ik_solve_params_.major_optimality_tol);
+                ik.get_mutable_prog()->SetSolverOption(
+                    solver_id,
+                    "Major Feasibility Tolerance",
+                    ik_solve_params_.major_feasibility_tol);
+                ik.get_mutable_prog()->SetSolverOption(
+                    solver_id,
+                    "Minor Feasibility Tolerance",
+                    ik_solve_params_.minor_feasibility_tol);
+                ik.get_mutable_prog()->SetSolverOption(
+                    solver_id,
+                    "Major Iterations Limit",
+                    static_cast<int>(ik_solve_params_.major_iterations_limit));
+
+                const auto result = drake::solvers::Solve(ik.prog(), initial_guess);
+                if (!result.is_success())
+                    return false;
+
+                q = result.GetSolution(ik.q());
+                plant_ptr_->SetPositions(plant_context_ptr_, q);
+                const auto solved_pose = right_r6.CalcPoseInWorld(*plant_context_ptr_);
+                position_error_mm =
+                    1000.0 * (solved_pose.translation() - right_r6_pos).norm();
+                orientation_error_deg = quatAngleDeg(
+                    right_r6_quat, solved_pose.rotation().ToQuaternion());
+                return true;
+            }
+            catch (const std::exception& e)
+            {
+                ROS_WARN_STREAM("Strict right-r6 IK exception: " << e.what());
+                return false;
+            }
+        }
+
         void sensor_data_raw_callback(const kuavo_msgs::sensorsData::ConstPtr& msg)
         {
             if (has_waist_joint_ && waist_joint_index_ >= 0 && 
@@ -1044,6 +1154,149 @@ class ArmsIKNode
                     const double a_right_ori_error_deg = quatAngleDeg(pose_vec[2].first, a_right_quat);
                     maybeAddSeed("analytic", q_seed, a_left_pos_error, a_right_pos_error, a_left_ori_error_deg, a_right_ori_error_deg);
                 }
+            }
+
+            const bool use_right_r6_offset =
+                cmd.use_custom_ik_param && cmd.ik_param.use_right_r6_offset;
+            if (use_right_r6_offset)
+            {
+                res.success = false;
+                res.with_torso = false;
+                if (!cmd.ik_param.lock_right_q7)
+                {
+                    res.error_reason = "right-r6 strict IK requires lock_right_q7=true";
+                    return true;
+                }
+                if (user_q0.size() != nq || !user_q0.allFinite())
+                {
+                    res.error_reason = "right-r6 strict IK requires a valid user q0";
+                    return true;
+                }
+
+                const auto& right_r6 = plant_ptr_->GetFrameByName("zarm_r6_link");
+                plant_ptr_->SetPositions(plant_context_ptr_, user_q0);
+                const auto current_r6_pose =
+                    right_r6.CalcPoseInWorld(*plant_context_ptr_);
+                Eigen::Vector3d target_r6_pos = current_r6_pose.translation();
+                const Eigen::Vector3d right_r6_offset(
+                    cmd.ik_param.right_r6_offset[0],
+                    cmd.ik_param.right_r6_offset[1],
+                    cmd.ik_param.right_r6_offset[2]);
+                target_r6_pos += right_r6_offset;
+                const Eigen::Quaterniond target_r6_quat =
+                    current_r6_pose.rotation().ToQuaternion();
+
+                double best_score = std::numeric_limits<double>::infinity();
+                double best_position_error_mm = std::numeric_limits<double>::infinity();
+                double best_orientation_error_deg = std::numeric_limits<double>::infinity();
+                double best_max_arm_joint_delta_rad =
+                    std::numeric_limits<double>::infinity();
+                double best_max_right_joint_delta_rad =
+                    std::numeric_limits<double>::infinity();
+                std::string best_reference;
+                Eigen::VectorXd best_q;
+
+                for (size_t i = 0; i < reference_q_list.size(); ++i)
+                {
+                    Eigen::VectorXd candidate_q;
+                    double position_error_mm = std::numeric_limits<double>::infinity();
+                    double orientation_error_deg = std::numeric_limits<double>::infinity();
+                    if (!solveRightR6StrictWithLockedQ7(
+                            left_pos,
+                            left_quat,
+                            target_r6_pos,
+                            target_r6_quat,
+                            reference_q_list[i],
+                            cmd.ik_param.right_q7_lock_value,
+                            candidate_q,
+                            position_error_mm,
+                            orientation_error_deg))
+                    {
+                        continue;
+                    }
+
+                    const double seed_distance = (candidate_q - user_q0).norm();
+                    const int arm_start =
+                        candidate_q.size() - 2 * single_arm_num_;
+                    const int right_arm_start =
+                        candidate_q.size() - single_arm_num_;
+                    const double max_arm_joint_delta_rad =
+                        (candidate_q.segment(arm_start, 2 * single_arm_num_) -
+                         user_q0.segment(arm_start, 2 * single_arm_num_))
+                            .cwiseAbs()
+                            .maxCoeff();
+                    const double max_right_joint_delta_rad =
+                        (candidate_q.segment(right_arm_start, single_arm_num_) -
+                         user_q0.segment(right_arm_start, single_arm_num_))
+                            .cwiseAbs()
+                            .maxCoeff();
+                    const double score =
+                        max_arm_joint_delta_rad +
+                        1e-2 * max_right_joint_delta_rad +
+                        1e-3 * seed_distance +
+                        1e-4 * (position_error_mm + orientation_error_deg);
+                    if (print_ik_info_)
+                    {
+                        ROS_INFO_STREAM(
+                            "[right-r6 strict candidate] reference=" << reference_names[i]
+                            << " pos_err=" << position_error_mm << " mm"
+                            << " ori_err=" << orientation_error_deg << " deg"
+                            << " q_distance=" << seed_distance
+                            << " max_arm_delta="
+                            << max_arm_joint_delta_rad * 180.0 / M_PI << " deg"
+                            << " max_right_delta="
+                            << max_right_joint_delta_rad * 180.0 / M_PI << " deg");
+                    }
+                    if (score < best_score)
+                    {
+                        best_score = score;
+                        best_position_error_mm = position_error_mm;
+                        best_orientation_error_deg = orientation_error_deg;
+                        best_max_arm_joint_delta_rad = max_arm_joint_delta_rad;
+                        best_max_right_joint_delta_rad = max_right_joint_delta_rad;
+                        best_reference = reference_names[i];
+                        best_q = candidate_q;
+                    }
+                }
+
+                std::chrono::duration<double, std::milli> elapsed =
+                    std::chrono::high_resolution_clock::now() - start;
+                res.time_cost = elapsed.count();
+                if (best_q.size() != nq)
+                {
+                    res.error_reason = "right-r6 strict IK failed with all references";
+                    return true;
+                }
+
+                const auto& right_q7_joint =
+                    plant_ptr_->GetJointByName<drake::multibody::RevoluteJoint>(
+                        "zarm_r7_joint");
+                const int right_q7_index = right_q7_joint.position_start();
+                res.success = true;
+                res.error_reason = "right-r6 strict IK success (reference: " +
+                    best_reference + ")";
+                q0_ = best_q;
+                const int start_idx = best_q.size() - 2 * single_arm_num_;
+                res.q_arm.resize(2 * single_arm_num_);
+                for (int j = 0; j < 2 * single_arm_num_; ++j)
+                    res.q_arm[j] = best_q[start_idx + j];
+                res.hand_poses = publish_ik_result_info(best_q);
+
+                ROS_INFO_STREAM(
+                    "Strict right-r6 IK success: current="
+                    << current_r6_pose.translation().transpose()
+                    << ", target=" << target_r6_pos.transpose()
+                    << ", offset=" << right_r6_offset.transpose()
+                    << ", pos_err=" << best_position_error_mm << " mm"
+                    << ", ori_err=" << best_orientation_error_deg << " deg"
+                    << ", max_arm_delta="
+                    << best_max_arm_joint_delta_rad * 180.0 / M_PI << " deg"
+                    << ", max_right_delta="
+                    << best_max_right_joint_delta_rad * 180.0 / M_PI << " deg"
+                    << ", q7=" << best_q[right_q7_index]
+                    << " rad (locked=" << cmd.ik_param.right_q7_lock_value << ")"
+                    << ", reference=" << best_reference);
+                return true;
             }
             
             // 尝试每个参考点进行IK求解

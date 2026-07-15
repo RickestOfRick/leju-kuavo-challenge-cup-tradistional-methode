@@ -1,0 +1,140 @@
+{
+  "bbox_source": "qpos_projected_3d_corners",
+  "camera_frame_id": "Head Camera View",
+  "detection_stamp": 1784093276.2433865,
+  "frame_id": "base_link",
+  "head_actual_pitch_deg": 23.50565312291585,
+  "head_actual_yaw_deg": -7.861570432276192e-05,
+  "image": "images/train/seed_00171_view_0.jpg",
+  "image_height": 720,
+  "image_stamp": 1784093276.515268,
+  "image_width": 1280,
+  "label": "labels/train/seed_00171_view_0.txt",
+  "metadata": "metadata/train/seed_00171_view_0.json",
+  "objects": [
+    {
+      "bbox_xywh_pixels": [
+        829.8511397641323,
+        482.8752101920793,
+        71.7283643387077,
+        92.77741099751944
+      ],
+      "bbox_yolo_normalized": [
+        0.6483212029407284,
+        0.6706600141556657,
+        0.056037784639615396,
+        0.12885751527433248
+      ],
+      "class_id": 0,
+      "class_name": "parcel",
+      "label_index": 0,
+      "position_source": "qpos_base_tf_camera_checked",
+      "source_name": "parcel_1",
+      "xyz_base_link": [
+        0.3439366383571459,
+        -0.30644774509802186,
+        -0.05213702301284784
+      ],
+      "xyz_camera": [
+        0.30644764852414336,
+        0.20335410376412863,
+        0.6484840315763724
+      ]
+    },
+    {
+      "bbox_xywh_pixels": [
+        711.1111845133075,
+        483.07611369276435,
+        43.962964079600965,
+        92.81210817866514
+      ],
+      "bbox_yolo_normalized": [
+        0.5555556129010215,
+        0.6709390467955061,
+        0.03434606568718834,
+        0.1289057058037015
+      ],
+      "class_id": 0,
+      "class_name": "parcel",
+      "label_index": 1,
+      "position_source": "qpos_base_tf_camera_checked",
+      "source_name": "parcel_2",
+      "xyz_base_link": [
+        0.3435765206879431,
+        -0.11308159098143564,
+        -0.05205446664862779
+      ],
+      "xyz_camera": [
+        0.11308229299580493,
+        0.20359710298657846,
+        0.6482034088697559
+      ]
+    },
+    {
+      "bbox_xywh_pixels": [
+        794.8393263337161,
+        404.16067841550637,
+        55.87659859396342,
+        82.55594084200635
+      ],
+      "bbox_yolo_normalized": [
+        0.6209682236982157,
+        0.5613342755770921,
+        0.04365359265153401,
+        0.11466102894723096
+      ],
+      "class_id": 0,
+      "class_name": "parcel",
+      "label_index": 2,
+      "position_source": "qpos_base_tf_camera_checked",
+      "source_name": "parcel_3",
+      "xyz_base_link": [
+        0.4932695262173945,
+        -0.2852143753909619,
+        -0.05221173862764718
+      ],
+      "xyz_camera": [
+        0.28521538550387215,
+        0.08335848417018887,
+        0.7373609292716452
+      ]
+    },
+    {
+      "bbox_xywh_pixels": [
+        700.3834064661811,
+        404.4219876384208,
+        36.459101742050734,
+        82.59595895442584
+      ],
+      "bbox_yolo_normalized": [
+        0.547174536301704,
+        0.5616972050533622,
+        0.028483673235977135,
+        0.11471660965892486
+      ],
+      "class_id": 0,
+      "class_name": "parcel",
+      "label_index": 3,
+      "position_source": "qpos_base_tf_camera_checked",
+      "source_name": "parcel_4",
+      "xyz_base_link": [
+        0.4926745004011784,
+        -0.10974677662929572,
+        -0.0521507695371846
+      ],
+      "xyz_camera": [
+        0.10974870307768603,
+        0.08380478763436316,
+        0.7369585091118432
+      ]
+    }
+  ],
+  "pitch_command_deg": 21.798710120371624,
+  "pitch_range_deg": [
+    8.0,
+    24.0
+  ],
+  "seed": 171,
+  "split": "train",
+  "view_index": 0
+}

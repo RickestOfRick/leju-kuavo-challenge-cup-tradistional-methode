@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="start_task1_vision" default="false"/>
+  <arg name="start_rqt" default="false"/>
+
+  <include if="$(arg start_task1_vision)" file="$(find task1_vision)/launch/task1_vision_scene1.launch">
+    <arg name="start_rqt" value="$(arg start_rqt)"/>
+  </include>
+
+  <node name="task1" pkg="task1_pick" type="task1_node.py" output="screen">
+    <param name="task1_vision_topic" value="/task1_vision/objects_json"/>
+    <param name="task1_vision_frame_id" value="base_link"/>
+    <param name="task1_vision_timeout" value="70.0"/>
+    <param name="task1_vision_min_confidence" value="0.0"/>
+    <param name="require_all_parcels" value="true"/>
+    <param name="head_yaw_deg" value="0.0"/>
+    <param name="head_pitch_deg" value="8.0"/>
+    <rosparam param="parcel_names">[parcel_1, parcel_2, parcel_3, parcel_4]</rosparam>
+    <rosparam param="vision_to_ik_offset">[0.0, 0.0, 0.0]</rosparam>
+  </node>
+</launch>

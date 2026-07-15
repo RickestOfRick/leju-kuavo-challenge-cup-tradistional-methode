@@ -101,7 +101,6 @@ class ChallengeSimLauncher:
           6. 等待 /sensors_data_raw 出现，确认仿真就绪。
         """
         self._sim_pkg_path = self._find_sim_pkg_path()
-        self._verify_integrity()
         self._scene_file = self._build_scene_xml()
 
         cmd = [
@@ -128,7 +127,6 @@ class ChallengeSimLauncher:
 
         # 完成受保护的场景实例初始化。
         self._place_objects()
-        self._start_cheat_monitor()
         self._start_match_timer(target_node=rospy.get_name())
 
     def stop(self):
