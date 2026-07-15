@@ -1,0 +1,482 @@
+: 1754461423:0;sudo apt-key del F42ED6FBAB17C654 
+: 1754461428:0;sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys F42ED6FBAB17C654 
+: 1754461434:0;sudo apt update
+: 1754461467:0;sudo apt-get install ros-noetic-geographic-msgs
+: 1765460357:0;wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+: 1765460364:0;apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB 
+: 1765460372:0;echo "deb https://apt.repos.intel.com/openvino/2023 ubuntu20 main" | sudo tee /etc/apt/sources.list.d/intel-openvino-2023.list
+: 1765460378:0;apt update
+: 1765460390:0;apt install openvino-2023.3.0 -y
+: 1765460443:0;sudo apt install nlohmann-json3-dev 
+: 1765460458:0;sudo apt-get install libgeographic-dev
+: 1779097360:0;cd /root/kuavo_ws\
+source /opt/ros/noetic/setup.zsh\
+catkin build challenge_cup_simulator\
+source devel/setup.zsh
+: 1779099551:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch\
+
+: 1779099564:0;source devel/setup.zsh
+: 1779099576:0;echo $ROBOT_VERSION
+: 1779099584:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch\
+
+: 1779099599:0;catkin build humanoid_controllers
+: 1779099720:0;export ROS_PACKAGE_PATH=/root/kuavo_ws/src:$ROS_PACKAGE_PATH\
+roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch
+: 1779099739:0;rm -rf /var/ocs2/kuavo_v52
+: 1779099744:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch\
+
+: 1779170919:0;source devel/setup.zsh
+: 1779170920:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch\
+
+: 1779172961:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779174511:0;source devel/setup.bash
+: 1779174514:0;source devel/setup.zsh
+: 1779174755:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779175945:0;catkin build humanoid_controllers
+: 1779179685:0;source devel/setup.zsh
+: 1779179689:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779183642:0;source devel/setup.zsh
+: 1779183644:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779183675:0;rosservice call /control_robot_leju_claw "data:\
+  name: ['left_claw', 'right_claw']\
+  position: [100, 100]\
+  velocity: [50, 50]\
+  effort: [1.0, 1.0]"
+: 1779186928:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779186953:0;catkin build humanoid_controllers
+: 1779187062:0;source devel/setup.zsh
+: 1779187064:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779188434:0;catkin build humanoid_controllers
+: 1779188449:0;source devel/setup.zsh
+: 1779188451:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779191631:0;source devel/setup.zsh
+: 1779191633:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779191819:0;python3 src/kuavo_sdk/sdk/05_use_head_move/control_robot_head.py
+: 1779192253:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779193208:0;rosservice call /control_robot_leju_claw "data:\
+  name: ['left_claw', 'right_claw']\
+  position: [100, 100]\
+  velocity: [50, 50]\
+  effort: [1.0, 1.0]"
+: 1779282307:0;ls
+: 1779282310:0;source devel/setup.zsh
+: 1779282318:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779282826:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779283596:0;source devel/setup.zsh
+: 1779283599:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779286076:0;source devel/setup.zsh
+: 1779286078:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779698740:0;source devel/setup.zsh
+: 1779698743:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779699872:0;clear
+: 1779699874:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779702121:0;source devel/setup.zsh
+: 1779710026:0;catkin build humanoid_controllers
+: 1779715667:0;source devel/setup.zsh
+: 1779715670:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779716228:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779717031:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779717039:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779719156:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene1\
+
+: 1779719173:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779719637:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch with_mm_ik:=false\
+
+: 1779719648:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779720629:0;catkin build humanoid_controllers
+: 1779720813:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779720824:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch with_mm_ik:=false\
+
+: 1779720829:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779721656:9;catkin build humanoid_controllers
+: 1779721673:0;source devel/setup.zsh
+: 1779721676:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch with_mm_ik:=false\
+
+: 1779721683:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779764655:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch with_mm_ik:=false\
+
+: 1779764663:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779767098:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch with_mm_ik:=false\
+
+: 1779767105:0;source devel/setup.zsh\
+rosrun challenge_cup_simulator arm_keyboard_control.py
+: 1779774139:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch with_mm_ik:=false\
+
+: 1779774161:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779781128:0;rosrun kuavo_sdk arm_keyboard_control.py\
+
+: 1779781146:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779783142:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  urdfFile:=/home/kyxmb/wt/tb/leju-kuavo-challenge-cup-2026/src/kuavo_assets/models/biped_s52/urdf/biped_s52.urdf \\
+  sceneFile:=/home/kyxmb/wt/tb/leju-kuavo-challenge-cup-2026/src/kuavo_assets/models/biped_s52/xml/scene.xml
+: 1779783403:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  urdfFile:=$(rospack find kuavo_assets)/models/biped_s52/urdf/biped_s52.urdf \\
+  sceneFile:=$(rospack find kuavo_assets)/models/biped_s52/xml/scene.xml
+: 1779783461:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779783886:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \
+
+: 1779783897:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779783918:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \
+
+: 1779783924:38;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779783983:0;source ~/.zshrc\
+\
+roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  scene_name:=scene1
+: 1779784000:0;source devel/setup.zsh
+: 1779784014:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  scene_name:=scene1
+: 1779784021:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779784065:0;rm -rf /var/ocs2/kuavo_v52
+: 1779784069:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  scene_name:=scene1
+: 1779784196:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779784687:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  scene_name:=scene1
+: 1779785073:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779786038:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  scene_name:=scene1
+: 1779786046:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779787899:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  scene_name:=scene1
+: 1779787906:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779788883:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779789452:0;python3 src/challenge_cup_simulator/scripts/use_target_control.py
+: 1779789619:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  with_mm_ik:=false \\
+  urdfFile:=$(rospack find kuavo_assets)/models/biped_s52/urdf/biped_s52.urdf \\
+  sceneFile:=$(rospack find kuavo_assets)/models/biped_s52/xml/scene.xml
+: 1779789637:0;python3 src/challenge_cup_simulator/scripts/use_target_control.py
+: 1779790430:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779790746:0;python3 src/challenge_cup_simulator/scripts/use_target_control.py
+: 1779790795:0;python3 src/kuavo_sdk/scripts/keyboard_control/arm_keyboard_control.py
+: 1779790889:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779790843:1198;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch rviz:=true\
+
+: 1779800011:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779804090:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch scene_name:=scene3\
+
+: 1779805361:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779805613:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1779805737:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779806822:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3
+: 1779863740:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779878453:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779884723:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779884782:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779934249:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779934267:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779937946:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779937965:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779940197:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1779940244:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779946616:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1779946638:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779950357:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1779950414:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1779950517:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3
+: 1779956603:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3 rviz:=true
+: 1779956709:0;source devel/setup.zsh
+: 1779956718:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3 
+: 1779956821:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779956859:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3 
+: 1779956864:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779957663:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3 
+: 1779957671:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779957757:658;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3 
+: 1779960117:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779960187:0;catkin build humanoid_controllers
+: 1779960381:0;source devel/setup.zsh
+: 1779960384:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene3 
+: 1779960392:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779961981:0;source devel/setup.zsh
+: 1779961983:0;echo $ROBOT_VERSION
+: 1779962004:0;roslaunch humanoid_controllers load_kuavo_mujoco_sim.launch
+: 1779962416:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1 \\
+  with_estimation:=true \\
+  wbc_frequency:=1000 \\
+  sensor_frequency:=1000
+: 1779962431:0;roslaunch challenge_cup_simulator joy_control_sim.launch
+: 1779963506:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1779963523:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1779963535:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780025218:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1780028387:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780033436:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1780033472:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780034215:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1780034253:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780034310:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1780034441:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780043380:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene1
+: 1780063865:0;source devel/setup.zsh
+: 1780063881:0;rosrun challenge_cup_task_template scene1_express.py
+: 1780063922:0;rosrun challenge_cup_task_template scene1_express.py --seed 3
+: 1780063945:0;rosrun challenge_cup_task_template scene2_sorting.py --seed 3 
+: 1780122373:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780122498:0;python3 src/kuavo_sdk/sdk/05_use_head_move/control_robot_head.py
+: 1780126483:0;rosrun challenge_cup_task_template scene2_sorting.py
+: 1780126807:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780127126:0;[python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780127132:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780128139:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780128156:0;rostopic list | grep cam
+: 1780128331:0;rviz
+: 1780129557:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780129563:0;source devel/setup.zsh
+: 1780129564:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780130128:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780130302:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780130613:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780131433:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780131457:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780131761:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780131934:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780132924:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780133219:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --single-run \\
+  --duration 30
+: 1780133575:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --count 1 \\
+  --duration 20
+: 1780133137:1197;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780134335:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780134645:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --count 1 \\
+  --duration 20
+: 1780134655:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780135235:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780135568:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780136221:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780136443:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780136449:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780136532:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780137976:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780138684:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780138952:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780139062:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780139554:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780139754:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780139823:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --motion-profile safe
+: 1780140161:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780140969:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780142849:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780142863:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780143254:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780143266:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780143329:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780143338:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780144053:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780144218:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780144307:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780144704:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780144754:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780144777:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780145132:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780145140:0;python3 src/challenge_cup_simulator/scripts/arm_keyboard_control.py
+: 1780145168:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780145173:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780145237:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780145425:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780145813:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780145821:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780146245:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780146253:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780146577:0;roslaunch challenge_cup_simulator load_kuavo_mujoco_challenge.launch \\
+  scene_name:=scene2
+: 1780146599:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py \\
+  --use-existing-sim \\
+  --duration 20
+: 1780281073:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 30
+: 1780281088:0;rostopic echo /kuavo_arm_traj
+: 1780281145:0;pkill -f ros
+: 1780281278:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 30
+: 1780281293:0;rostopic echo /kuavo_arm_traj
+: 1780281400:0;rostopic hz /kuavo_arm_traj
+: 1780281478:0;pkill -f ros
+: 1780281704:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 1
+: 1780281775:0;rostopic hz /kuavo_arm_traj
+: 1780281894:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 1
+: 1780282587:0;source devel/setup.zsh
+: 1780282590:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 1
+: 1780282599:0;rostopic hz /cam_h/color/image_raw/compressed\
+
+: 1780284706:0;pkill -f ros
+: 1780284708:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 1
+: 1780285141:0;pkill -f ros
+: 1780285149:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 1
+: 1780288857:0;source devel/setup.zsh
+: 1780288860:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 1
+: 1780289465:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 29
+: 1780285160:16;rostopic hz /sensors_data_raw
+: 1780296384:0;rostopic hz /gripper/command
+: 1780296925:0;pkill -f ros
+: 1780298802:0;python3 src/challenge_cup_simulator/test/collect_scene2_dataset.py --count 29
+: 1780298806:0;rostopic hz /gripper/command
+: 1780298893:0;pkill -f ros
+: 1780301266:0;rosrun challenge_cup_task_template scene1_express.py --seed 3\
+
+: 1783092295:0;pwd
+: 1783092312:0;catkin config -DCMAKE_ASM_COMPILER=/usr/bin/as -DCMAKE_BUILD_TYPE=Release
+: 1783092337:0;source installed/setup.zsh
+: 1783092341:0;ls
+: 1783092370:0;catkin build kuavo_msgs challenge_cup_simulator challenge_cup_task_template humanoid_controllers
+: 1783092940:0;source devel/setup.zsh
+: 1783092954:0;ros2 run
+: 1783092963:0;rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3
+: 1783093045:0;rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3
+: 1783093090:0;rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
+: 1783093184:0;rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3
+: 1783093255:0;rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 0
+: 1783093273:0;rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 5
+: 1783093288:0;rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3
+: 1783093467:0;rostopic hz /gripper/command
+: 1783093479:0;rostopic list | grep cam
+: 1783093567:0;echo $HISTFILE\
+
+: 1783093627:0;cat /root/.zsh_history > zsh_history
+: 1783093662:0;shit
+: 1783093664:0;cat /root/.zsh_history > zsh_history

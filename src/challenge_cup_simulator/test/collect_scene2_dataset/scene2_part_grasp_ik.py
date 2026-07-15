@@ -849,6 +849,18 @@ def _move_arm_ik_once(
         pos_err,
         "%.1fdeg" % math.degrees(quat_err) if quat_err is not None else "n/a",
     )
+    # ── Step 3: quaternion diagnostic ────────────────────────────────
+    if active_quat is not None and actual_quat is not None:
+        runtime.loginfo_cb(
+            "[QUAT_DEBUG] %s %s-hand "
+            "target_q=[%.3f,%.3f,%.3f,%.3f] "
+            "actual_q=[%.3f,%.3f,%.3f,%.3f] "
+            "err=%.1fdeg",
+            label, active_arm,
+            active_quat[0], active_quat[1], active_quat[2], active_quat[3],
+            actual_quat[0], actual_quat[1], actual_quat[2], actual_quat[3],
+            math.degrees(quat_err),
+        )
     return pos_err, quat_err, actual, actual_quat, cmd14
 
 
@@ -979,6 +991,17 @@ def get_object_arm(object_name):
     return auto_arm
 
 
+def get_grasp_offset_world(object_name, active_arm):
+    """零件中心到夹爪抓取点的偏移（世界坐标系）。
+
+    返回 [dx, dy, dz] 可以直接加到任意 world_xyz 上。
+    数据采集管线用 get_object_world_xyz() (GT+offset)，视觉管线调用此函数
+    把 offset 叠加到 YOLO+depth 估计位置。
+    """
+    offset_local = _grasp_offset_local_for_side(object_name, active_arm)
+    return _object_local_offset_to_world(object_name, offset_local)
+
+
 def _run_grasp_sequence(
     runtime: GraspRuntime,
     object_name: str,
@@ -1051,6 +1074,7 @@ def _run_grasp_sequence(
             pos_err,
             runtime.grasp_position_tolerance,
             math.degrees(quat_err),
+            math.degrees(runtime.orientation_tolerance_rad),
         )
 
     runtime.publish_arm_gripper_close_cb(active_arm)
