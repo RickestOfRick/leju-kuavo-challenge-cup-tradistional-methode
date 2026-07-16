@@ -2,13 +2,18 @@
 
 `task2_motion` 将原任务二数采脚本转换为正式任务包，输入统一为 `task2_vision` 发布的 `base_link` 工件位姿。目前使用场景生成器提供的六个工件完整真值。
 
-输入必须包含 `part_type_a_1` 到 `part_type_c_2` 六个完整实例名。`_1/_2` 是场景中的固定对象身份，不按运行时相对位置重新编号。以后替换为 YOLO、深度和 yaw 拟合时，需要先在视觉侧确定完整实例名，并保持 `/task2_vision/objects_json` 的消息结构。
+输入必须包含 `part_type_a_1` 到 `part_type_c_2` 六个 motion 实例名。编号由
+`task2_vision` 根据 `base_link` 下的位置生成：A、B 类从右到左编号，C 类
+从左到右编号。motion 使用该名字选择实例偏置；真值模式另以
+`ground_truth_name` 和顶层 `motion_to_ground_truth` 保存 `.so` 原始实例名，
+从而确保重新编号后仍读取对应真值对象的位置、姿态和 yaw。以后替换为
+YOLO、深度和 yaw 拟合时，应直接输出相同的 motion 空间编号。
 
 ## 模块结构
 
-- `task2_config.py`：所有可调参数，包括局部抓取偏置、交接点、固定放箱关节角、IK、插值和稳定阈值。
+- `task2_config.py`：所有可调参数，包括 base_link 抓取偏置、交接点、固定放箱关节角、IK、插值和稳定阈值。
 - `task2_perception.py`：读取并固定六个 `base_link` 工件位姿。
-- `task2_geometry.py`：计算作业手、局部抓取偏置、窄边方向、抓取姿态和交接目标。
+- `task2_geometry.py`：计算作业手、base_link 抓取偏置、窄边方向、抓取姿态和交接目标。
 - `task2_motion.py`：WBC 控制、软 IK、二分 fallback、关节插值、稳定等待和 FK 误差。
 - `task2_scheduler.py`：依次执行六个工件的抓取、必要的换手和分类放箱。
 - `task2_node.py`：独立运行入口。

@@ -47,9 +47,12 @@ def _parse_object(item):
         orientation = _yaw_quaternion(yaw)
     if not all(math.isfinite(value) for value in position + orientation + [yaw]):
         return None
+    ground_truth_name = str(item.get("ground_truth_name", name))
 
     return {
         "name": name,
+        "motion_name": name,
+        "ground_truth_name": ground_truth_name,
         "class_name": class_name,
         "position": position,
         "orientation": orientation,
@@ -91,6 +94,13 @@ def wait_for_task2_objects():
         last_missing = [name for name in OBJECT_NAMES if name not in parsed]
         if not last_missing:
             rospy.loginfo("task2: fixed %d base_link object poses", len(parsed))
+            for name in OBJECT_NAMES:
+                observation = parsed[name]
+                rospy.loginfo(
+                    "task2: vision naming motion=%s ground_truth=%s",
+                    name,
+                    observation["ground_truth_name"],
+                )
             return parsed
 
     raise RuntimeError(

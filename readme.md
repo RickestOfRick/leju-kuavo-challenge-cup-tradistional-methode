@@ -104,7 +104,12 @@ float64[3] right_r6_offset
 
 ### test.py
 
-批量测试,成功检测逻辑为任务最后四个包裹中心的x,y,z真值都在箱子范围内,没有测试称重盘是否变化,测试完一个种子写一个的结果.可能有bug
+批量测试由 `src/challenge_cup_task_template/scripts/test.py` 顶部的
+`TASK_QUEUE` 配置。程序会先跑完队列中一个任务的全部 seed，再继续下一个任务；
+每个 seed 的结果立即写入 `result.txt`。
+
+- 任务一：四个包裹中心位于分拣箱内部，Z 为相对箱底 `0-25 cm`；不检查称重盘变化。
+- 任务二：A、B、C 类工件分别位于 `sorting_bin_a/b/c`，XY 严格使用箱底实际尺寸，不增加容差，Z 为相对箱底 `0-30 cm`。
 
 ### task1_vision
 
@@ -116,9 +121,8 @@ float64[3] right_r6_offset
 
 ### task2_motion
 
-动作逻辑和任务一一样, 参考系为baselink, 采用ik+q插值+wbc, xyz偏置都是baselink坐标系的偏置(数采原本的偏置是局部坐标系的).目前的问题有不稳定(参数目前只按照seed 1,2,3调的), C类螺丝刀抓取后lift -> release的插值会导致高度减少, 螺丝刀会撞到箱子, 还没落地的解决方案是在路径中间补几个同高度的ik点再q插值
-
-交接的逻辑和参数没有调试过,就用的原本数采的逻辑
+动作逻辑和任务一一样, 参考系为baselink, 采用ik+q插值+wbc, xyz 偏置都是 baselink 坐标系的偏置 (数采原本的偏置是局部坐标系).  
+目前的问题还是有不稳定 (目前根据 seed 1-10 调试的参数), C, B类物件距离过近时可能会相互干扰(seed 4), C类螺丝刀上升和放置的轨迹还可以优化,以及没有测试交接逻辑.
 
 ## 运行
 
@@ -141,7 +145,7 @@ catkin build kuavo_msgs challenge_cup_task_template
 source devel/setup.zsh
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 14
 
-# 批量测试
+# 按 test.py 中 TASK_QUEUE 依次批量测试任务一、任务二
 source devel/setup.zsh
 python3 src/challenge_cup_task_template/scripts/test.py
 

@@ -19,27 +19,55 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_PATH = os.path.abspath(__file__)
 RESULT_FILE = os.path.join(SCRIPT_DIR, "result.txt")
 
-# 0: 原 task1 动作批量测试；1: 运行 data.py 的包裹数据采集批处理。
+# 0: 按任务队列批量测试；1: 运行 data.py 的 task1 包裹数据采集批处理。
 TEST_MODE = 0
 
-SEED_START = 1
-SEED_END = 100
-SCENE = "scene1"
+# 外层按列表顺序执行任务，前一个任务的全部 seed 结束后才进入下一个任务。
+TASK_QUEUE = [
+    {"task": "task1", "scene": "scene1", "seed_start": 1, "seed_end": 100},
+    {"task": "task2", "scene": "scene2", "seed_start": 1, "seed_end": 100},
+]
 
 TIME_LIMIT_SEC = 360.0
 LAUNCH_WAIT_SEC = 180.0
 POST_SUCCESS_WAIT_SEC = 20.0
 POLL_INTERVAL_SEC = 0.25
 WORKER_WATCHDOG_MARGIN_SEC = 90.0
+GEOMETRY_EPS = 1e-9
 
 QPOS_TOPIC = "/mujoco/qpos"
-PARCEL_NAMES = ["parcel_1", "parcel_2", "parcel_3", "parcel_4"]
-BOX_BODY = "sorting_box_0p4_0p3_0p3"
-BOX_FLOOR_GEOM = "sorting_box_0p4_0p3_0p3_floor"
-BOX_INNER_SIZE_XY = [0.40, 0.30]
-BOX_RELATIVE_Z_RANGE = [0.0, 0.25]
+SCENE_SUCCESS_RULES = {
+    "scene1": {
+        "object_to_box": {
+            "parcel_1": "sorting_box_0p4_0p3_0p3",
+            "parcel_2": "sorting_box_0p4_0p3_0p3",
+            "parcel_3": "sorting_box_0p4_0p3_0p3",
+            "parcel_4": "sorting_box_0p4_0p3_0p3",
+        },
+        "box_floor_geoms": {
+            "sorting_box_0p4_0p3_0p3": "sorting_box_0p4_0p3_0p3_floor",
+        },
+        "relative_z_range": [0.0, 0.25],
+    },
+    "scene2": {
+        "object_to_box": {
+            "part_type_a_1": "sorting_bin_a",
+            "part_type_a_2": "sorting_bin_a",
+            "part_type_b_1": "sorting_bin_b",
+            "part_type_b_2": "sorting_bin_b",
+            "part_type_c_1": "sorting_bin_c",
+            "part_type_c_2": "sorting_bin_c",
+        },
+        "box_floor_geoms": {
+            "sorting_bin_a": "sorting_bin_a_floor",
+            "sorting_bin_b": "sorting_bin_b_floor",
+            "sorting_bin_c": "sorting_bin_c_floor",
+        },
+        "relative_z_range": [0.0, 0.30],
+    },
+}
 
-WORKER_RESULT_PREFIX = "__TASK1_TEST_RESULT__ "
+WORKER_RESULT_PREFIX = "__CHALLENGE_TEST_RESULT__ "
 _STOP_REQUESTED = threading.Event()
 _FORCE_STOP_REQUESTED = threading.Event()
 
@@ -49,9 +77,12 @@ RESIDUAL_PROCESS_MARKERS = (
     "challenge_task.py --scene",
     "challenge_cup_task_template/scripts/data.py",
     "task1_vision_scene1.launch",
+    "task2_vision_scene2.launch",
     "load_kuavo_mujoco_challenge.launch",
     "task1_node.py",
+    "task2_node.py",
     "roslaunch task1_pick",
+    "roslaunch task2_motion",
     "challenge_secret.run_match_timer",
     "challenge_secret.run_cheat_monitor",
 )
@@ -61,7 +92,9 @@ RESIDUAL_ROS_NODE_PREFIXES = (
     "/challenge_task",
     "/task1_vision",
     "/task1",
-    "/task1_batch_test",
+    "/task2_vision",
+    "/task2",
+    "/challenge_batch_test",
     "/parcel_data_collector",
     "/nodelet_",
     "/ekf_se",
@@ -393,10 +426,11 @@ def _cleanup_residuals(reason):
     _cleanup_ros_graph()
 
 
-def _cleanup_seed_processes(proc, seed, tracked_groups):
+def _cleanup_seed_processes(proc, task_name, scene, seed, tracked_groups):
     if proc is not None and proc.poll() is None:
         tracked_groups.update(_descendant_process_groups(proc.pid))
-    _terminate_process_group(proc, "challenge_task_seed_{}".format(seed))
+    run_label = "{}_{}_seed_{}".format(task_name, scene, seed)
+    _terminate_process_group(proc, "challenge_task_{}".format(run_label))
     if proc is not None and proc.stdin is not None:
         try:
             proc.stdin.close()
@@ -404,22 +438,24 @@ def _cleanup_seed_processes(proc, seed, tracked_groups):
             pass
     _cleanup_ros_graph()
     _terminate_groups(tracked_groups)
-    _cleanup_residuals("after seed {}".format(seed))
+    _cleanup_residuals("after {}".format(run_label))
 
 
-def _start_challenge_task(seed):
+def _start_challenge_task(task_name, scene, seed):
     code = """
 import sys
 sys.path.insert(0, sys.argv[1])
 import challenge_task
 challenge_task.NEED_OPERATOR_ENTER = 0
-seed = int(sys.argv[2])
+task_name = sys.argv[2]
+scene = sys.argv[3]
+seed = int(sys.argv[4])
 challenge_task.run_scene(
-    scene=sys.argv[3],
+    scene=scene,
     seed=seed,
-    node_name="challenge_task_scene1_seed_{}".format(seed),
+    node_name="challenge_task_{}_{}_seed_{}".format(task_name, scene, seed),
     timeout=120,
-    time_limit=float(sys.argv[4]),
+    time_limit=float(sys.argv[5]),
     timer_gui=False,
 )
 """
@@ -432,8 +468,9 @@ challenge_task.run_scene(
             "-c",
             code,
             SCRIPT_DIR,
+            str(task_name),
+            str(scene),
             str(seed),
-            SCENE,
             str(TIME_LIMIT_SEC),
         ],
         # 保持 stdin 打开但不发送数据，避免底层键盘轮询把 EOF 当成命令。
@@ -452,7 +489,7 @@ challenge_task.run_scene(
 def _wait_for_ros_master(timeout, proc=None):
     import rosgraph
 
-    master = rosgraph.Master("/task1_batch_test_probe")
+    master = rosgraph.Master("/challenge_batch_test_probe")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and not _STOP_REQUESTED.is_set():
         if proc is not None and proc.poll() is not None:
@@ -470,7 +507,7 @@ def _ensure_rospy(proc):
         return False
     import rospy
 
-    rospy.init_node("task1_batch_test", anonymous=True, disable_signals=True)
+    rospy.init_node("challenge_batch_test", anonymous=True, disable_signals=True)
     return True
 
 
@@ -485,7 +522,11 @@ def _read_sim_time(timeout=0.5):
 
 
 class QposBoxChecker:
-    def __init__(self):
+    def __init__(self, scene):
+        if scene not in SCENE_SUCCESS_RULES:
+            raise ValueError("no success rule for {}".format(scene))
+        self.scene = str(scene)
+        self.rule = SCENE_SUCCESS_RULES[self.scene]
         self.model_path = None
         self.model = None
         self.data = None
@@ -519,48 +560,63 @@ class QposBoxChecker:
         self.data.qpos[: self.model.nq] = qpos[: self.model.nq]
         _load_mujoco().mj_forward(self.model, self.data)
 
-    def _parcel_in_box(self, parcel_name):
-        parcel_pos = [float(value) for value in self.data.body(parcel_name).xpos]
-        box = self.data.body(BOX_BODY)
+    def _object_in_box(self, object_name, box_name):
+        object_pos = [float(value) for value in self.data.body(object_name).xpos]
+        box = self.data.body(box_name)
         box_pos = [float(value) for value in box.xpos]
         box_mat = [float(value) for value in box.xmat]
 
-        delta = [parcel_pos[index] - box_pos[index] for index in range(3)]
+        delta = [object_pos[index] - box_pos[index] for index in range(3)]
         local_x = box_mat[0] * delta[0] + box_mat[3] * delta[1] + box_mat[6] * delta[2]
         local_y = box_mat[1] * delta[0] + box_mat[4] * delta[1] + box_mat[7] * delta[2]
         local_z = box_mat[2] * delta[0] + box_mat[5] * delta[1] + box_mat[8] * delta[2]
 
-        floor_size = self.model.geom(BOX_FLOOR_GEOM).size
-        floor_pos = self.model.geom(BOX_FLOOR_GEOM).pos
+        floor_geom_name = self.rule["box_floor_geoms"][box_name]
+        floor_geom = self.model.geom(floor_geom_name)
+        floor_size = [float(value) for value in floor_geom.size]
+        floor_pos = [float(value) for value in floor_geom.pos]
+        relative_x = local_x - floor_pos[0]
+        relative_y = local_y - floor_pos[1]
         box_bottom_local_z = float(floor_pos[2]) - float(floor_size[2])
         relative_z = local_z - box_bottom_local_z
-        z_min, z_max = [float(value) for value in BOX_RELATIVE_Z_RANGE]
-        half_x = BOX_INNER_SIZE_XY[0] * 0.5
-        half_y = BOX_INNER_SIZE_XY[1] * 0.5
+        z_min, z_max = [float(value) for value in self.rule["relative_z_range"]]
         inside = (
-            abs(local_x) <= half_x
-            and abs(local_y) <= half_y
-            and z_min <= relative_z <= z_max
+            abs(relative_x) <= floor_size[0] + GEOMETRY_EPS
+            and abs(relative_y) <= floor_size[1] + GEOMETRY_EPS
+            and z_min - GEOMETRY_EPS <= relative_z <= z_max + GEOMETRY_EPS
         )
-        detail = "{} local_xy=[{:.3f},{:.3f}] relative_z={:.3f} range=[{:.3f},{:.3f}]".format(
-            parcel_name, local_x, local_y, relative_z, z_min, z_max
+        detail = (
+            "{} -> {} local_xy=[{:.3f},{:.3f}] "
+            "xy_limit=[{:.3f},{:.3f}] relative_z={:.3f} "
+            "z_range=[{:.3f},{:.3f}]"
+        ).format(
+            object_name,
+            box_name,
+            relative_x,
+            relative_y,
+            floor_size[0],
+            floor_size[1],
+            relative_z,
+            z_min,
+            z_max,
         )
         return inside, detail
 
-    def all_parcels_in_box(self):
+    def all_objects_in_expected_boxes(self):
         self._forward_latest_qpos(timeout=0.5)
         details = []
-        for name in PARCEL_NAMES:
-            inside, detail = self._parcel_in_box(name)
+        for object_name, box_name in self.rule["object_to_box"].items():
+            inside, detail = self._object_in_box(object_name, box_name)
             details.append(detail)
             if not inside:
                 return False, "; ".join(details)
         return True, "; ".join(details)
 
 
-def _run_one_seed(seed):
-    print("[INFO] test: start seed {}".format(seed), flush=True)
-    _cleanup_residuals("before seed {}".format(seed))
+def _run_one_seed(task_name, scene, seed):
+    run_label = "{} {} seed {}".format(task_name, scene, seed)
+    print("[INFO] test: start {}".format(run_label), flush=True)
+    _cleanup_residuals("before {}".format(run_label))
     proc = None
     log = None
     tracked_groups = set()
@@ -568,12 +624,12 @@ def _run_one_seed(seed):
     timer_start_sim = None
     last_sim_time = None
     last_sim_sample_wall = None
-    checker = QposBoxChecker()
+    checker = QposBoxChecker(scene)
     success_time = None
     success_detail = ""
 
     try:
-        proc = _start_challenge_task(seed)
+        proc = _start_challenge_task(task_name, scene, seed)
         tracked_groups.update(_descendant_process_groups(proc.pid))
         log = ChildLog(proc)
         if not _ensure_rospy(proc):
@@ -616,7 +672,7 @@ def _run_one_seed(seed):
 
             if proc.poll() is not None:
                 try:
-                    ok, detail = checker.all_parcels_in_box()
+                    ok, detail = checker.all_objects_in_expected_boxes()
                     if ok and elapsed_sim is not None:
                         return elapsed_sim, detail
                     return -1.0, "process exited before success: {}".format(detail)
@@ -626,7 +682,7 @@ def _run_one_seed(seed):
                     )
 
             try:
-                ok, detail = checker.all_parcels_in_box()
+                ok, detail = checker.all_objects_in_expected_boxes()
             except Exception:
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -648,26 +704,44 @@ def _run_one_seed(seed):
                 break
         return success_time, success_detail
     finally:
-        _cleanup_seed_processes(proc, seed, tracked_groups)
+        _cleanup_seed_processes(proc, task_name, scene, seed, tracked_groups)
         if log is not None:
             log.close()
 
 
-def _worker_main(seed):
+def _worker_main(task_name, scene, seed):
     _install_signal_handlers()
-    value, detail = _run_one_seed(seed)
+    value, detail = _run_one_seed(task_name, scene, seed)
     payload = json.dumps(
-        {"value": value, "detail": detail}, ensure_ascii=False, separators=(",", ":")
+        {
+            "task": task_name,
+            "scene": scene,
+            "seed": seed,
+            "value": value,
+            "detail": detail,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
     print(WORKER_RESULT_PREFIX + payload, flush=True)
     return 0 if value >= 0.0 else 1
 
 
-def _run_seed_worker(seed):
+def _run_seed_worker(task_name, scene, seed):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
-        [sys.executable, "-u", SCRIPT_PATH, "--worker-seed", str(seed)],
+        [
+            sys.executable,
+            "-u",
+            SCRIPT_PATH,
+            "--worker-task",
+            str(task_name),
+            "--worker-scene",
+            str(scene),
+            "--worker-seed",
+            str(seed),
+        ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -690,18 +764,37 @@ def _run_seed_worker(seed):
         while proc.poll() is None:
             if _STOP_REQUESTED.is_set():
                 tracked_groups.update(_descendant_process_groups(proc.pid))
-                _terminate_process_group(proc, "seed_worker_{}".format(seed), 40.0, 8.0)
+                _terminate_process_group(
+                    proc,
+                    "seed_worker_{}_{}_{}".format(task_name, scene, seed),
+                    40.0,
+                    8.0,
+                )
                 break
             if time.monotonic() >= deadline:
-                print("[ERROR] test: seed {} worker watchdog timeout".format(seed))
+                print(
+                    "[ERROR] test: {} {} seed {} worker watchdog timeout".format(
+                        task_name, scene, seed
+                    )
+                )
                 tracked_groups.update(_descendant_process_groups(proc.pid))
-                _terminate_process_group(proc, "seed_worker_{}".format(seed), 10.0, 5.0)
+                _terminate_process_group(
+                    proc,
+                    "seed_worker_{}_{}_{}".format(task_name, scene, seed),
+                    10.0,
+                    5.0,
+                )
                 break
             time.sleep(0.25)
         try:
             proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
-            _terminate_process_group(proc, "seed_worker_{}".format(seed), 2.0, 2.0)
+            _terminate_process_group(
+                proc,
+                "seed_worker_{}_{}_{}".format(task_name, scene, seed),
+                2.0,
+                2.0,
+            )
         log.join()
         if log.result is not None:
             return log.result
@@ -709,20 +802,63 @@ def _run_seed_worker(seed):
     finally:
         if proc.poll() is None:
             tracked_groups.update(_descendant_process_groups(proc.pid))
-        _terminate_process_group(proc, "seed_worker_{}".format(seed), 5.0, 3.0)
+        _terminate_process_group(
+            proc,
+            "seed_worker_{}_{}_{}".format(task_name, scene, seed),
+            5.0,
+            3.0,
+        )
         _terminate_groups(tracked_groups)
-        _cleanup_residuals("parent after seed {}".format(seed))
+        _cleanup_residuals(
+            "parent after {} {} seed {}".format(task_name, scene, seed)
+        )
 
 
-def _append_result(fh, seed, value, detail):
+def _append_result(fh, task_name, scene, seed, value, detail):
     detail = str(detail).replace("\r", " ").replace("\n", " | ")
     if value >= 0:
-        line = "{} {:.3f} {}\n".format(seed, value, detail)
+        line = "{} {} {} {:.3f} {}\n".format(
+            task_name, scene, seed, value, detail
+        )
     else:
-        line = "{} -1 {}\n".format(seed, detail)
+        line = "{} {} {} -1 {}\n".format(task_name, scene, seed, detail)
     fh.write(line)
     fh.flush()
     os.fsync(fh.fileno())
+
+
+def _normalized_task_queue():
+    normalized = []
+    for index, item in enumerate(TASK_QUEUE, start=1):
+        if not isinstance(item, dict):
+            raise ValueError("TASK_QUEUE item {} must be a dict".format(index))
+        task_name = str(item.get("task", "")).strip()
+        scene = str(item.get("scene", "")).strip()
+        seed_start = int(item.get("seed_start", 1))
+        seed_end = int(item.get("seed_end", seed_start))
+        if not task_name:
+            raise ValueError("TASK_QUEUE item {} has empty task".format(index))
+        if scene not in SCENE_SUCCESS_RULES:
+            raise ValueError(
+                "TASK_QUEUE item {} has unsupported scene {}".format(index, scene)
+            )
+        if seed_start > seed_end:
+            raise ValueError(
+                "TASK_QUEUE item {} seed_start {} > seed_end {}".format(
+                    index, seed_start, seed_end
+                )
+            )
+        normalized.append(
+            {
+                "task": task_name,
+                "scene": scene,
+                "seed_start": seed_start,
+                "seed_end": seed_end,
+            }
+        )
+    if not normalized:
+        raise ValueError("TASK_QUEUE must contain at least one task")
+    return normalized
 
 
 def _preflight():
@@ -736,25 +872,54 @@ def _preflight():
 def _batch_main():
     _install_signal_handlers()
     _preflight()
+    task_queue = _normalized_task_queue()
     _cleanup_residuals("batch startup")
     interrupted = False
     try:
         with open(RESULT_FILE, "w", encoding="utf-8") as fh:
-            fh.write("# seed sim_time_sec detail\n")
+            fh.write("# task scene seed sim_time_sec detail\n")
             fh.flush()
-            for seed in range(SEED_START, SEED_END + 1):
-                if _STOP_REQUESTED.is_set():
-                    interrupted = True
-                    break
-                value, detail = _run_seed_worker(seed)
-                _append_result(fh, seed, value, detail)
+            for task_index, task_config in enumerate(task_queue, start=1):
+                task_name = task_config["task"]
+                scene = task_config["scene"]
+                seed_start = task_config["seed_start"]
+                seed_end = task_config["seed_end"]
                 print(
-                    "[INFO] test: seed {} result {:.3f}".format(seed, value),
+                    "[INFO] test: queue task {}/{} {} {} seeds {}-{}".format(
+                        task_index,
+                        len(task_queue),
+                        task_name,
+                        scene,
+                        seed_start,
+                        seed_end,
+                    ),
                     flush=True,
                 )
-                if _STOP_REQUESTED.is_set():
-                    interrupted = True
+                for seed in range(seed_start, seed_end + 1):
+                    if _STOP_REQUESTED.is_set():
+                        interrupted = True
+                        break
+                    value, detail = _run_seed_worker(task_name, scene, seed)
+                    _append_result(
+                        fh, task_name, scene, seed, value, detail
+                    )
+                    print(
+                        "[INFO] test: {} {} seed {} result {:.3f}".format(
+                            task_name, scene, seed, value
+                        ),
+                        flush=True,
+                    )
+                    if _STOP_REQUESTED.is_set():
+                        interrupted = True
+                        break
+                if interrupted:
                     break
+                print(
+                    "[INFO] test: completed queue task {}/{} {} {}".format(
+                        task_index, len(task_queue), task_name, scene
+                    ),
+                    flush=True,
+                )
     finally:
         _cleanup_residuals("batch shutdown")
     if _STOP_REQUESTED.is_set():
@@ -763,11 +928,15 @@ def _batch_main():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch test challenge scene1 task1")
+    parser = argparse.ArgumentParser(description="Batch test challenge task queue")
+    parser.add_argument("--worker-task", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-scene", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-seed", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_seed is not None:
-        return _worker_main(args.worker_seed)
+        if not args.worker_task or not args.worker_scene:
+            parser.error("worker task and scene are required with worker seed")
+        return _worker_main(args.worker_task, args.worker_scene, args.worker_seed)
     if int(TEST_MODE) == 1:
         _install_signal_handlers()
         return subprocess.call(

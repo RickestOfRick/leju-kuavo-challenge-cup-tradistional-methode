@@ -22,7 +22,9 @@ challenge_secret.get_object_layout("scene2", seed)
 每个工件包含：
 
 ```text
-objects[i].name             实例名，例如 part_type_a_1
+objects[i].name             motion 实例名，例如 part_type_a_1
+objects[i].motion_name      与 name 相同，供动作参数和偏置查表
+objects[i].ground_truth_name .so 中原始真值实例名
 objects[i].class_name       类别名，例如 part_type_a
 objects[i].position         工件参考原点相对 base_link 的位置，单位 m
 objects[i].yaw              绕 base_link Z 轴的角度，单位 rad
@@ -33,6 +35,13 @@ objects[i].world_position   .so 返回的原始 world_xyz
 objects[i].world_quat_wxyz  .so 返回的原始 MuJoCo 四元数 [w,x,y,z]
 objects[i].position_source  challenge_secret_layout_ground_truth
 ```
+
+实例编号由 `task2_vision` 根据 `base_link` 下的 Y 坐标生成。Y 正方向为左：
+A、B 类从右到左编号 `_1`、`_2`，C 类从左到右编号 `_1`、`_2`。
+真值模式下 `.so` 的实例名可能与 motion 实例名不同，因此消息同时发布
+`ground_truth_name`，顶层 `motion_to_ground_truth` 给出本次场景的完整对照。
+位置、姿态和 yaw 始终来自该 `ground_truth_name` 对应的真值对象，motion
+仅使用重新编号后的 `name` 选择抓取偏置。
 
 `position` 是数采脚本 `world_xyz` 转换到 `base_link` 后的结果。它严格说是 MuJoCo 工件参考原点，不额外计算视觉包围盒的几何中心，也没有叠加抓取偏置。
 

@@ -10,6 +10,7 @@ import task2_geometry as geometry
 import task2_perception as perception
 from task2_config import (
     ARM_MOVE_TIME,
+    C_PLACE_IK_Z_FRACTIONS,
     GRIPPER_CLOSE_TIME,
     HANDOFF_APPROACH_Z_OFFSET,
     HOME_JOINTS_DEG,
@@ -96,6 +97,7 @@ def _pick_at_pose(
         side,
         fmt(grasp_position),
     )
+    return lift
 
 
 def _transfer_to_handoff(controller, job, target_arm):
@@ -136,6 +138,7 @@ def _transfer_to_handoff(controller, job, target_arm):
         WORK_POSE_JOINTS_DEG,
         "{}_source_return_work".format(job["object"]),
         side=source_arm,
+        checked_keypoint=True,
     )
     return targets
 
@@ -146,22 +149,51 @@ def _place_in_bin(
     side,
     bin_name,
     held_quaternion,
+    lift_position,
 ):
     place_position = _place_position(side, bin_name)
-    controller.move_pose(
-        side,
-        place_position,
-        held_quaternion,
-        "{}_place_{}".format(object_name, bin_name),
-        move_time=ARM_MOVE_TIME,
-        checked_keypoint=True,
-    )
+    if str(object_name).startswith("part_type_c_"):
+        fractions = [float(value) for value in C_PLACE_IK_Z_FRACTIONS]
+        if not fractions or any(
+            value <= 0.0 or value >= 1.0 for value in fractions
+        ):
+            raise ValueError("C place IK Z fractions must be within (0, 1)")
+        if fractions != sorted(fractions):
+            raise ValueError("C place IK Z fractions must be ascending")
+        intermediate_positions = [
+            [
+                float(lift_position[0]),
+                float(place_position[1]),
+                float(lift_position[2])
+                + fraction
+                * (float(place_position[2]) - float(lift_position[2])),
+            ]
+            for fraction in fractions
+        ]
+        controller.move_pose_via_ik(
+            side,
+            intermediate_positions,
+            place_position,
+            held_quaternion,
+            "{}_place_{}".format(object_name, bin_name),
+            move_time=ARM_MOVE_TIME,
+        )
+    else:
+        controller.move_pose(
+            side,
+            place_position,
+            held_quaternion,
+            "{}_place_{}".format(object_name, bin_name),
+            move_time=ARM_MOVE_TIME,
+            checked_keypoint=True,
+        )
     controller.gripper.open(side)
     rospy.sleep(RELEASE_DWELL)
     controller.move_joints(
         WORK_POSE_JOINTS_DEG,
         "{}_return_work".format(object_name),
         side=side,
+        checked_keypoint=True,
     )
     rospy.loginfo("task2: %s released into %s", object_name, bin_name)
 
@@ -178,8 +210,9 @@ def run_scene2_task(seed, object_poses=None):
         for name in sorted(observations):
             item = observations[name]
             rospy.loginfo(
-                "task2: %s base_link=%s yaw=%.2f deg source=%s",
+                "task2: motion=%s ground_truth=%s base_link=%s yaw=%.2f deg source=%s",
                 name,
+                item.get("ground_truth_name", name),
                 fmt(item["position"]),
                 math.degrees(item["yaw"]),
                 item["position_source"],
@@ -204,7 +237,7 @@ def run_scene2_task(seed, object_poses=None):
                 job["arm"],
                 job["bin"],
             )
-            _pick_at_pose(
+            lift_position = _pick_at_pose(
                 controller,
                 job["object"],
                 job["arm"],
@@ -217,7 +250,7 @@ def run_scene2_task(seed, object_poses=None):
             target_arm = geometry.handoff_target_arm(job)
             if target_arm is not None:
                 targets = _transfer_to_handoff(controller, job, target_arm)
-                _pick_at_pose(
+                lift_position = _pick_at_pose(
                     controller,
                     job["object"],
                     target_arm,
@@ -232,6 +265,7 @@ def run_scene2_task(seed, object_poses=None):
                     target_arm,
                     job["bin"],
                     targets["grasp_quaternion"],
+                    lift_position,
                 )
             else:
                 _place_in_bin(
@@ -240,15 +274,26 @@ def run_scene2_task(seed, object_poses=None):
                     job["arm"],
                     job["bin"],
                     job["lift_quaternion"],
+                    lift_position,
                 )
 
         controller.gripper.open_all()
-        controller.move_joints(WORK_POSE_JOINTS_DEG, "final_work_pose")
-        controller.move_joints(SIDE_LIFT_JOINTS_DEG, "final_side_lift")
-        controller.move_joints(HOME_JOINTS_DEG, "final_home")
+        controller.move_joints(
+            SIDE_LIFT_JOINTS_DEG,
+            "final_side_lift",
+            checked_keypoint=False,
+        )
+        controller.move_joints(
+            HOME_JOINTS_DEG,
+            "final_home",
+            checked_keypoint=False,
+        )
         rospy.loginfo("task2: all six parts sorted for seed=%d", seed)
         return True
     except Exception:
+        if rospy.is_shutdown():
+            rospy.loginfo("task2: interrupted by ROS shutdown")
+            return False
         rospy.logerr("task2 exception: %s", traceback.format_exc())
         return False
     finally:

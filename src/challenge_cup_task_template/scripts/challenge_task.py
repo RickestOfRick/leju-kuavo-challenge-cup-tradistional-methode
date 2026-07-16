@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 
 GREEN = "\033[32m"
 RESET = "\033[0m"
@@ -78,11 +79,19 @@ def _terminate_process_group(proc, name, wait_sigint=3.0, wait_sigterm=2.0):
             pass
         return
 
-    for sig, timeout, label in (
-        (signal.SIGINT, wait_sigint, "SIGINT"),
-        (signal.SIGTERM, wait_sigterm, "SIGTERM"),
-        (signal.SIGKILL, 1.0, "SIGKILL"),
-    ):
+    stop_sequence = (
+        (
+            (signal.SIGTERM, min(float(wait_sigterm), 2.0), "SIGTERM"),
+            (signal.SIGKILL, 1.0, "SIGKILL"),
+        )
+        if rospy.is_shutdown()
+        else (
+            (signal.SIGINT, wait_sigint, "SIGINT"),
+            (signal.SIGTERM, wait_sigterm, "SIGTERM"),
+            (signal.SIGKILL, 1.0, "SIGKILL"),
+        )
+    )
+    for sig, timeout, label in stop_sequence:
         if proc.poll() is not None:
             return
         try:
@@ -162,6 +171,7 @@ class ManagedProcess:
         self.name = name
         self.cmd = list(cmd)
         self.proc = None
+        self._stop_lock = threading.Lock()
 
     # 启动需要随主流程退出而回收的辅助进程。
     def start(self):
@@ -173,10 +183,13 @@ class ManagedProcess:
         return self
 
     def stop(self):
-        if self.proc is None or self.proc.poll() is not None:
+        # rospy shutdown 回调和 run_scene finally 可能同时进入，只允许一方清理。
+        with self._stop_lock:
+            proc = self.proc
+            self.proc = None
+        if proc is None or proc.poll() is not None:
             return
-        _terminate_process_group(self.proc, self.name)
-        self.proc = None
+        _terminate_process_group(proc, self.name)
 
 
 # 按场景启动任务依赖的辅助 ROS 进程。
@@ -284,6 +297,8 @@ def _run_scene1_task1(seed):
         parcel_poses=parcel_poses,
     )
     if not ok:
+        if rospy.is_shutdown():
+            return
         raise RuntimeError("task1 action failed")
 
 
@@ -299,6 +314,8 @@ def _run_scene2_task2(seed):
     )
     _wait_for_operator_start()
     if not task2_node.run_scene2_task(seed, object_poses=object_poses):
+        if rospy.is_shutdown():
+            return
         raise RuntimeError("task2 action failed")
 
 
@@ -317,14 +334,14 @@ def run_scene(
         match_time_limit=time_limit,
         timer_gui=timer_gui,
     )
-    launcher.start(node_name=node_name or config["node_name"], timeout=timeout)
-
-    import rospy
-
-    rospy.loginfo("=== %s任务启动 ===", config["title"])
-
-    services = _start_scene_services(scene, seed)
+    services = []
     try:
+        launcher.start(node_name=node_name or config["node_name"], timeout=timeout)
+
+        import rospy
+
+        rospy.loginfo("=== %s任务启动 ===", config["title"])
+        services = _start_scene_services(scene, seed)
         _apply_head_camera(config.get("head_camera", {}))
         rospy.sleep(1.0)
         rospy.loginfo("场景实例已初始化。")
@@ -342,6 +359,8 @@ def run_scene(
         rospy.spin()
     finally:
         _stop_scene_services(services)
+        # 不等 Python atexit，主流程结束或 Ctrl+C 时立即回收仿真进程组。
+        launcher.stop()
 
 
 def main():
@@ -374,14 +393,26 @@ def main():
     )
     args = parser.parse_args()
 
-    run_scene(
-        scene=args.scene,
-        seed=args.seed,
-        node_name=args.node_name,
-        timeout=args.timeout,
-        time_limit=args.time_limit,
-        timer_gui=not args.no_timer_gui,
-    )
+    try:
+        run_scene(
+            scene=args.scene,
+            seed=args.seed,
+            node_name=args.node_name,
+            timeout=args.timeout,
+            time_limit=args.time_limit,
+            timer_gui=not args.no_timer_gui,
+        )
+    except KeyboardInterrupt:
+        return
+    except Exception:
+        try:
+            import rospy
+
+            if rospy.is_shutdown():
+                return
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":

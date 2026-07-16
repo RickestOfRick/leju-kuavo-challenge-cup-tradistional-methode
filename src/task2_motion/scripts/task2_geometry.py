@@ -4,6 +4,7 @@
 import math
 
 from task2_config import (
+    A1_BASE_Y_PARALLEL_TOL_DEG,
     CLASS_POSES,
     GRASP_NARROW_EDGE_YAW_OFFSET,
     GRASP_OFFSETS_BASE,
@@ -151,7 +152,21 @@ def narrow_edge_offset(observation, arm):
         candidates,
         key=lambda value: _tool_forward_x_score(pose_values, object_yaw, arm, value),
     )
-    return -selected if _other_narrow_edge(observation, arm) else selected
+    if _other_narrow_edge(observation, arm):
+        selected = -selected
+    if observation["name"] == "part_type_a_1":
+        local_y_base = rotate_vector(
+            observation["orientation"], [0.0, 1.0, 0.0]
+        )[:2]
+        axis_norm = math.hypot(local_y_base[0], local_y_base[1])
+        parallel_cosine = (
+            abs(local_y_base[1]) / axis_norm if axis_norm > 1e-9 else 0.0
+        )
+        if parallel_cosine >= math.cos(
+            math.radians(A1_BASE_Y_PARALLEL_TOL_DEG)
+        ):
+            selected = -selected
+    return selected
 
 
 def _grasp_offset_base(object_name, arm):

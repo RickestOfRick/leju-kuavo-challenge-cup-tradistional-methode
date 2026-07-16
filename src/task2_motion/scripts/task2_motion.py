@@ -476,7 +476,6 @@ class RobotController:
         target_quaternion,
         pos_cost_weight,
         label,
-        allow_temporary,
     ):
         try:
             return (
@@ -493,9 +492,6 @@ class RobotController:
             if not str(error).startswith("IK failed"):
                 raise
             last_error = error
-
-        if not allow_temporary:
-            raise last_error
 
         current_pose = self._pose_for_side(self.call_fk(current), side)
         current_position = list(current_pose.pos_xyz)
@@ -569,9 +565,23 @@ class RobotController:
             previous = endpoint
         self._set_side_hold(side, target)
 
-    def move_joints(self, target_degrees, label, side="both", move_time=ARM_MOVE_TIME):
+    def move_joints(
+        self,
+        target_degrees,
+        label,
+        side="both",
+        move_time=ARM_MOVE_TIME,
+        checked_keypoint=True,
+    ):
         start = rad_to_deg(self.read_arm_joints())
         self._interpolate_leg(start, target_degrees, move_time, side)
+        if not checked_keypoint:
+            rospy.loginfo(
+                "task2: [%s] %s joint act completed without stability wait or FK check",
+                label,
+                side,
+            )
+            return [math.radians(float(value)) for value in target_degrees]
         rospy.sleep(MOTION_SETTLE_TIME)
         joints = self.wait_arm_stable(side)
         rospy.loginfo(
@@ -594,7 +604,7 @@ class RobotController:
         wait_for_stability=True,
     ):
         actual = list(current)
-        temporary_moves = 0
+        recovery_round = 0
         while not rospy.is_shutdown():
             solution, is_target = self._solve_ik_step(
                 actual,
@@ -603,20 +613,32 @@ class RobotController:
                 target_quaternion,
                 pos_cost_weight,
                 label,
-                allow_temporary=temporary_moves < SOFT_IK_BISECT_ATTEMPTS,
             )
             previous = rad_to_deg(actual)
             target = rad_to_deg(solution)
             self._interpolate_leg(previous, target, float(move_time), side)
             rospy.sleep(MOTION_SETTLE_TIME)
-            actual = (
-                self.wait_arm_stable(side)
-                if wait_for_stability
-                else self.read_arm_joints()
-            )
             if is_target:
+                actual = (
+                    self.wait_arm_stable(side)
+                    if wait_for_stability
+                    else self.read_arm_joints()
+                )
                 return actual
-            temporary_moves += 1
+            rospy.logwarn(
+                "task2: [%s] temporary fallback q executed; waiting for %s arm "
+                "to stabilize before retrying the original target",
+                label,
+                side,
+            )
+            actual = self.wait_arm_stable(side)
+            recovery_round += 1
+            rospy.logwarn(
+                "task2: [%s] temporary fallback motion is stable; retrying the "
+                "original target from actual q (recovery round %d)",
+                label,
+                recovery_round,
+            )
         raise RuntimeError("task2: shutdown while executing {}".format(label))
 
     def _log_pose_fk(
@@ -703,6 +725,106 @@ class RobotController:
             return actual_joints
         return self._log_pose_fk(
             actual_joints,
+            side,
+            target_position,
+            target_quaternion,
+            label,
+        )
+
+    def move_pose_via_ik(
+        self,
+        side,
+        intermediate_positions,
+        target_position,
+        target_quaternion,
+        label,
+        pos_cost_weight=IK_POS_COST_WEIGHT,
+        move_time=ARM_MOVE_TIME,
+    ):
+        """经多个 IK 中间解连续执行 q 插值，只在最终目标等待稳定和检查 FK。"""
+        current = list(self.read_arm_joints())
+        intermediate_positions = [
+            [float(value) for value in position]
+            for position in intermediate_positions
+        ]
+        if not intermediate_positions or any(
+            len(position) != 3 for position in intermediate_positions
+        ):
+            raise ValueError("IK intermediate positions must contain XYZ points")
+        target_position = [float(value) for value in target_position]
+
+        constraint_positions = list(intermediate_positions) + [target_position]
+        constraint_labels = [
+            "{}_intermediate_{}/{}".format(
+                label, index, len(intermediate_positions)
+            )
+            for index in range(1, len(intermediate_positions) + 1)
+        ] + [label]
+        leg_time = float(move_time) / len(constraint_positions)
+
+        # 直接 IK 全部成功时保持原有的离线求解和连续 q 插值逻辑。
+        solutions = []
+        previous_solution = list(current)
+        direct_error = None
+        for position in constraint_positions:
+            try:
+                solution = self._solve_ik_once(
+                    previous_solution,
+                    side,
+                    position,
+                    target_quaternion,
+                    pos_cost_weight,
+                )
+            except RuntimeError as error:
+                if not str(error).startswith("IK failed"):
+                    raise
+                direct_error = error
+                break
+            solutions.append(solution)
+            previous_solution = solution
+
+        if direct_error is None:
+            previous = current
+            rospy.loginfo(
+                "task2: [%s] continuous q trajectory via %d IK constraints, q legs=%d",
+                label,
+                len(intermediate_positions),
+                len(solutions),
+            )
+            for solution in solutions:
+                self._interpolate_leg(
+                    rad_to_deg(previous),
+                    rad_to_deg(solution),
+                    leg_time,
+                    side,
+                )
+                previous = list(solution)
+            rospy.sleep(MOTION_SETTLE_TIME)
+            stable_joints = self.wait_arm_stable(side)
+        else:
+            rospy.logwarn(
+                "task2: [%s] continuous IK preplanning failed (%s); entering "
+                "execution-aware fallback recovery",
+                label,
+                direct_error,
+            )
+            actual = list(current)
+            for index, (position, constraint_label) in enumerate(
+                zip(constraint_positions, constraint_labels)
+            ):
+                actual = self._execute_pose_leg(
+                    actual,
+                    side,
+                    position,
+                    target_quaternion,
+                    constraint_label,
+                    pos_cost_weight=pos_cost_weight,
+                    move_time=leg_time,
+                    wait_for_stability=index == len(constraint_positions) - 1,
+                )
+            stable_joints = actual
+        return self._log_pose_fk(
+            stable_joints,
             side,
             target_position,
             target_quaternion,

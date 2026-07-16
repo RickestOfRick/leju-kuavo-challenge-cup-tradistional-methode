@@ -14,6 +14,7 @@ OBJECT_NAMES = (
     "part_type_c_1",
     "part_type_c_2",
 )
+CLASS_NAMES = ("part_type_a", "part_type_b", "part_type_c")
 POSITION_SOURCE = "challenge_secret_layout_ground_truth"
 
 
@@ -84,6 +85,35 @@ def object_class_name(object_name):
     return str(object_name).rsplit("_", 1)[0]
 
 
+def _assign_motion_names(objects):
+    """按 base_link 左右位置生成 motion 使用的稳定实例编号。"""
+    by_class = {class_name: [] for class_name in CLASS_NAMES}
+    for item in objects:
+        by_class[item["class_name"]].append(item)
+
+    renamed = {}
+    for class_name in CLASS_NAMES:
+        class_objects = by_class[class_name]
+        if len(class_objects) != 2:
+            raise ValueError(
+                "{} must contain exactly two objects, got {}".format(
+                    class_name, len(class_objects)
+                )
+            )
+        # base_link 的 Y 正方向为左：A/B 从右到左，C 从左到右。
+        class_objects.sort(
+            key=lambda item: float(item["position"][1]),
+            reverse=class_name == "part_type_c",
+        )
+        for index, item in enumerate(class_objects, start=1):
+            motion_name = "{}_{}".format(class_name, index)
+            item["motion_name"] = motion_name
+            item["name"] = motion_name
+            renamed[motion_name] = item
+
+    return [renamed[name] for name in OBJECT_NAMES]
+
+
 def load_scene2_layout(simulator_path, seed):
     """调用与数采脚本相同的 `.so` 接口读取指定 seed 的布局。"""
     lib_dir = os.path.join(os.path.abspath(simulator_path), "lib")
@@ -106,22 +136,26 @@ def load_scene2_layout(simulator_path, seed):
 
 
 def build_published_objects(layout, world_base_position, world_base_quat_wxyz):
-    """将六个工件的 world 真值转换到 base_link，顺序固定。"""
+    """将 world 真值转换到 base_link，再按空间位置生成 motion 实例名。"""
     base_position = [float(value) for value in world_base_position]
     if len(base_position) != 3:
         raise ValueError("world_base_position must contain 3 values")
     world_to_base_quat = _quat_inverse_wxyz(world_base_quat_wxyz)
     objects = []
-    for name in OBJECT_NAMES:
-        item = layout[name]
+    for ground_truth_name in OBJECT_NAMES:
+        item = layout[ground_truth_name]
         world_position = [float(value) for value in item["pos"]]
         world_quat_wxyz = [float(value) for value in item["quat"]]
         if len(world_position) != 3:
-            raise ValueError("{} position must contain 3 values".format(name))
+            raise ValueError(
+                "{} position must contain 3 values".format(ground_truth_name)
+            )
         if not all(
             math.isfinite(value) for value in world_position + world_quat_wxyz
         ):
-            raise ValueError("{} layout contains a non-finite value".format(name))
+            raise ValueError(
+                "{} layout contains a non-finite value".format(ground_truth_name)
+            )
 
         relative_world = [
             world_position[index] - base_position[index] for index in range(3)
@@ -133,8 +167,10 @@ def build_published_objects(layout, world_base_position, world_base_quat_wxyz):
         yaw = yaw_from_quat_wxyz(base_quat_wxyz)
         objects.append(
             {
-                "name": name,
-                "class_name": object_class_name(name),
+                "name": ground_truth_name,
+                "motion_name": None,
+                "ground_truth_name": ground_truth_name,
+                "class_name": object_class_name(ground_truth_name),
                 "position": position,
                 "yaw": yaw,
                 "yaw_deg": math.degrees(yaw),
@@ -151,4 +187,4 @@ def build_published_objects(layout, world_base_position, world_base_quat_wxyz):
                 "position_source": POSITION_SOURCE,
             }
         )
-    return objects
+    return _assign_motion_names(objects)

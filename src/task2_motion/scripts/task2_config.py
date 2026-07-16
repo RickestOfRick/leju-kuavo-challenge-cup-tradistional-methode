@@ -51,42 +51,53 @@ GRASP_OFFSETS_BASE = {
     },
     "part_type_a_2": {
         "left": [0.024611612, 0.004389598, 0.05],
-        "right": [0.03610907, -0.045345481, 0.05],
+        "right": [0.03110907, -0.030345481, 0.05],
     },
     "part_type_b_1": {
         "left": [0.018787454, -0.006857956, 0.05],
-        "right": [0.024181181, -0.005286934, 0.05],
+        "right": [0.020181181, -0.012286934, 0.05],
     },
     "part_type_b_2": {
-        "left": [0.007518057, 0.006593847, 0.05],
+        "left": [0.012518057, 0.021593847, 0.05],
         "right": [0.000924211, 0.014111904, 0.05],
     },
     "part_type_c_1": {
-        "left": [-0.026064838, 0.044912331, 0.04],
+        "left": [0.01564838, 0.044912331, 0.04],
         "right": [-0.014123567, 0.017335653, 0.04],
     },
     "part_type_c_2": {
-        "left": [0.013856999, 0.044554725, 0.04],
+        "left": [0.012856999, 0.035554725, 0.045],
         "right": [-0.001369873, 0.036029480, 0.05],
     },
 }
 
-# 姿态参数沿用数采的“自适应旋转 × 工具手动旋转”定义。
+
+def pose_degrees(values):
+    """将六维 degree 姿态配置转换为内部使用的 radian。"""
+    angles = [float(value) for value in values]
+    if len(angles) != 6:
+        raise ValueError("pose degrees must contain 6 angles")
+    return [math.radians(value) for value in angles]
+
+
+# 姿态参数顺序为 [yaw_bias, pitch, roll, manual_yaw, manual_pitch, manual_roll]，单位 degree。
 CLASS_POSES = {
     "part_type_a": {
-        "grasp": [0.0, -math.pi / 4, 0.0, math.pi / 2, 0.0, 0.0],
-        "lift": [0.0, -math.pi / 2, 0.0, math.pi / 2, 0.0, 0.0],
+        "grasp": pose_degrees([0.0, -7.5, 0.0, 90.0, 0.0, 0.0]),
+        "lift": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 0.0]),
     },
     "part_type_b": {
-        "grasp": [0.0, -math.pi / 4, 0.0, math.pi / 2, 0.0, 0.0],
-        "lift": [0.0, -math.pi / 2, 0.0, math.pi / 2, 0.0, 0.0],
+        "grasp": pose_degrees([0.0, -10.0, 0.0, 90.0, 0.0, 0.0]),
+        "lift": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 0.0]),
     },
     "part_type_c": {
-        "grasp": [-math.pi / 4, -math.pi / 4, 0.0, math.pi / 2, 0.0, 0.0],
-        "lift": [-math.pi / 4, -math.pi / 4, 0.0, math.pi / 2, 0.0, 0.0],
+        "grasp": pose_degrees([-45.0, -45.0, 0.0, 90.0, 0.0, 0.0]),
+        "lift": pose_degrees([-45.0, -45.0, 0.0, 90.0, 0.0, 0.0]),
     },
 }
 GRASP_NARROW_EDGE_YAW_OFFSET = math.pi / 2
+# A1 的物理长轴是局部 Y；与 base_link Y 平行时使用另一窄边。
+A1_BASE_Y_PARALLEL_TOL_DEG = 15.0
 
 # base_link 下的末端经验修正。旧数采的 X/Z 常量是 world 到基座的平移，现已由视觉完成。
 HAND_EE_CALIBRATION = {
@@ -257,22 +268,24 @@ PRESET_SETTLE_TIME = 0.5
 # 这里是末端绝对 XYZ，不叠加抓取偏置或 HAND_EE_CALIBRATION。
 PLACE_POSITIONS_BASE = {
     "right": {
-        "sorting_bin_a": [0.535486, -0.443608, 0.384811],
-        "sorting_bin_b": [0.535486, -0.013608, 0.174811],
+        "sorting_bin_a": [0.535486, -0.443608, 0.244811],
+        "sorting_bin_b": [0.535486, -0.013608, 0.244811],
     },
     "left": {
-        "sorting_bin_b": [0.535486, -0.013608, 0.174811],
-        "sorting_bin_c": [0.535486, 0.416392, 0.174811],
+        "sorting_bin_b": [0.535486, -0.013608, 0.244811],
+        "sorting_bin_c": [0.545486, 0.416392, 0.364811],
     },
 }
 
 # 抓取、交接与放置关键点。
-PRE_GRASP_Z_OFFSET = 0.10
+PRE_GRASP_Z_OFFSET = 0.07
 LIFT_OFFSETS_BY_CLASS = {
     "part_type_a": [0.0, 0.0, 0.32],
     "part_type_b": [0.0, 0.0, 0.32],
-    "part_type_c": [-0.1, 0.0, 0.38],
+    "part_type_c": [-0.05, 0.0, 0.34],
 }
+# C 类从 lift 到 release 的连续 q 轨迹所经过的 IK 高度比例。
+C_PLACE_IK_Z_FRACTIONS = [0.50]
 HANDOFF_APPROACH_Z_OFFSET = 0.20
 GRIPPER_CLOSE_TIME = 0.70
 RELEASE_DWELL = 0.40

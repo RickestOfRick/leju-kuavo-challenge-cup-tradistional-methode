@@ -46,8 +46,9 @@ class Task2VisionNode:
         )
         for item in self.objects:
             rospy.loginfo(
-                "task2_vision: %s position=%s yaw=%.3f deg",
+                "task2_vision: motion=%s ground_truth=%s position=%s yaw=%.3f deg",
                 item["name"],
+                item["ground_truth_name"],
                 [round(value, 6) for value in item["position"]],
                 item["yaw_deg"],
             )
@@ -79,6 +80,10 @@ class Task2VisionNode:
             "position_source": POSITION_SOURCE,
             "world_base_position": self.world_base_position,
             "world_base_quat_wxyz": self.world_base_quat_wxyz,
+            "motion_to_ground_truth": {
+                item["name"]: item["ground_truth_name"]
+                for item in self.objects
+            },
             "objects": self.objects,
         }
         return String(data=json.dumps(payload, ensure_ascii=True, sort_keys=True))
@@ -111,7 +116,11 @@ def main():
     rospy.init_node("task2_vision")
     try:
         Task2VisionNode().spin()
+    except rospy.ROSInterruptException:
+        return
     except Exception as exc:
+        if rospy.is_shutdown():
+            return
         rospy.logfatal("task2_vision: startup failed: %s", exc)
         raise
 
