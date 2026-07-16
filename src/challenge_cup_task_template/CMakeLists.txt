@@ -3,7 +3,8 @@ project(challenge_cup_task_template)
 
 find_package(catkin REQUIRED COMPONENTS
   task1_vision
-  task3_vision
+  task2_vision
+  task2_motion
   kuavo_msgs
   task1_pick
 )

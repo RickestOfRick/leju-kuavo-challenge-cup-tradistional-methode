@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>task2_motion</name>
+  <version>0.0.1</version>
+  <description>任务二零件抓取、交接与分类放箱运动包。</description>
+
+  <maintainer email="zwx@example.com">zwx</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>kuavo_msgs</depend>
+  <depend>task2_vision</depend>
+
+  <export/>
+</package>

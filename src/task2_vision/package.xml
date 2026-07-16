@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>task2_vision</name>
+  <version>0.0.1</version>
+  <description>任务二零件在 base_link 下的完整位姿与偏航角真值发布包。</description>
+
+  <maintainer email="zwx@example.com">zwx</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <exec_depend>challenge_cup_simulator</exec_depend>
+
+  <export/>
+</package>

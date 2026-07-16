@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="seed" default="0"/>
+  <arg name="config" default="$(find task2_vision)/config/scene2_task2_vision.yaml"/>
+
+  <node name="task2_vision" pkg="task2_vision" type="task2_vision_node.py" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="seed" value="$(arg seed)"/>
+  </node>
+</launch>

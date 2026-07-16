@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="seed" default="0"/>
+  <node name="task2_motion" pkg="task2_motion" type="task2_node.py" output="screen"
+        args="--seed $(arg seed)"/>
+</launch>

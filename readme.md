@@ -102,20 +102,44 @@ float64[3] right_r6_offset
 - 使用多组参考关节角分别求解，并按关节变化量、参考距离和末端误差选择结果；
 - 通过 `/ik/two_arm_hand_pose_cmd_srv_muli_refer` 返回 14 维双臂关节解和求解误差信息。
 
-## test.py
+### test.py
 
 批量测试,成功检测逻辑为任务最后四个包裹中心的x,y,z真值都在箱子范围内,没有测试称重盘是否变化,测试完一个种子写一个的结果.可能有bug
 
-## task1_vision
+### task1_vision
 
 拟合结果调取见 [task1_vision/README.md](src/task1_vision/README.md)。
 
+### task2_vision
+
+直接从真值读取, 提供物体xyz和yaw, 包括同一类别的不同编号
+
+### task2_motion
+
+动作逻辑和任务一一样, 参考系为baselink, 采用ik+q插值+wbc, xyz偏置都是baselink坐标系的偏置(数采原本的偏置是局部坐标系的).目前的问题有不稳定(参数目前只按照seed 1,2,3调的), C类螺丝刀抓取后lift -> release的插值会导致高度减少, 螺丝刀会撞到箱子, 还没落地的解决方案是在路径中间补几个同高度的ik点再q插值
+
+交接的逻辑和参数没有调试过,就用的原本数采的逻辑
+
 ## 运行
+
+### 任务二
+
+```bash
+catkin build kuavo_msgs task2_vision task2_motion challenge_cup_task_template
+source devel/setup.zsh
+rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 4
+
+# 另开终端读取任务二六个工件在 base_link 下的位姿和 yaw 真值
+source devel/setup.zsh
+rostopic echo /task2_vision/objects_json
+```
+
+### 任务一
 
 ```bash
 catkin build kuavo_msgs challenge_cup_task_template
 source devel/setup.zsh
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 8
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 14
 
 # 批量测试
 source devel/setup.zsh
@@ -123,14 +147,6 @@ python3 src/challenge_cup_task_template/scripts/test.py
 
 source devel/setup.zsh
 rosrun rqt_gui rqt_gui --standalone task1_vision/Task1Vision --args -h
-
-# 场景三启动后检查上下层 SMT 料盘 qpos 假框
-catkin build kuavo_msgs challenge_cup_task_template
-source devel/setup.zsh
-rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 4
-
-source devel/setup.zsh
-rosrun rqt_gui rqt_gui --standalone task3_vision/Task3Vision
 
 # task1自动数据采集
 source devel/setup.zsh

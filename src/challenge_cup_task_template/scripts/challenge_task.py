@@ -26,6 +26,8 @@ TASK1_VISION_MODE = 1
 
 TASK1_PACKAGE = "task1_pick"
 TASK1_MODULE = "task1_node"
+TASK2_PACKAGE = "task2_motion"
+TASK2_MODULE = "task2_node"
 
 SCENE_CONFIGS = {
     "scene1": {
@@ -136,6 +138,24 @@ def _load_task1_node():
     return importlib.import_module(TASK1_MODULE)
 
 
+def _load_task2_node():
+    try:
+        import rospkg
+
+        scripts_dir = os.path.join(rospkg.RosPack().get_path(TASK2_PACKAGE), "scripts")
+    except Exception:
+        scripts_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            TASK2_PACKAGE,
+            "scripts",
+        )
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return importlib.import_module(TASK2_MODULE)
+
+
 # 管理随主任务启动和退出的辅助进程。
 class ManagedProcess:
     def __init__(self, name, cmd):
@@ -160,7 +180,7 @@ class ManagedProcess:
 
 
 # 按场景启动任务依赖的辅助 ROS 进程。
-def _start_scene_services(scene):
+def _start_scene_services(scene, seed=0):
     if scene == "scene1":
         return [
             ManagedProcess(
@@ -174,15 +194,15 @@ def _start_scene_services(scene):
                 ],
             ).start()
         ]
-    if scene == "scene3":
+    if scene == "scene2":
         return [
             ManagedProcess(
-                "task3_vision",
+                "task2_vision",
                 [
                     "roslaunch",
-                    "task3_vision",
-                    "task3_vision_scene3.launch",
-                    "start_rqt:=false",
+                    "task2_vision",
+                    "task2_vision_scene2.launch",
+                    "seed:={}".format(int(seed)),
                 ],
             ).start()
         ]
@@ -267,6 +287,21 @@ def _run_scene1_task1(seed):
         raise RuntimeError("task1 action failed")
 
 
+def _run_scene2_task2(seed):
+    import rospy
+
+    task2_node = _load_task2_node()
+    rospy.loginfo("challenge_task: task2 entry=%s/%s", TASK2_PACKAGE, TASK2_MODULE)
+    object_poses = task2_node.init_from_task2_vision()
+    rospy.loginfo(
+        GREEN + "task2: fixed initial object poses from task2_vision: %s" + RESET,
+        ", ".join(sorted(object_poses)),
+    )
+    _wait_for_operator_start()
+    if not task2_node.run_scene2_task(seed, object_poses=object_poses):
+        raise RuntimeError("task2 action failed")
+
+
 def run_scene(
     scene, seed, node_name=None, timeout=120, time_limit=None, timer_gui=True
 ):
@@ -288,7 +323,7 @@ def run_scene(
 
     rospy.loginfo("=== %s任务启动 ===", config["title"])
 
-    services = _start_scene_services(scene)
+    services = _start_scene_services(scene, seed)
     try:
         _apply_head_camera(config.get("head_camera", {}))
         rospy.sleep(1.0)
@@ -297,6 +332,11 @@ def run_scene(
         if scene == "scene1":
             _run_scene1_task1(seed)
             rospy.loginfo("task1 动作流程结束。")
+            return
+
+        if scene == "scene2":
+            _run_scene2_task2(seed)
+            rospy.loginfo("task2 动作流程结束。")
             return
 
         rospy.spin()

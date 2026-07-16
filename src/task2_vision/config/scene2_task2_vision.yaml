@@ -1,0 +1,6 @@
+# 真值在整个场景实例中保持不变，低频重复发布便于后启动的订阅者读取。
+publish_hz: 2.0
+# 使用机器人浮动基座的 qpos，将 world 真值转换到 base_link。
+qpos_topic: /mujoco/qpos
+robot_base_qpos_addr: 0
+qpos_timeout: 20.0
