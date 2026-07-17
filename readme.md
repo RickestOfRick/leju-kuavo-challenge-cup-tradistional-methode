@@ -102,27 +102,21 @@ float64[3] right_r6_offset
 - 使用多组参考关节角分别求解，并按关节变化量、参考距离和末端误差选择结果；
 - 通过 `/ik/two_arm_hand_pose_cmd_srv_muli_refer` 返回 14 维双臂关节解和求解误差信息。
 
-### test.py
-
-批量测试由 `src/challenge_cup_task_template/scripts/test.py` 顶部的
-`TASK_QUEUE` 配置。程序会先跑完队列中一个任务的全部 seed，再继续下一个任务；
-每个 seed 的结果立即写入 `result.txt`。
-
-- 任务一：四个包裹中心位于分拣箱内部，Z 为相对箱底 `0-25 cm`；不检查称重盘变化。
-- 任务二：A、B、C 类工件分别位于 `sorting_bin_a/b/c`，XY 严格使用箱底实际尺寸，不增加容差，Z 为相对箱底 `0-30 cm`。
-
 ### task1_vision
 
 拟合结果调取见 [task1_vision/README.md](src/task1_vision/README.md)。
 
 ### task2_vision
 
-直接从真值读取, 提供物体xyz和yaw, 包括同一类别的不同编号
+假bbox + 深度CAD拟合,效果在5mm 5deg误差左右
+
+### data.py
+
+任务一, 二的yolo需要的bbox和类别数据自动采集脚本, 直接python3运行即可, 需要主脚本部分函数, 需要task1/2_vision包
 
 ### task2_motion
 
-动作逻辑和任务一一样, 参考系为baselink, 采用ik+q插值+wbc, xyz 偏置都是 baselink 坐标系的偏置 (数采原本的偏置是局部坐标系).  
-目前的问题还是有不稳定 (目前根据 seed 1-10 调试的参数), C, B类物件距离过近时可能会相互干扰(seed 4), C类螺丝刀上升和放置的轨迹还可以优化,以及没有测试交接逻辑.
+目前的问题为: C类螺丝刀上升和放置的轨迹还可以优化, 交接逻辑还没测试
 
 ## 运行
 
@@ -136,6 +130,12 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 4
 # 另开终端读取任务二六个工件在 base_link 下的位姿和 yaw 真值
 source devel/setup.zsh
 rostopic echo /task2_vision/objects_json
+
+# 显示头部 RGB 和 qpos 投影的 A/B/C 类别框
+rosrun rqt_gui rqt_gui --standalone task2_vision/Task2Vision
+
+# 查看可直接对照模式 0 真值的 RGB-D/CAD 位姿拟合输出
+rostopic echo /task2_depth_xy/objects_json
 ```
 
 ### 任务一
@@ -152,7 +152,9 @@ python3 src/challenge_cup_task_template/scripts/test.py
 source devel/setup.zsh
 rosrun rqt_gui rqt_gui --standalone task1_vision/Task1Vision --args -h
 
-# task1自动数据采集
+# task1/task2 自动数据采集；先在 data.py 顶部设置 DATA_TASK
+# task1 输出到 data/scene1_parcel_yolo
+# task2 输出到 data/scene2_parts_yolo，类别 A/B/C 对应 0/1/2
 source devel/setup.zsh
 python3 src/challenge_cup_task_template/scripts/data.py
 

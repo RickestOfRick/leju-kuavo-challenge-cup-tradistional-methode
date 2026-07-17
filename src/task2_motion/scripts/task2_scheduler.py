@@ -9,6 +9,7 @@ import rospy
 import task2_geometry as geometry
 import task2_perception as perception
 from task2_config import (
+    AB_PRE_GRASP_ORIENTATION_RETRY_DEG,
     ARM_MOVE_TIME,
     C_PLACE_IK_Z_FRACTIONS,
     GRIPPER_CLOSE_TIME,
@@ -18,6 +19,7 @@ from task2_config import (
     IK_POS_COST_WEIGHT,
     LIFT_OFFSETS_BY_CLASS,
     PLACE_POSITIONS_BASE,
+    PLACE_Y_OFFSETS_BY_CLASS,
     PRE_GRASP_Z_OFFSET,
     RELEASE_DWELL,
     SIDE_LIFT_JOINTS_DEG,
@@ -26,7 +28,7 @@ from task2_config import (
 from task2_motion import RobotController, fmt
 
 
-def _place_position(side, bin_name):
+def _place_position(side, bin_name, object_name):
     try:
         position = [
             float(value) for value in PLACE_POSITIONS_BASE[side][bin_name]
@@ -37,6 +39,22 @@ def _place_position(side, bin_name):
         raise ValueError(
             "place XYZ for {} -> {} must contain xyz".format(side, bin_name)
         )
+    try:
+        class_name, instance_text = str(object_name).rsplit("_", 1)
+        instance_index = int(instance_text) - 1
+        y_offsets = [
+            float(value) for value in PLACE_Y_OFFSETS_BY_CLASS[class_name]
+        ]
+        y_offset = y_offsets[instance_index]
+    except (KeyError, ValueError, IndexError):
+        raise RuntimeError("no place Y offset for {}".format(object_name))
+    if len(y_offsets) != 2 or instance_index not in (0, 1):
+        raise ValueError(
+            "place Y offsets for {} must map instances 1 and 2".format(
+                class_name
+            )
+        )
+    position[1] += y_offset
     return position
 
 
@@ -51,6 +69,110 @@ def _lift_offset(object_name):
     return offset
 
 
+def _approach_initial_pre_grasp(controller, job):
+    """A/B 在 pre-grasp 实测两种窄边姿态，并保留 FK 误差较小者。"""
+    object_name = job["object"]
+    side = job["arm"]
+    observation = job["observation"]
+    pre_grasp = list(job["grasp_position"])
+    pre_grasp[2] += PRE_GRASP_Z_OFFSET
+    original_grasp = list(job["grasp_quaternion"])
+
+    controller.gripper.open(side)
+    _, original_error = controller.move_pose(
+        side,
+        pre_grasp,
+        original_grasp,
+        "{}_pre_grasp".format(object_name),
+        pos_cost_weight=IK_POS_COST_WEIGHT,
+        return_orientation_error=True,
+    )
+    original_error_deg = math.degrees(original_error)
+    if (
+        observation["class_name"] not in ("part_type_a", "part_type_b")
+        or original_error_deg <= AB_PRE_GRASP_ORIENTATION_RETRY_DEG
+    ):
+        return
+
+    flipped_yaw_offset = -float(job["grasp_yaw_offset"])
+    flipped_grasp = geometry.grasp_quaternion(
+        observation, side, yaw_offset=flipped_yaw_offset
+    )
+    flipped_lift = geometry.lift_quaternion(
+        observation, side, yaw_offset=flipped_yaw_offset
+    )
+    rospy.logwarn(
+        "task2: [%s_pre_grasp] ori_err=%.2f deg > %.2f deg; "
+        "returning to work pose and trying the 180-deg yaw alternative",
+        object_name,
+        original_error_deg,
+        AB_PRE_GRASP_ORIENTATION_RETRY_DEG,
+    )
+    controller.move_joints(
+        WORK_POSE_JOINTS_DEG,
+        "{}_yaw_retry_return_work".format(object_name),
+        side=side,
+        checked_keypoint=True,
+    )
+    flipped_error = None
+    flipped_failure = None
+    try:
+        _, flipped_error = controller.move_pose(
+            side,
+            pre_grasp,
+            flipped_grasp,
+            "{}_pre_grasp_yaw_flipped".format(object_name),
+            pos_cost_weight=IK_POS_COST_WEIGHT,
+            return_orientation_error=True,
+        )
+    except RuntimeError as error:
+        if rospy.is_shutdown():
+            raise
+        flipped_failure = str(error)
+
+    if flipped_error is not None and flipped_error < original_error:
+        flipped_error_deg = math.degrees(flipped_error)
+        job["grasp_yaw_offset"] = flipped_yaw_offset
+        job["grasp_quaternion"] = flipped_grasp
+        job["lift_quaternion"] = flipped_lift
+        rospy.logwarn(
+            "task2: %s selected flipped yaw at pre-grasp: "
+            "ori_err %.2f -> %.2f deg",
+            object_name,
+            original_error_deg,
+            flipped_error_deg,
+        )
+        return
+
+    if flipped_error is None:
+        rospy.logwarn(
+            "task2: %s flipped yaw pre-grasp failed (%s); restoring original yaw",
+            object_name,
+            flipped_failure,
+        )
+    else:
+        rospy.logwarn(
+            "task2: %s flipped yaw did not improve pre-grasp ori_err "
+            "(original=%.2f deg flipped=%.2f deg); restoring original yaw",
+            object_name,
+            original_error_deg,
+            math.degrees(flipped_error),
+        )
+    controller.move_joints(
+        WORK_POSE_JOINTS_DEG,
+        "{}_yaw_restore_return_work".format(object_name),
+        side=side,
+        checked_keypoint=True,
+    )
+    controller.move_pose(
+        side,
+        pre_grasp,
+        original_grasp,
+        "{}_pre_grasp_yaw_restored".format(object_name),
+        pos_cost_weight=IK_POS_COST_WEIGHT,
+    )
+
+
 def _pick_at_pose(
     controller,
     object_name,
@@ -59,6 +181,7 @@ def _pick_at_pose(
     grasp_quaternion,
     lift_quaternion,
     label_prefix,
+    pre_grasp_reached=False,
 ):
     pre_grasp = list(grasp_position)
     pre_grasp[2] += PRE_GRASP_Z_OFFSET
@@ -67,14 +190,15 @@ def _pick_at_pose(
         grasp_position[index] + lift_offset[index] for index in range(3)
     ]
 
-    controller.gripper.open(side)
-    controller.move_pose(
-        side,
-        pre_grasp,
-        grasp_quaternion,
-        "{}_pre_grasp".format(label_prefix),
-        pos_cost_weight=IK_POS_COST_WEIGHT,
-    )
+    if not pre_grasp_reached:
+        controller.gripper.open(side)
+        controller.move_pose(
+            side,
+            pre_grasp,
+            grasp_quaternion,
+            "{}_pre_grasp".format(label_prefix),
+            pos_cost_weight=IK_POS_COST_WEIGHT,
+        )
     controller.move_pose(
         side,
         grasp_position,
@@ -151,7 +275,7 @@ def _place_in_bin(
     held_quaternion,
     lift_position,
 ):
-    place_position = _place_position(side, bin_name)
+    place_position = _place_position(side, bin_name, object_name)
     if str(object_name).startswith("part_type_c_"):
         fractions = [float(value) for value in C_PLACE_IK_Z_FRACTIONS]
         if not fractions or any(
@@ -237,6 +361,7 @@ def run_scene2_task(seed, object_poses=None):
                 job["arm"],
                 job["bin"],
             )
+            _approach_initial_pre_grasp(controller, job)
             lift_position = _pick_at_pose(
                 controller,
                 job["object"],
@@ -245,6 +370,7 @@ def run_scene2_task(seed, object_poses=None):
                 job["grasp_quaternion"],
                 job["lift_quaternion"],
                 job["object"],
+                pre_grasp_reached=True,
             )
 
             target_arm = geometry.handoff_target_arm(job)

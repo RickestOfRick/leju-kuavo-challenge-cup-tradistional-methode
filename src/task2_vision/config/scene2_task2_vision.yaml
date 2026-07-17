@@ -1,6 +1,113 @@
+# 模式由 launch 的 vision_mode 覆盖：0=完整真值，1=RGB-D/CAD 拟合 XYZ/yaw。
 # 真值在整个场景实例中保持不变，低频重复发布便于后启动的订阅者读取。
 publish_hz: 2.0
 # 使用机器人浮动基座的 qpos，将 world 真值转换到 base_link。
 qpos_topic: /mujoco/qpos
 robot_base_qpos_addr: 0
 qpos_timeout: 20.0
+# qpos 工件碰撞几何投影到头部 RGB 图像时使用的相机信息和 TF。
+camera_info_topic: /cam_h/color/camera_info
+camera_frame_id: "Head Camera View"
+head_image_topic: /cam_h/color/image_raw/compressed
+tf_timeout: 0.02
+# 覆盖 mesh 边缘的抗锯齿像素，避免渲染轮廓刚好落到框外。
+bbox_padding_pixels: 2.0
+
+# qpos 框只用于生成每个物体的深度 ROI；拟合结果发布到
+# /task2_depth_xy/objects_json，不覆盖原真值话题。
+truth_objects_topic: /task2_vision/objects_json
+# 模式 1 的 motion 在开始等待时先按模式 0 读取一次完整真值并发布到此话题。
+# 深度拟合收到该同运行参考后清空旧样本，所有锁定坐标均换算到该参考基座。
+mode0_reference_topic: /task2_vision/mode0_reference_json
+depth_image_topic: /cam_h/depth/image_raw/compressedDepth
+color_image_topic: /cam_h/color/image_raw/compressed
+depth_xy_publish_hz: 2.0
+depth_min_m: 0.15
+depth_max_m: 3.0
+
+# 所有绿色像素都视为桌面并从物体前景中严格排除。HSV 使用 OpenCV 范围：
+# H=0..179，S/V=0..255；膨胀 1 px 同时去掉绿色抗锯齿边缘。
+green_table_filter_enabled: true
+green_table_hsv_lower: [35, 40, 10]
+green_table_hsv_upper: [90, 255, 255]
+# 阴影会降低 V，但近似保持 RGB 比例；归一化色度用于识别暗绿色。
+green_table_chroma_min: 0.38
+green_table_chroma_dominance_min: 0.04
+green_table_shadow_min_intensity_sum: 3.0
+green_table_dilate_pixels: 1
+color_depth_max_skew_sec: 0.20
+
+# 全局桌面平面：下采样点云、排除六个物体框后，在 base_link 工作区做 RANSAC。
+table_fit_stride: 4
+table_fit_x_range: [0.15, 0.52]
+table_fit_y_range: [-0.50, 0.50]
+table_fit_z_range: [-0.25, 0.05]
+table_ransac_iterations: 240
+table_ransac_distance_threshold_m: 0.0035
+table_ransac_max_tilt_deg: 12.0
+table_histogram_bin_size_m: 0.004
+table_roi_exclusion_scale: 1.12
+
+# 逐物体深度前景和受限 CAD region+depth 位姿配准。
+depth_roi_scale: 1.03
+object_min_height_above_table_m: 0.0025
+object_max_height_above_table_m: 0.15
+object_component_min_pixels: 5
+object_fit_min_points: 25
+object_bound_percentiles: [1.0, 99.0]
+
+# 类别静置姿态固定，物体 yaw 不读取逐 seed 真值。yaw_prior 命名只比较每类
+# 两个固定先验；relative_position 命名逐帧联合分配两个 +/-20 degree 窗口。
+cad_yaw_refine_top_k: 1
+cad_yaw_refinement_steps_deg: [3.0, 1.0]
+# relative_position 编号模式：每个先验窗口各自 +/-20 degree，10 degree 粗搜。
+cad_yaw_prior_window_deg: 20.0
+cad_yaw_prior_window_step_deg: 5.0
+# 窗口内使用 CAD 数据分 + weight*(yaw 偏离先验/sigma)^2。先验只提供搜索
+# 范围，因此该项仅作弱平局判定，明显更好的 CAD 证据仍可选择窗口边缘。
+cad_yaw_prior_regularization_weight: 0.2
+cad_yaw_prior_sigma_deg_by_class:
+  part_type_a: 12.0
+  part_type_b: 8.0
+  part_type_c: 12.0
+cad_yaw_handle_score_weight: 1.0
+cad_yaw_surface_samples: 1200
+cad_yaw_xy_iterations: 2
+c_handle_surface_samples: 2000
+c_handle_maximum_iterations: 6
+
+# 每个 yaw 候选使用 CAD 可见轮廓到观测 mask 的有符号距离残差，以及 CAD
+# 法线到 RGB-D 对应点的点到面残差，联合建立 2x2 XY Gauss-Newton 方程。
+cad_gn_surface_samples: 5000
+cad_gn_maximum_iterations: 6
+cad_gn_region_sigma_px: 2.0
+cad_gn_depth_sigma_m: 0.003
+cad_gn_region_weight: 1.0
+cad_gn_depth_weight: 1.0
+cad_gn_robust_delta: 2.5
+cad_gn_maximum_depth_residual_m: 0.04
+cad_gn_maximum_correspondence_pixels: 4.0
+cad_gn_maximum_step_m: 0.02
+cad_gn_maximum_translation_m: 0.08
+cad_gn_convergence_translation_m: 0.0002
+cad_gn_damping: 0.001
+cad_gn_rendered_mask_dilate_pixels: 1
+cad_gn_maximum_region_points: 600
+cad_gn_maximum_depth_points: 1600
+# CAD->观测和观测->CAD 两个覆盖率都必须达到该阈值，避免 C 类只对齐局部。
+cad_gn_minimum_bidirectional_coverage: 0.45
+cad_gn_minimum_iou: 0.30
+# A/B 的细小或暗色轮廓更容易被绿色边缘、反光和深度量化侵蚀；C 保持严格门限，
+# 防止只匹配手柄或杆。拒绝结果仍会发布到 RQT，但不会计入 5 帧。
+cad_gn_minimum_bidirectional_coverage_by_class:
+  part_type_a: 0.25
+  part_type_b: 0.30
+  part_type_c: 0.45
+cad_gn_minimum_iou_by_class:
+  part_type_a: 0.15
+  part_type_b: 0.18
+  part_type_c: 0.30
+
+# 同一帧内六个物体都有效就计数；满 5 帧后锁定 XYZ/yaw 中位数。
+pose_median_frames: 5
+depth_fit_random_seed: 42

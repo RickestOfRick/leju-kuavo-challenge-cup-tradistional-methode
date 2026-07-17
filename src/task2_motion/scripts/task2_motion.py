@@ -648,6 +648,7 @@ class RobotController:
         target_position,
         target_quaternion,
         label,
+        return_orientation_error=False,
     ):
         actual_pose = self._pose_for_side(self.call_fk(stable_joints), side)
         actual_position = list(actual_pose.pos_xyz)
@@ -692,6 +693,8 @@ class RobotController:
                 math.degrees(orientation_error),
                 math.degrees(FK_ORIENTATION_WARN_RAD),
             )
+        if return_orientation_error:
+            return stable_joints, orientation_error
         return stable_joints
 
     def move_pose(
@@ -703,7 +706,12 @@ class RobotController:
         pos_cost_weight=IK_POS_COST_WEIGHT,
         move_time=ARM_MOVE_TIME,
         checked_keypoint=True,
+        return_orientation_error=False,
     ):
+        if return_orientation_error and not checked_keypoint:
+            raise ValueError(
+                "orientation error requires a checked pose keypoint"
+            )
         current = self.read_arm_joints()
         target_position = [float(value) for value in target_position]
 
@@ -729,6 +737,7 @@ class RobotController:
             target_position,
             target_quaternion,
             label,
+            return_orientation_error=return_orientation_error,
         )
 
     def move_pose_via_ik(

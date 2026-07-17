@@ -3,32 +3,21 @@
 
 import math
 
-# 视觉输入。后续接入 YOLO 时只需保持相同 JSON 字段和 base_link 坐标语义。
+# 独立运行 task2_motion 时默认使用完整真值；统一入口会按模式覆盖该话题。
 VISION_TOPIC = "/task2_vision/objects_json"
+VISION_TRUTH_TOPIC = "/task2_vision/objects_json"
+VISION_MODE0_REFERENCE_TOPIC = "/task2_vision/mode0_reference_json"
 VISION_FRAME_ID = "base_link"
-VISION_TIMEOUT = 30.0
+VISION_TIMEOUT = 90.0
 VISION_MIN_CONFIDENCE = 0.0
 VISION_ALLOWED_POSITION_SOURCES = [
     "challenge_secret_layout_ground_truth",
+    "qpos_bbox_depth_table_plane_xy_fit",
+    "qpos_bbox_cad_depth_render_xy_fit",
+    "qpos_bbox_region_depth_gn_xy_fit",
+    "qpos_bbox_region_depth_xyz_yaw_fit",
     "yolo_depth_pose",
 ]
-
-OBJECT_NAMES = [
-    "part_type_a_1",
-    "part_type_a_2",
-    "part_type_b_1",
-    "part_type_b_2",
-    "part_type_c_1",
-    "part_type_c_2",
-]
-OBJECT_TO_BIN = {
-    "part_type_a_1": "sorting_bin_a",
-    "part_type_a_2": "sorting_bin_a",
-    "part_type_b_1": "sorting_bin_b",
-    "part_type_b_2": "sorting_bin_b",
-    "part_type_c_1": "sorting_bin_c",
-    "part_type_c_2": "sorting_bin_c",
-}
 
 # 数采脚本中的默认顺序；可通过下方开关恢复原动态优先级。
 SORTING_OBJECT_ORDER = [
@@ -40,14 +29,14 @@ SORTING_OBJECT_ORDER = [
     "part_type_c_2",
 ]
 # False=严格使用上面的默认顺序；True=启用无交接优先、再按 |Y| 排序。
-SORTING_USE_DYNAMIC_PRIORITY = False
+SORTING_USE_DYNAMIC_PRIORITY = True
 
 # base_link 坐标系下的固定抓取偏置：X 正向前、Y 正向左，不随工件 yaw 旋转。
 # 数值由原局部偏置按 scene2 默认布局等效转换，默认布局下抓取目标保持不变。
 GRASP_OFFSETS_BASE = {
     "part_type_a_1": {
         "left": [0.019725109, 0.005993335, 0.05],
-        "right": [0.023731775, -0.055718444, 0.05],
+        "right": [0.023731775, -0.048718444, 0.05],
     },
     "part_type_a_2": {
         "left": [0.024611612, 0.004389598, 0.05],
@@ -58,8 +47,8 @@ GRASP_OFFSETS_BASE = {
         "right": [0.017181181, -0.012286934, 0.05],
     },
     "part_type_b_2": {
-        "left": [0.017518057, 0.021593847, 0.05],
-        "right": [0.000924211, 0.014111904, 0.05],
+        "left": [0.012518057, 0.026593847, 0.05],
+        "right": [0.010924211, 0.006111904, 0.05],
     },
     "part_type_c_1": {
         "left": [0.01564838, 0.044912331, 0.04],
@@ -96,8 +85,8 @@ CLASS_POSES = {
     },
 }
 GRASP_NARROW_EDGE_YAW_OFFSET = math.pi / 2
-# A1 的物理长轴是局部 Y；与 base_link Y 平行时使用另一窄边。
-A1_BASE_Y_PARALLEL_TOL_DEG = 15.0
+# A/B 初次到达 pre-grasp 后，超过该 FK 姿态误差才试探另一窄边。
+AB_PRE_GRASP_ORIENTATION_RETRY_DEG = 30.0
 
 # base_link 下的末端经验修正。旧数采的 X/Z 常量是 world 到基座的平移，现已由视觉完成。
 HAND_EE_CALIBRATION = {
@@ -273,12 +262,18 @@ PLACE_POSITIONS_BASE = {
     },
     "left": {
         "sorting_bin_b": [0.535486, -0.013608, 0.244811],
-        "sorting_bin_c": [0.565486, 0.416392, 0.364811],
+        "sorting_bin_c": [0.580486, 0.416392, 0.364811],
     },
+}
+# 各类工件按动作语义编号 _1/_2 施加的放箱 Y 偏置，单位 m。
+PLACE_Y_OFFSETS_BY_CLASS = {
+    "part_type_a": [-0.0, 0.0],
+    "part_type_b": [-0.0, 0.0],
+    "part_type_c": [-0.02, 0.02],
 }
 
 # 抓取、交接与放置关键点。
-PRE_GRASP_Z_OFFSET = 0.07
+PRE_GRASP_Z_OFFSET = 0.06
 LIFT_OFFSETS_BY_CLASS = {
     "part_type_a": [0.0, 0.0, 0.32],
     "part_type_b": [0.0, 0.0, 0.32],

@@ -4,13 +4,11 @@
 import math
 
 from task2_config import (
-    A1_BASE_Y_PARALLEL_TOL_DEG,
     CLASS_POSES,
     GRASP_NARROW_EDGE_YAW_OFFSET,
     GRASP_OFFSETS_BASE,
     HANDOFF_CONFIG,
     HAND_EE_CALIBRATION,
-    OBJECT_TO_BIN,
     SORTING_OBJECT_ORDER,
     SORTING_USE_DYNAMIC_PRIORITY,
 )
@@ -18,6 +16,13 @@ from task2_config import (
 
 def _class_name(object_name):
     return str(object_name).rsplit("_", 1)[0]
+
+
+def _sorting_bin_for_class(class_name):
+    class_name = str(class_name)
+    if class_name not in ("part_type_a", "part_type_b", "part_type_c"):
+        raise ValueError("unsupported task2 part class: {}".format(class_name))
+    return "sorting_bin_{}".format(class_name.rsplit("_", 1)[1])
 
 
 def _quat_normalize(quat):
@@ -154,18 +159,6 @@ def narrow_edge_offset(observation, arm):
     )
     if _other_narrow_edge(observation, arm):
         selected = -selected
-    if observation["name"] == "part_type_a_1":
-        local_y_base = rotate_vector(
-            observation["orientation"], [0.0, 1.0, 0.0]
-        )[:2]
-        axis_norm = math.hypot(local_y_base[0], local_y_base[1])
-        parallel_cosine = (
-            abs(local_y_base[1]) / axis_norm if axis_norm > 1e-9 else 0.0
-        )
-        if parallel_cosine >= math.cos(
-            math.radians(A1_BASE_Y_PARALLEL_TOL_DEG)
-        ):
-            selected = -selected
     return selected
 
 
@@ -191,21 +184,25 @@ def grasp_target(observation, arm):
     return apply_hand_calibration(reference, arm)
 
 
-def grasp_quaternion(observation, arm):
+def grasp_quaternion(observation, arm, yaw_offset=None):
+    if yaw_offset is None:
+        yaw_offset = narrow_edge_offset(observation, arm)
     return pose_quaternion(
         CLASS_POSES[observation["class_name"]]["grasp"],
         observation["yaw"],
         arm=arm,
-        yaw_offset=narrow_edge_offset(observation, arm),
+        yaw_offset=yaw_offset,
     )
 
 
-def lift_quaternion(observation, arm):
+def lift_quaternion(observation, arm, yaw_offset=None):
+    if yaw_offset is None:
+        yaw_offset = narrow_edge_offset(observation, arm)
     return pose_quaternion(
         CLASS_POSES[observation["class_name"]]["lift"],
         observation["yaw"],
         arm=arm,
-        yaw_offset=narrow_edge_offset(observation, arm),
+        yaw_offset=yaw_offset,
     )
 
 
@@ -235,15 +232,21 @@ def build_jobs(observations):
     for name in SORTING_OBJECT_ORDER:
         observation = observations[name]
         arm = select_arm(observation)
+        yaw_offset = narrow_edge_offset(observation, arm)
         jobs.append(
             {
                 "object": name,
-                "bin": OBJECT_TO_BIN[name],
+                "bin": _sorting_bin_for_class(observation["class_name"]),
                 "arm": arm,
                 "observation": observation,
                 "grasp_position": grasp_target(observation, arm),
-                "grasp_quaternion": grasp_quaternion(observation, arm),
-                "lift_quaternion": lift_quaternion(observation, arm),
+                "grasp_yaw_offset": yaw_offset,
+                "grasp_quaternion": grasp_quaternion(
+                    observation, arm, yaw_offset=yaw_offset
+                ),
+                "lift_quaternion": lift_quaternion(
+                    observation, arm, yaw_offset=yaw_offset
+                ),
             }
         )
     if not SORTING_USE_DYNAMIC_PRIORITY:

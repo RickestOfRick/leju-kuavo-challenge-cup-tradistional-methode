@@ -25,6 +25,17 @@ NEED_OPERATOR_ENTER = 0
 # 任务一视觉模式: 0=qpos 投影假框+深度拟合, 1=YOLO RGB 框+深度拟合。
 TASK1_VISION_MODE = 1
 
+# 任务二视觉模式: 0=完整真值, 1=qpos 类别框+RGB-D/CAD 拟合 XYZ 和 yaw。
+TASK2_VISION_MODE = 1
+
+# 任务二同类工件编号: True=按拟合 yaw 与固定先验匹配；False=按相对 Y 位置。
+TASK2_USE_YAW_PRIOR_INSTANCE_MATCHING = True
+
+TASK2_VISION_TOPICS = {
+    0: "/task2_vision/objects_json",
+    1: "/task2_depth_xy/objects_json",
+}
+
 TASK1_PACKAGE = "task1_pick"
 TASK1_MODULE = "task1_node"
 TASK2_PACKAGE = "task2_motion"
@@ -62,6 +73,14 @@ SCENE_CONFIGS = {
         },
     },
 }
+
+
+def _task2_instance_naming_method():
+    return (
+        "yaw_prior"
+        if bool(TASK2_USE_YAW_PRIOR_INSTANCE_MATCHING)
+        else "relative_position"
+    )
 
 
 # 按进程组逐级停止子进程, 避免 Ctrl+C 后 roslaunch 子节点残留。
@@ -208,6 +227,10 @@ def _start_scene_services(scene, seed=0):
             ).start()
         ]
     if scene == "scene2":
+        vision_mode = int(TASK2_VISION_MODE)
+        if vision_mode not in TASK2_VISION_TOPICS:
+            raise RuntimeError("TASK2_VISION_MODE only supports 0 or 1")
+        instance_naming_method = _task2_instance_naming_method()
         return [
             ManagedProcess(
                 "task2_vision",
@@ -216,6 +239,8 @@ def _start_scene_services(scene, seed=0):
                     "task2_vision",
                     "task2_vision_scene2.launch",
                     "seed:={}".format(int(seed)),
+                    "vision_mode:={}".format(vision_mode),
+                    "instance_naming_method:={}".format(instance_naming_method),
                 ],
             ).start()
         ]
@@ -228,14 +253,17 @@ def _stop_scene_services(services):
         service.stop()
 
 
-# 根据场景配置设置头部相机姿态。
-def _apply_head_camera(head_camera):
+# 根据场景配置调用各任务自己的头部相机控制实现。
+def _apply_head_camera(scene, head_camera):
     if not head_camera.get("enabled", False):
         return
     import rospy
 
     try:
-        from task1_vision.head_control import apply_head_camera_pose_from_params
+        if scene == "scene2":
+            from task2_vision.head_control import apply_head_camera_pose_from_params
+        else:
+            from task1_vision.head_control import apply_head_camera_pose_from_params
 
         apply_head_camera_pose_from_params(
             enabled=True,
@@ -247,7 +275,7 @@ def _apply_head_camera(head_camera):
         rospy.set_param("~head_pitch_deg", float(head_camera.get("pitch_deg", 8.0)))
         rospy.set_param("~skip_init_head_motion", True)
     except Exception as exc:
-        rospy.logwarn("task1_vision head camera pose setup failed: %s", exc)
+        rospy.logwarn("%s head camera pose setup failed: %s", scene, exc)
 
 
 # 动作开始前等待人工确认。
@@ -275,6 +303,25 @@ def _configure_task1_vision_source():
     rospy.loginfo(
         "challenge_task: task1 vision allowed position sources=%s",
         allowed_sources,
+    )
+
+
+def _configure_task2_vision_source():
+    import rospy
+
+    vision_mode = int(TASK2_VISION_MODE)
+    if vision_mode not in TASK2_VISION_TOPICS:
+        raise RuntimeError("TASK2_VISION_MODE only supports 0 or 1")
+    topic = TASK2_VISION_TOPICS[vision_mode]
+    instance_naming_method = _task2_instance_naming_method()
+    rospy.set_param("~task2_vision_mode", vision_mode)
+    rospy.set_param("~task2_vision_topic", topic)
+    rospy.set_param("~task2_instance_naming_method", instance_naming_method)
+    rospy.loginfo(
+        "challenge_task: task2 vision mode=%d topic=%s instance_naming=%s",
+        vision_mode,
+        topic,
+        instance_naming_method,
     )
 
 
@@ -307,6 +354,7 @@ def _run_scene2_task2(seed):
 
     task2_node = _load_task2_node()
     rospy.loginfo("challenge_task: task2 entry=%s/%s", TASK2_PACKAGE, TASK2_MODULE)
+    _configure_task2_vision_source()
     object_poses = task2_node.init_from_task2_vision()
     rospy.loginfo(
         GREEN + "task2: fixed initial object poses from task2_vision: %s" + RESET,
@@ -342,7 +390,7 @@ def run_scene(
 
         rospy.loginfo("=== %s任务启动 ===", config["title"])
         services = _start_scene_services(scene, seed)
-        _apply_head_camera(config.get("head_camera", {}))
+        _apply_head_camera(scene, config.get("head_camera", {}))
         rospy.sleep(1.0)
         rospy.loginfo("场景实例已初始化。")
 

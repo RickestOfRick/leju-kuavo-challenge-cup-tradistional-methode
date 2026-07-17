@@ -11,7 +11,7 @@ YOLO、深度和 yaw 拟合时，应直接输出相同的 motion 空间编号。
 
 ## 模块结构
 
-- `task2_config.py`：所有可调参数，包括 base_link 抓取偏置、交接点、固定放箱关节角、IK、插值和稳定阈值。
+- `task2_config.py`：所有可调参数，包括 base_link 抓取偏置、按 `_1/_2` 设置的放箱 Y 偏置、交接点、固定放箱关节角、IK、插值和稳定阈值。
 - `task2_perception.py`：读取并固定六个 `base_link` 工件位姿。
 - `task2_geometry.py`：计算作业手、base_link 抓取偏置、窄边方向、抓取姿态和交接目标。
 - `task2_motion.py`：WBC 控制、软 IK、二分 fallback、关节插值、稳定等待和 FK 误差。

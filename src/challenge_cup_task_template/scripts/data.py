@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Collect scene1 parcel RGB, YOLO boxes, and XYZ truth by seed."""
+"""Collect task1/task2 RGB, qpos-projected YOLO boxes, and metadata by seed."""
 
 import collections
 import json
@@ -24,10 +24,14 @@ RESET = "\033[0m"
 # 全局采集参数
 # =============================================================================
 
+# task1=4 个 parcel 单类别；task2=6 个部件、A/B/C 三类别。
+DATA_TASK = "task2"
+
+# 两个任务共用同一 seed 范围和相机视角采样逻辑。
 SEED_START = 1
 SEED_END = 1000
 
-# 每个 seed 在任务一视角采三张图；pitch 在范围内均匀随机且由 seed 决定。
+# 每个 seed 采三张图；pitch 在范围内均匀随机且由 seed 决定。
 PITCH_VIEWS_PER_SEED = 3
 PITCH_MIN_DEG = 8.0
 PITCH_MAX_DEG = 24.0
@@ -37,12 +41,53 @@ HEAD_STABLE_DURATION = 0.2
 HEAD_STABLE_SPEED_DEG_S = 1.0
 HEAD_STABLE_TIMEOUT = 5.0
 
+TASK_CONFIGS = {
+    "task1": {
+        "scene": "scene1",
+        "dataset_directory": "scene1_parcel_yolo",
+        "objects_topic": "/task1_vision/objects_json",
+        "vision_package": "task1_vision",
+        "vision_launch": "task1_vision_scene1.launch",
+        "object_names": ("parcel_1", "parcel_2", "parcel_3", "parcel_4"),
+        "class_ids": {"parcel": 0},
+    },
+    "task2": {
+        "scene": "scene2",
+        "dataset_directory": "scene2_parts_yolo",
+        "objects_topic": "/task2_vision/objects_json",
+        "vision_package": "task2_vision",
+        "vision_launch": "task2_vision_scene2.launch",
+        "object_names": (
+            "part_type_a_1",
+            "part_type_a_2",
+            "part_type_b_1",
+            "part_type_b_2",
+            "part_type_c_1",
+            "part_type_c_2",
+        ),
+        "class_ids": {
+            "part_type_a": 0,
+            "part_type_b": 1,
+            "part_type_c": 2,
+        },
+    },
+}
+if DATA_TASK not in TASK_CONFIGS:
+    raise ValueError("DATA_TASK must be task1 or task2")
+TASK_CONFIG = TASK_CONFIGS[DATA_TASK]
+SCENE_NAME = str(TASK_CONFIG["scene"])
+OBJECT_NAMES = tuple(TASK_CONFIG["object_names"])
+CLASS_ID_BY_NAME = dict(TASK_CONFIG["class_ids"])
 DATASET_ROOT = os.path.abspath(
-    os.path.join(SCRIPT_DIR, "..", "..", "..", "data", "scene1_parcel_yolo")
+    os.path.join(
+        SCRIPT_DIR,
+        "..",
+        "..",
+        "..",
+        "data",
+        TASK_CONFIG["dataset_directory"],
+    )
 )
-PARCEL_NAMES = ("parcel_1", "parcel_2", "parcel_3", "parcel_4")
-YOLO_CLASS_ID = 0
-YOLO_CLASS_NAME = "parcel"
 
 # seed 能被该值整除时写入 val，其余写入 train。
 VALIDATION_SEED_MODULO = 10
@@ -54,28 +99,31 @@ CAPTURE_TIMEOUT_SEC = 20.0
 CAPTURE_ATTEMPTS_PER_VIEW = 3
 IMAGE_SYNC_TOLERANCE_SEC = 0.08
 
-OBJECTS_TOPIC = "/task1_vision/objects_json"
+OBJECTS_TOPIC = str(TASK_CONFIG["objects_topic"])
 IMAGE_TOPIC = "/cam_h/color/image_raw/compressed"
-WORKER_RESULT_PREFIX = "__PARCEL_DATA_RESULT__ "
-WORKER_SEED_ENV = "PARCEL_DATA_WORKER_SEED"
-WORKER_ROOT_ENV = "PARCEL_DATA_WORKER_ROOT"
+WORKER_RESULT_PREFIX = "__CHALLENGE_DATA_RESULT__ "
+WORKER_SEED_ENV = "CHALLENGE_DATA_WORKER_SEED"
+WORKER_ROOT_ENV = "CHALLENGE_DATA_WORKER_ROOT"
 
 # 每轮采集只允许存在一套以下进程。既用于启动前清除上次异常退出的
 # 残留，也用于当前 seed 完成后的兜底回收。
 RESIDUAL_PROCESS_MARKERS = (
     SCRIPT_PATH,
     "task1_vision_scene1.launch",
+    "task2_vision_scene2.launch",
     "load_kuavo_mujoco_challenge.launch",
     "challenge_secret.run_match_timer",
     "challenge_secret.run_cheat_monitor",
     "__name:=task1_vision",
+    "__name:=task2_vision",
     "__name:=nodelet_manager",
     "__name:=humanoid_sqp_mpc",
     "__name:=arms_ik_node",
 )
 RESIDUAL_ROS_NODE_PREFIXES = (
     "/task1_vision",
-    "/parcel_data_collector",
+    "/task2_vision",
+    "/challenge_data_collector",
     "/nodelet_",
     "/ekf_se",
     "/arms_ik_node",
@@ -362,18 +410,25 @@ def _prepare_dataset(root):
         for kind in ("images", "labels", "metadata"):
             os.makedirs(os.path.join(root, kind, split), exist_ok=True)
     os.makedirs(os.path.join(root, "seeds"), exist_ok=True)
+    ordered_classes = sorted(CLASS_ID_BY_NAME.items(), key=lambda item: item[1])
+    expected_ids = list(range(len(ordered_classes)))
+    if [class_id for _, class_id in ordered_classes] != expected_ids:
+        raise ValueError("YOLO class ids must be contiguous and start at zero")
     dataset_yaml = "\n".join(
         [
             "path: {}".format(root),
             "train: images/train",
             "val: images/val",
             "names:",
-            "  0: parcel",
-            "",
         ]
+        + ["  {}: {}".format(class_id, name) for name, class_id in ordered_classes]
+        + [""]
     )
     _atomic_write_text(os.path.join(root, "data.yaml"), dataset_yaml)
-    _atomic_write_text(os.path.join(root, "classes.txt"), YOLO_CLASS_NAME + "\n")
+    _atomic_write_text(
+        os.path.join(root, "classes.txt"),
+        "".join("{}\n".format(name) for name, _ in ordered_classes),
+    )
 
 
 def _seed_marker_path(root, seed):
@@ -388,6 +443,9 @@ def _load_seed_marker(root, seed):
     except Exception:
         return None
     if int(marker.get("seed", -1)) != int(seed):
+        return None
+    marker_task = marker.get("task")
+    if marker_task is not None and str(marker_task) != DATA_TASK:
         return None
     for sample in marker.get("samples", []):
         for key in ("image", "label", "metadata"):
@@ -446,15 +504,24 @@ def _float_vector(value, length=3):
     return result
 
 
-def _parcel_objects(payload):
+def _object_base_position(obj):
+    for key in ("truth_position", "position"):
+        position = _float_vector(obj.get(key, []))
+        if position is not None:
+            return position
+    return None
+
+
+def _dataset_objects(payload):
     by_name = {}
     for obj in payload.get("objects", []):
         name = str(obj.get("name", ""))
-        if name not in PARCEL_NAMES or str(obj.get("class_name", "")) != "parcel":
+        class_name = str(obj.get("class_name", ""))
+        if name not in OBJECT_NAMES or class_name not in CLASS_ID_BY_NAME:
             continue
         if not bool(obj.get("bbox_projected", False)):
             continue
-        truth_position = _float_vector(obj.get("truth_position", []))
+        truth_position = _object_base_position(obj)
         bbox_center = _float_vector(obj.get("bbox_center", []), length=2)
         bbox_size = _float_vector(obj.get("bbox_size", []), length=2)
         if truth_position is None or bbox_center is None or bbox_size is None:
@@ -462,9 +529,9 @@ def _parcel_objects(payload):
         if bbox_size[0] <= 1.0 or bbox_size[1] <= 1.0:
             continue
         by_name[name] = obj
-    if any(name not in by_name for name in PARCEL_NAMES):
+    if any(name not in by_name for name in OBJECT_NAMES):
         return None
-    return [by_name[name] for name in PARCEL_NAMES]
+    return [by_name[name] for name in OBJECT_NAMES]
 
 
 class SynchronizedCapture:
@@ -531,12 +598,15 @@ class SynchronizedCapture:
         for payload in reversed(self._payloads):
             try:
                 detection_stamp = float(payload.get("stamp"))
-                color_stamp = float(payload.get("color_stamp"))
             except (TypeError, ValueError):
                 continue
+            try:
+                color_stamp = float(payload.get("color_stamp", detection_stamp))
+            except (TypeError, ValueError):
+                color_stamp = detection_stamp
             if detection_stamp < not_before or color_stamp < not_before:
                 continue
-            if _parcel_objects(payload) is None:
+            if _dataset_objects(payload) is None:
                 continue
             if not self._images:
                 continue
@@ -552,7 +622,7 @@ def _normalized_box(obj, image_width, image_height):
     center = _float_vector(obj.get("bbox_center", []), length=2)
     size = _float_vector(obj.get("bbox_size", []), length=2)
     if center is None or size is None:
-        raise RuntimeError("invalid bbox for {}".format(obj.get("name", "parcel")))
+        raise RuntimeError("invalid bbox for {}".format(obj.get("name", "object")))
     x1 = max(0.0, center[0] - 0.5 * size[0])
     y1 = max(0.0, center[1] - 0.5 * size[1])
     x2 = min(float(image_width), center[0] + 0.5 * size[0])
@@ -575,10 +645,16 @@ def _save_sample(
     image_width = int(payload.get("image_width", 0))
     image_height = int(payload.get("image_height", 0))
     if image_width <= 0 or image_height <= 0:
-        raise RuntimeError("task1_vision payload has invalid image dimensions")
-    parcels = _parcel_objects(payload)
-    if parcels is None:
-        raise RuntimeError("capture does not contain four qpos-projected parcel boxes")
+        raise RuntimeError(
+            "{} vision payload has invalid image dimensions".format(DATA_TASK)
+        )
+    objects = _dataset_objects(payload)
+    if objects is None:
+        raise RuntimeError(
+            "capture does not contain all {} qpos-projected {} objects".format(
+                len(OBJECT_NAMES), DATA_TASK
+            )
+        )
 
     stem = "seed_{:05d}_view_{}".format(int(seed), int(view_index))
     extension = _image_extension(image_msg)
@@ -588,32 +664,41 @@ def _save_sample(
 
     yolo_lines = []
     object_metadata = []
-    for label_index, obj in enumerate(parcels):
+    for label_index, obj in enumerate(objects):
+        class_name = str(obj.get("class_name", ""))
+        class_id = int(CLASS_ID_BY_NAME[class_name])
         yolo_box = _normalized_box(obj, image_width, image_height)
         yolo_lines.append(
             "{} {}\n".format(
-                YOLO_CLASS_ID, " ".join("{:.8f}".format(value) for value in yolo_box)
+                class_id, " ".join("{:.8f}".format(value) for value in yolo_box)
             )
         )
         object_metadata.append(
             {
                 "label_index": label_index,
                 "source_name": str(obj.get("name", "")),
-                "class_id": YOLO_CLASS_ID,
-                "class_name": YOLO_CLASS_NAME,
+                "ground_truth_name": str(
+                    obj.get("ground_truth_name", obj.get("name", ""))
+                ),
+                "class_id": class_id,
+                "class_name": class_name,
                 "bbox_xywh_pixels": [
                     float(value)
                     for value in obj.get("bbox_center", [])[:2]
                     + obj.get("bbox_size", [])[:2]
                 ],
                 "bbox_yolo_normalized": yolo_box,
-                "xyz_base_link": _float_vector(obj.get("truth_position", [])),
-                "xyz_camera": _float_vector(obj.get("truth_camera_position", [])),
-                "position_source": str(obj.get("truth_position_source", "")),
+                "position_source": str(
+                    obj.get(
+                        "truth_position_source", obj.get("position_source", "")
+                    )
+                ),
             }
         )
 
     metadata = {
+        "task": DATA_TASK,
+        "scene": SCENE_NAME,
         "seed": int(seed),
         "view_index": int(view_index),
         "split": split,
@@ -621,13 +706,13 @@ def _save_sample(
         "pitch_command_deg": float(pitch_command),
         "head_actual_yaw_deg": actual_head[0] if actual_head else None,
         "head_actual_pitch_deg": actual_head[1] if actual_head else None,
-        "image_stamp": float(payload.get("color_stamp")),
+        "image_stamp": float(image_msg.header.stamp.to_sec()),
         "detection_stamp": float(payload.get("stamp")),
         "image_width": image_width,
         "image_height": image_height,
         "frame_id": str(payload.get("frame_id", "")),
         "camera_frame_id": str(payload.get("camera_frame_id", "")),
-        "bbox_source": "qpos_projected_3d_corners",
+        "bbox_source": str(payload.get("bbox_source", "qpos_projected")),
         "image": _relative(root, image_path),
         "label": _relative(root, label_path),
         "metadata": _relative(root, metadata_path),
@@ -684,14 +769,41 @@ def _wait_head_stable():
     )
 
 
+def _start_data_vision(challenge_task, seed):
+    command = [
+        "roslaunch",
+        str(TASK_CONFIG["vision_package"]),
+        str(TASK_CONFIG["vision_launch"]),
+        "start_rqt:=false",
+        "vision_mode:=0",
+    ]
+    if DATA_TASK == "task2":
+        command.extend(
+            [
+                "seed:={}".format(int(seed)),
+                "start_depth_xy:=false",
+                "instance_naming_method:=relative_position",
+            ]
+        )
+    return [
+        challenge_task.ManagedProcess(
+            "{}_data_vision".format(DATA_TASK), command
+        ).start()
+    ]
+
+
 def _collect_seed(seed, root):
     import challenge_task
     import rospy
-    from task1_vision.head_control import publish_head_camera_pose
+
+    if DATA_TASK == "task2":
+        from task2_vision.head_control import publish_head_camera_pose
+    else:
+        from task1_vision.head_control import publish_head_camera_pose
 
     launcher_class = challenge_task._load_launcher()
     launcher = launcher_class(
-        scene="scene1",
+        scene=SCENE_NAME,
         seed=int(seed),
         match_time_limit=0.0,
         timer_gui=False,
@@ -701,10 +813,12 @@ def _collect_seed(seed, root):
     samples = []
     try:
         launcher.start(
-            node_name="parcel_data_collector_seed_{}".format(int(seed)),
+            node_name="challenge_data_collector_{}_seed_{}".format(
+                DATA_TASK, int(seed)
+            ),
             timeout=120,
         )
-        services = challenge_task._start_scene_services("scene1")
+        services = _start_data_vision(challenge_task, seed)
         capture = SynchronizedCapture()
 
         commands = _pitch_commands(seed)
@@ -760,6 +874,8 @@ def _collect_seed(seed, root):
                 )
 
         marker = {
+            "task": DATA_TASK,
+            "scene": SCENE_NAME,
             "seed": int(seed),
             "pitch_commands_deg": commands,
             "samples": samples,
@@ -825,7 +941,7 @@ def _run_seed_worker(seed, root):
     next_group_scan = 0.0
     try:
         while proc.poll() is None:
-            # Simulator, timer and task1_vision each create their own process
+            # Simulator, timer and the selected vision node create their own process
             # group. Remember them while the worker is still their parent so
             # they can also be reaped after the worker itself exits.
             now = time.monotonic()
@@ -834,12 +950,12 @@ def _run_seed_worker(seed, root):
                 next_group_scan = now + 1.0
             if _STOP_REQUESTED.is_set():
                 _terminate_process_group(
-                    proc, "parcel_data_seed_{}".format(seed), 20.0, 5.0
+                    proc, "challenge_data_seed_{}".format(seed), 20.0, 5.0
                 )
                 return False, "interrupted"
             if now >= deadline:
                 _terminate_process_group(
-                    proc, "parcel_data_seed_{}".format(seed), 10.0, 5.0
+                    proc, "challenge_data_seed_{}".format(seed), 10.0, 5.0
                 )
                 return False, "worker timeout"
             time.sleep(0.25)
@@ -854,7 +970,7 @@ def _run_seed_worker(seed, root):
                 pass
         if proc.poll() is None:
             _terminate_process_group(
-                proc, "parcel_data_seed_{}".format(seed), 5.0, 3.0
+                proc, "challenge_data_seed_{}".format(seed), 5.0, 3.0
             )
         live_tracked_groups = _live_groups(tracked_groups)
         if live_tracked_groups:
@@ -890,7 +1006,9 @@ def _batch_main():
         )
     print(GREEN + resume_text + RESET, flush=True)
     print(
-        "[INFO] data: dataset={} existing_samples={} seeds={}..{} views_per_seed={} pitch_range=[{:.1f}, {:.1f}] deg".format(
+        "[INFO] data: task={} scene={} dataset={} existing_samples={} seeds={}..{} views_per_seed={} pitch_range=[{:.1f}, {:.1f}] deg".format(
+            DATA_TASK,
+            SCENE_NAME,
             root,
             existing_samples,
             SEED_START,
