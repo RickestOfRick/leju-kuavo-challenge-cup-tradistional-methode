@@ -8,7 +8,7 @@ VISION_TOPIC = "/task2_vision/objects_json"
 VISION_TRUTH_TOPIC = "/task2_vision/objects_json"
 VISION_MODE0_REFERENCE_TOPIC = "/task2_vision/mode0_reference_json"
 VISION_FRAME_ID = "base_link"
-VISION_TIMEOUT = 90.0
+VISION_TIMEOUT = 60.0
 VISION_MIN_CONFIDENCE = 0.0
 VISION_ALLOWED_POSITION_SOURCES = [
     "challenge_secret_layout_ground_truth",
@@ -16,19 +16,21 @@ VISION_ALLOWED_POSITION_SOURCES = [
     "qpos_bbox_cad_depth_render_xy_fit",
     "qpos_bbox_region_depth_gn_xy_fit",
     "qpos_bbox_region_depth_xyz_yaw_fit",
+    "yolo_bbox_region_depth_xyz_yaw_fit",
+    "handoff_full_yaw_rgbd_cad_fit",
     "yolo_depth_pose",
 ]
 
 # 数采脚本中的默认顺序；可通过下方开关恢复原动态优先级。
 SORTING_OBJECT_ORDER = [
     "part_type_a_1",
-    "part_type_a_2",
     "part_type_b_1",
+    "part_type_a_2",
     "part_type_b_2",
     "part_type_c_1",
     "part_type_c_2",
 ]
-# False=严格使用上面的默认顺序；True=启用无交接优先、再按 |Y| 排序。
+# False=严格使用上面的表顺序；True=无交接优先，同组内保持表顺序。
 SORTING_USE_DYNAMIC_PRIORITY = True
 
 # base_link 坐标系下的固定抓取偏置：X 正向前、Y 正向左，不随工件 yaw 旋转。
@@ -39,24 +41,24 @@ GRASP_OFFSETS_BASE = {
         "right": [0.023731775, -0.048718444, 0.05],
     },
     "part_type_a_2": {
-        "left": [0.024611612, 0.004389598, 0.05],
+        "left": [0.051611612, 0.010389598, 0.05],
         "right": [0.03110907, -0.030345481, 0.05],
     },
     "part_type_b_1": {
         "left": [0.018787454, -0.006857956, 0.05],
-        "right": [0.017181181, -0.012286934, 0.05],
+        "right": [0.021181181, -0.012286934, 0.05],
     },
     "part_type_b_2": {
         "left": [0.012518057, 0.026593847, 0.05],
-        "right": [0.010924211, 0.006111904, 0.05],
+        "right": [0.020924211, 0.003111904, 0.05],
     },
     "part_type_c_1": {
-        "left": [0.01564838, 0.044912331, 0.04],
-        "right": [-0.014123567, 0.017335653, 0.04],
+        "left": [0.01564838, 0.044912331, 0.03],
+        "right": [0.014123567, 0.017335653, 0.03],
     },
     "part_type_c_2": {
-        "left": [0.012856999, 0.035554725, 0.045],
-        "right": [-0.001369873, 0.036029480, 0.05],
+        "left": [0.018856999, 0.035554725, 0.03],
+        "right": [0.014369873, 0.036029480, 0.03],
     },
 }
 
@@ -80,13 +82,19 @@ CLASS_POSES = {
         "lift": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 0.0]),
     },
     "part_type_c": {
-        "grasp": pose_degrees([-45.0, -45.0, 0.0, 90.0, 0.0, 0.0]),
-        "lift": pose_degrees([-45.0, -45.0, 0.0, 90.0, 0.0, 0.0]),
+        "grasp": pose_degrees([-45.0, -15.0, 0.0, 90.0, 0.0, 0.0]),
+        "lift": pose_degrees([-45.0, -90.0, 0.0, 90.0, 0.0, 0.0]),
     },
 }
-GRASP_NARROW_EDGE_YAW_OFFSET = math.pi / 2
-# A/B 初次到达 pre-grasp 后，超过该 FK 姿态误差才试探另一窄边。
-AB_PRE_GRASP_ORIENTATION_RETRY_DEG = 30.0
+# 各类抓取的两个等价腕部 yaw 候选，单位 degree，两者相差 180°。
+# B 类横梁沿物体局部 Y，0°/180° 使夹爪从左右两侧形成 |T| 夹持。
+GRASP_YAW_CANDIDATES_DEG_BY_CLASS = {
+    "part_type_a": [90.0, -90.0],
+    "part_type_b": [90.0, -90.0],
+    "part_type_c": [90.0, -90.0],
+}
+# A/B/C 初次到达 pre-grasp 后，超过该 FK 姿态误差才试探另一抓取 yaw。
+PRE_GRASP_ORIENTATION_RETRY_DEG = 30.0
 
 # base_link 下的末端经验修正。旧数采的 X/Z 常量是 world 到基座的平移，现已由视觉完成。
 HAND_EE_CALIBRATION = {
@@ -94,70 +102,123 @@ HAND_EE_CALIBRATION = {
     "right": [-0.04, 0.02, -0.02],
 }
 
-# 左右手交接参考点已由旧 world 坐标转换到 base_link，尚未叠加上面的手侧修正。
+# 视觉重定位交接：pre/place 都是直接编码的 base_link 绝对末端坐标，不叠加
+# HAND_EE_CALIBRATION。place_pose/grasp_pose 由 degree 转为内部 radian。
+# [物体 yaw 偏置, 自适应 Y 轴 pitch, 预留 roll（当前无用）,手动 Z 轴 yaw, 手动 Y 轴 pitch, 手动 X 轴 roll]。
 HANDOFF_CONFIG = {
     "left_to_right": {
+        "pre_place_position": {
+            "part_type_a": [0.366, 0.0, 0.218783],
+            "part_type_c": [0.366, 0.0, 0.218783],
+        },
         "place_position": {
-            "part_type_a": [0.266, 0.0, -0.038783],
-            "part_type_c": [0.316, 0.0, -0.038783],
+            "part_type_a": [0.366, 0.1, 0.078783],
+            "part_type_c": [0.366, 0.1, 0.078783],
         },
         "place_pose": {
-            "part_type_a": [
-                0.0,
-                -math.pi / 2,
-                0.0,
-                -3 * math.pi / 4,
-                0.0,
-                -math.pi / 2,
-            ],
-            "part_type_c": [
-                0.0,
-                -math.pi / 2,
-                0.0,
-                -2 * math.pi / 3,
-                0.0,
-                -math.pi / 2,
-            ],
-        },
-        "grasp_position": {
-            "part_type_a": [0.316, 0.0, -0.073783],
-            "part_type_c": [0.316, 0.0, -0.073783],
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, -90.0, 0.0, -90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, -90.0, 0.0, -90.0]),
         },
         "grasp_pose": {
-            "part_type_a": [0.0, -math.pi / 2, 0.0, 2 * math.pi / 3, 0.0, math.pi / 2],
-            "part_type_c": [0.0, -math.pi / 2, 0.0, 2 * math.pi / 3, 0.0, math.pi / 2],
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
         },
     },
     "right_to_left": {
+        "pre_place_position": {
+            "part_type_a": [0.266, 0.0, 0.278783],
+            "part_type_c": [0.306, 0.0, 0.278783],
+        },
         "place_position": {
-            "part_type_a": [0.266, 0.0, -0.038783],
-            "part_type_c": [0.306, 0.0, -0.028783],
+            "part_type_a": [0.266, 0.0, 0.078783],
+            "part_type_c": [0.306, 0.0, 0.078783],
         },
         "place_pose": {
-            "part_type_a": [0.0, -math.pi / 2, 0.0, 3 * math.pi / 4, 0.0, math.pi / 2],
-            "part_type_c": [0.0, -math.pi / 2, 0.0, 3 * math.pi / 4, 0.0, math.pi / 2],
-        },
-        "grasp_position": {
-            "part_type_a": [0.316, 0.0, -0.073783],
-            "part_type_c": [0.316, 0.0, -0.078783],
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, 135.0, 0.0, 90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, 135.0, 0.0, 90.0]),
         },
         "grasp_pose": {
-            "part_type_a": [
-                0.0,
-                -math.pi / 2,
-                0.0,
-                -2 * math.pi / 3,
-                0.0,
-                -math.pi / 2,
-            ],
-            "part_type_c": [
-                0.0,
-                -math.pi / 2,
-                0.0,
-                -2 * math.pi / 3,
-                0.0,
-                -math.pi / 2,
-            ],
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, -120.0, 0.0, -90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, -120.0, 0.0, -90.0]),
+        },
+    },
+}
+
+# 每类交接独立选择一套完整逻辑。source_fk_delay 使用下面的给手 FK 相对偏移
+# 和有符号夹爪时序；vision_relocalize 使用上面的绝对放置点，释放后重新视觉抓取。
+HANDOFF_MODE_SOURCE_FK_DELAY = "source_fk_delay"
+HANDOFF_MODE_VISION_RELOCALIZE = "vision_relocalize"
+HANDOFF_MODE_BY_CLASS = {
+    "part_type_a": HANDOFF_MODE_SOURCE_FK_DELAY,
+    "part_type_c": HANDOFF_MODE_VISION_RELOCALIZE,
+}
+
+HANDOFF_RELOCALIZATION_REQUEST_TOPIC = "/task2_depth_xy/handoff_relocalize_request"
+HANDOFF_RELOCALIZATION_RESULT_TOPIC = "/task2_depth_xy/handoff_relocalize_result"
+HANDOFF_RELOCALIZATION_TIMEOUT = 60.0
+
+# 新交接配置：pre_place_position/place_position/place_pose 为给出手的绝对目标。
+# A/C 的接手 pre/grasp 偏移相对给手 place 实测 FK。
+# grasp_pose 仍为接手的绝对姿态配置。
+# 有符号时序差 = 接手 close 时刻 - 给手 open 时刻，单位仿真时间 s。
+# 正数=先 open 给手；0=同时切换；负数=先 close 接手，再 open 给手。
+# 调度器使用 /sensors_data_raw.sensor_time 计时，不受仿真实时率影响。
+HANDOFF_RECEIVER_CLOSE_DELAY_BY_CLASS = {
+    "part_type_a": 0.055,
+    "part_type_c": -0.08,
+}
+
+HANDOFF_SOURCE_FK_RELATIVE_CONFIG = {
+    "left_to_right": {
+        "pre_place_position": {
+            "part_type_a": [0.346, 0.2, 0.328783],
+            "part_type_c": [0.346, 0.2, 0.328783],
+        },
+        "place_position": {
+            "part_type_a": [0.346, 0.0, 0.298783],
+            "part_type_c": [0.346, 0.0, 0.298783],
+        },
+        "place_pose": {
+            "part_type_a": pose_degrees([0.0, -100.0, 0.0, -90.0, 0.0, -90.0]),
+            "part_type_c": pose_degrees([0.0, -100.0, 0.0, -90.0, 0.0, -90.0]),
+        },
+        "pre_grasp_position": {
+            "part_type_a": [0.0, -0.06, -0.05],
+            "part_type_c": [0.0, -0.06, -0.05],
+        },
+        "grasp_position": {
+            "part_type_a": [0.0, 0.0, 0.0],
+            "part_type_c": [0.0, 0.0, 0.0],
+        },
+        "grasp_pose": {
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
+        },
+    },
+    "right_to_left": {
+        "pre_place_position": {
+            "part_type_a": [0.346, -0.2, 0.348783],
+            "part_type_c": [0.346, -0.2, 0.348783],
+        },
+        "place_position": {
+            "part_type_a": [0.346, 0.0, 0.308783],
+            "part_type_c": [0.346, 0.0, 0.308783],
+        },
+        "place_pose": {
+            "part_type_a": pose_degrees([0.0, -100.0, 0.0, 90.0, 0.0, 90.0]),
+            "part_type_c": pose_degrees([0.0, -100.0, 0.0, 90.0, 0.0, 90.0]),
+        },
+        "pre_grasp_position": {
+            "part_type_a": [0.0, 0.06, -0.05],
+            "part_type_c": [0.0, 0.06, -0.05],
+        },
+        "grasp_position": {
+            "part_type_a": [0.0, 0.0, 0.0],
+            "part_type_c": [0.0, 0.0, 0.0],
+        },
+        "grasp_pose": {
+            "part_type_a": pose_degrees([0.0, -100.0, 0.0, -90.0, 0.0, -90.0]),
+            "part_type_c": pose_degrees([0.0, -100.0, 0.0, -90.0, 0.0, -90.0]),
         },
     },
 }
@@ -279,9 +340,11 @@ LIFT_OFFSETS_BY_CLASS = {
     "part_type_b": [0.0, 0.0, 0.32],
     "part_type_c": [-0.05, 0.0, 0.34],
 }
-# C 类从 lift 到 release 的连续 q 轨迹所经过的 IK 高度比例。
-C_PLACE_IK_Z_FRACTIONS = [0.50]
-HANDOFF_APPROACH_Z_OFFSET = 0.20
+# C 类闭爪后的第一段低抬升，再进入上面的最终 lift。
+C_INITIAL_LIFT_OFFSET = [-0.05, 0.0, 0.10]
+# C 类从放箱前当前实测 FK 到 release 的笛卡尔直线等分段数。
+# 8 段对应 1/8..7/8 的 7 个中间 IK q 约束和 1 个最终 q。
+C_PLACE_IK_SUBDIVISIONS = 8
 GRIPPER_CLOSE_TIME = 0.70
 RELEASE_DWELL = 0.40
 

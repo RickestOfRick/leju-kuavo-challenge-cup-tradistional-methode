@@ -108,15 +108,17 @@ float64[3] right_r6_offset
 
 ### task2_vision
 
-假bbox + 深度CAD拟合,效果在5mm 5deg误差左右
+支持模式 1 的 qpos 假框和模式 2 的三类别 YOLO 框，两者共用 RGB-D/CAD
+XYZ/yaw 拟合与 5 帧中位数锁定。
 
 ### data.py
 
-任务一, 二的yolo需要的bbox和类别数据自动采集脚本, 直接python3运行即可, 需要主脚本部分函数, 需要task1/2_vision包
+任务一, 二的yolo需要的bbox和类别数据自动采集脚本, 容器中直接python3运行即可, 需要主脚本部分函数, 需要task1/2_vision包
 
-### task2_motion
+### task2_motion问题
 
-目前的问题为: C类螺丝刀上升和放置的轨迹还可以优化, 交接逻辑还没测试
+目前的问题为: A类的交接为空接, 稳定性没有完全验证; C类的交接为放置后交接, 但是放置的位置不在左臂的舒适工作区之内, 需要进一步优化.  
+动作偏置参数都在task2_config.py中
 
 ## 运行
 
@@ -127,15 +129,11 @@ catkin build kuavo_msgs task2_vision task2_motion challenge_cup_task_template
 source devel/setup.zsh
 rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 4
 
-# 另开终端读取任务二六个工件在 base_link 下的位姿和 yaw 真值
 source devel/setup.zsh
 rostopic echo /task2_vision/objects_json
 
-# 显示头部 RGB 和 qpos 投影的 A/B/C 类别框
+# 显示头部 RGB、YOLO A/B/C 框和 RGB-D/CAD 拟合结果
 rosrun rqt_gui rqt_gui --standalone task2_vision/Task2Vision
-
-# 查看可直接对照模式 0 真值的 RGB-D/CAD 位姿拟合输出
-rostopic echo /task2_depth_xy/objects_json
 ```
 
 ### 任务一
@@ -158,6 +156,7 @@ rosrun rqt_gui rqt_gui --standalone task1_vision/Task1Vision --args -h
 source devel/setup.zsh
 python3 src/challenge_cup_task_template/scripts/data.py
 
+# 在 yolo/config.py 顶部设置 YOLO_TASK="task1" 或 "task2"
 python yolo/train.py
 python yolo/validate.py
 ```

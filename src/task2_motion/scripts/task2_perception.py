@@ -3,13 +3,19 @@
 
 import json
 import math
+import threading
 import time
 
 import rospy
+from kuavo_msgs.msg import sensorsData
 from std_msgs.msg import String
 
 from task2_config import (
     GRASP_OFFSETS_BASE,
+    HANDOFF_RELOCALIZATION_REQUEST_TOPIC,
+    HANDOFF_RELOCALIZATION_RESULT_TOPIC,
+    HANDOFF_RELOCALIZATION_TIMEOUT,
+    TOPIC_TIMEOUT,
     VISION_ALLOWED_POSITION_SOURCES,
     VISION_FRAME_ID,
     VISION_MODE0_REFERENCE_TOPIC,
@@ -18,6 +24,107 @@ from task2_config import (
     VISION_TOPIC,
     VISION_TRUTH_TOPIC,
 )
+
+
+class _SensorTimeClock:
+    """Track MuJoCo simulation time published with the raw sensor stream."""
+
+    def __init__(self, topic="/sensors_data_raw"):
+        self.topic = str(topic)
+        self._condition = threading.Condition()
+        self._seconds = None
+        self._subscriber = rospy.Subscriber(
+            self.topic, sensorsData, self._callback, queue_size=1
+        )
+
+    def _callback(self, message):
+        seconds = float(message.sensor_time.to_sec())
+        if not math.isfinite(seconds):
+            return
+        with self._condition:
+            self._seconds = seconds
+            self._condition.notify_all()
+
+    def wait_until_ready(self, wall_timeout=TOPIC_TIMEOUT):
+        wall_deadline = time.monotonic() + float(wall_timeout)
+        with self._condition:
+            while self._seconds is None and not rospy.is_shutdown():
+                remaining = wall_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for {} sensor_time".format(self.topic)
+                    )
+                self._condition.wait(timeout=min(0.1, remaining))
+            if rospy.is_shutdown():
+                raise RuntimeError("shutdown while waiting for simulation time")
+            return float(self._seconds)
+
+    def seconds(self):
+        with self._condition:
+            if self._seconds is None:
+                raise RuntimeError("{} sensor_time is unavailable".format(self.topic))
+            return float(self._seconds)
+
+
+class _SimulationDeadline:
+    """Expire after simulation seconds; wall time only detects a stopped clock."""
+
+    def __init__(self, duration, stall_timeout=TOPIC_TIMEOUT):
+        self.duration = float(duration)
+        if not math.isfinite(self.duration) or self.duration <= 0.0:
+            raise ValueError("simulation timeout must be finite and positive")
+        self.clock = _sensor_time_clock()
+        self.start = self.clock.wait_until_ready()
+        self.previous = self.start
+        self.last_progress_wall = time.monotonic()
+        self.stall_timeout = float(stall_timeout)
+
+    def expired(self):
+        now = self.clock.seconds()
+        if now + 1e-12 < self.previous:
+            raise RuntimeError("simulation time moved backwards")
+        if now > self.previous + 1e-12:
+            self.last_progress_wall = time.monotonic()
+        elif time.monotonic() - self.last_progress_wall >= self.stall_timeout:
+            raise RuntimeError(
+                "{} sensor_time stopped advancing".format(self.clock.topic)
+            )
+        self.previous = now
+        return now - self.start + 1e-12 >= self.duration
+
+
+_SENSOR_TIME_CLOCK = None
+_SENSOR_TIME_CLOCK_LOCK = threading.Lock()
+
+
+def _sensor_time_clock():
+    global _SENSOR_TIME_CLOCK
+    with _SENSOR_TIME_CLOCK_LOCK:
+        if _SENSOR_TIME_CLOCK is None:
+            _SENSOR_TIME_CLOCK = _SensorTimeClock()
+        return _SENSOR_TIME_CLOCK
+
+
+def _wait_for_message_before_deadline(topic, message_type, deadline, label):
+    while not rospy.is_shutdown():
+        if deadline.expired():
+            raise RuntimeError(
+                "{} timed out after {:.1f}s simulation time".format(
+                    label, deadline.duration
+                )
+            )
+        try:
+            message = rospy.wait_for_message(topic, message_type, timeout=0.5)
+        except Exception:
+            continue
+        if deadline.expired():
+            raise RuntimeError(
+                "{} timed out after {:.1f}s simulation time".format(
+                    label, deadline.duration
+                )
+            )
+        return message
+    raise RuntimeError("shutdown while waiting for {}".format(label))
 
 
 def _yaw_quaternion(yaw):
@@ -74,11 +181,11 @@ def wait_for_task2_objects():
     )
     expected_frame = rospy.get_param("~task2_vision_frame_id", VISION_FRAME_ID)
     timeout = float(rospy.get_param("~task2_vision_timeout", VISION_TIMEOUT))
-    deadline = time.time() + timeout
+    deadline = _SimulationDeadline(timeout)
     last_missing = list(motion_names)
     reference_publisher = None
 
-    if expected_mode == 1:
+    if expected_mode in (1, 2):
         truth_topic = str(
             rospy.get_param("~task2_truth_topic", VISION_TRUTH_TOPIC)
         )
@@ -89,11 +196,15 @@ def wait_for_task2_objects():
             )
         )
         rospy.loginfo(
-            "task2: mode 1 first reading mode-0 truth reference from %s",
+            "task2: mode %d first reading mode-0 truth reference from %s",
+            expected_mode,
             truth_topic,
         )
-        reference_message = rospy.wait_for_message(
-            truth_topic, String, timeout=timeout
+        reference_message = _wait_for_message_before_deadline(
+            truth_topic,
+            String,
+            deadline,
+            "task2 mode-0 reference",
         )
         reference_payload = json.loads(reference_message.data)
         if str(reference_payload.get("frame_id", "")) != expected_frame:
@@ -138,11 +249,11 @@ def wait_for_task2_objects():
         reference_publisher = rospy.Publisher(
             reference_topic, String, queue_size=1, latch=True
         )
-        connection_deadline = time.time() + min(5.0, timeout)
+        connection_deadline = time.monotonic() + min(5.0, timeout)
         while (
             not rospy.is_shutdown()
             and reference_publisher.get_num_connections() == 0
-            and time.time() < connection_deadline
+            and time.monotonic() < connection_deadline
         ):
             rospy.sleep(0.05)
         reference_publisher.publish(reference_message)
@@ -153,12 +264,14 @@ def wait_for_task2_objects():
         )
 
     rospy.loginfo("task2: waiting for complete object poses from %s", topic)
-    while not rospy.is_shutdown() and time.time() < deadline:
+    while not rospy.is_shutdown() and not deadline.expired():
         try:
             message = rospy.wait_for_message(topic, String, timeout=1.0)
             payload = json.loads(message.data)
         except Exception:
             continue
+        if deadline.expired():
+            break
         if str(payload.get("frame_id", "")) != expected_frame:
             rospy.logwarn_throttle(
                 2.0,
@@ -215,7 +328,148 @@ def wait_for_task2_objects():
             return parsed
 
     raise RuntimeError(
-        "task2 vision timed out after {:.1f}s; missing {}".format(
+        "task2 vision timed out after {:.1f}s simulation time; missing {}".format(
             timeout, ", ".join(last_missing)
+        )
+    )
+
+
+def _mode0_relocalized_object(source_observation, timeout):
+    """Read the corresponding live truth object when the whole task uses mode 0."""
+    truth_name = str(
+        source_observation.get("ground_truth_name", source_observation["name"])
+    )
+    motion_name = str(source_observation["name"])
+    topic = str(rospy.get_param("~task2_truth_topic", VISION_TRUTH_TOPIC))
+    deadline = _SimulationDeadline(timeout)
+    while not rospy.is_shutdown() and not deadline.expired():
+        try:
+            message = rospy.wait_for_message(topic, String, timeout=1.0)
+            payload = json.loads(message.data)
+        except Exception:
+            continue
+        if deadline.expired():
+            break
+        for item in payload.get("objects", []):
+            if str(item.get("ground_truth_name", item.get("name", ""))) != truth_name:
+                continue
+            renamed = dict(item)
+            renamed["name"] = motion_name
+            renamed["ground_truth_name"] = truth_name
+            observation = _parse_object(renamed)
+            if observation is not None:
+                return observation
+    raise RuntimeError(
+        "task2 mode-0 handoff relocalization timed out after {:.1f}s simulation "
+        "time for {}".format(timeout, motion_name)
+    )
+
+
+def relocalize_handoff_object(source_observation, expected_position):
+    """Request a fresh full-angle RGB-D/CAD fit for one released object."""
+    timeout = float(
+        rospy.get_param(
+            "~task2_handoff_relocalization_timeout",
+            HANDOFF_RELOCALIZATION_TIMEOUT,
+        )
+    )
+    expected_mode = int(rospy.get_param("~task2_vision_mode", -1))
+    if expected_mode == 0:
+        return _mode0_relocalized_object(source_observation, timeout)
+    if expected_mode not in (1, 2):
+        raise RuntimeError(
+            "task2 handoff relocalization requires vision mode 0, 1, or 2"
+        )
+
+    expected = [float(value) for value in expected_position]
+    if len(expected) != 3 or not all(math.isfinite(value) for value in expected):
+        raise ValueError("handoff relocalization expected position must contain xyz")
+    request_topic = str(
+        rospy.get_param(
+            "~task2_handoff_relocalization_request_topic",
+            HANDOFF_RELOCALIZATION_REQUEST_TOPIC,
+        )
+    )
+    result_topic = str(
+        rospy.get_param(
+            "~task2_handoff_relocalization_result_topic",
+            HANDOFF_RELOCALIZATION_RESULT_TOPIC,
+        )
+    )
+    request_id = "{}-{}".format(
+        source_observation["name"], int(time.time() * 1000000000.0)
+    )
+    request = {
+        "request_id": request_id,
+        "name": str(source_observation["name"]),
+        "ground_truth_name": str(
+            source_observation.get(
+                "ground_truth_name", source_observation["name"]
+            )
+        ),
+        "class_name": str(source_observation["class_name"]),
+        "expected_position": expected,
+        "vision_mode": expected_mode,
+    }
+    publisher = rospy.Publisher(request_topic, String, queue_size=1, latch=True)
+    connection_deadline = time.monotonic() + min(3.0, timeout)
+    while (
+        not rospy.is_shutdown()
+        and publisher.get_num_connections() == 0
+        and time.monotonic() < connection_deadline
+    ):
+        rospy.sleep(0.05)
+    if publisher.get_num_connections() == 0:
+        raise RuntimeError(
+            "task2 handoff relocalization has no subscriber on {}".format(
+                request_topic
+            )
+        )
+    publisher.publish(
+        String(data=json.dumps(request, ensure_ascii=True, sort_keys=True))
+    )
+    rospy.loginfo(
+        "task2: requested full-angle handoff relocalization id=%s object=%s "
+        "expected=%s",
+        request_id,
+        source_observation["name"],
+        [round(value, 4) for value in expected],
+    )
+
+    deadline = _SimulationDeadline(timeout)
+    while not rospy.is_shutdown() and not deadline.expired():
+        try:
+            message = rospy.wait_for_message(result_topic, String, timeout=1.0)
+            payload = json.loads(message.data)
+        except Exception:
+            continue
+        if deadline.expired():
+            break
+        if str(payload.get("request_id", "")) != request_id:
+            continue
+        if not bool(payload.get("success", False)):
+            raise RuntimeError(
+                "task2 handoff relocalization failed for {}: {}".format(
+                    source_observation["name"],
+                    payload.get("reason", "unknown"),
+                )
+            )
+        observation = _parse_object(payload.get("object", {}))
+        if observation is None:
+            raise RuntimeError("task2 handoff relocalization returned invalid object")
+        rospy.loginfo(
+            "task2: handoff relocalized %s base_link=%.4f %.4f %.4f "
+            "yaw=%.2f deg",
+            observation["name"],
+            observation["position"][0],
+            observation["position"][1],
+            observation["position"][2],
+            math.degrees(observation["yaw"]),
+        )
+        return observation
+    raise RuntimeError(
+        "task2 handoff relocalization timed out after {:.1f}s simulation time "
+        "for {}".format(
+            timeout, source_observation["name"]
         )
     )

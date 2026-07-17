@@ -1,4 +1,4 @@
-# 模式由 launch 的 vision_mode 覆盖：0=完整真值，1=RGB-D/CAD 拟合 XYZ/yaw。
+# 模式由 launch 覆盖：0=真值，1=qpos框+RGB-D/CAD，2=YOLO框+RGB-D/CAD。
 # 真值在整个场景实例中保持不变，低频重复发布便于后启动的订阅者读取。
 publish_hz: 2.0
 # 使用机器人浮动基座的 qpos，将 world 真值转换到 base_link。
@@ -19,6 +19,14 @@ truth_objects_topic: /task2_vision/objects_json
 # 模式 1 的 motion 在开始等待时先按模式 0 读取一次完整真值并发布到此话题。
 # 深度拟合收到该同运行参考后清空旧样本，所有锁定坐标均换算到该参考基座。
 mode0_reference_topic: /task2_vision/mode0_reference_json
+
+# 模式 2 的三类别 YOLO 推理。相对路径以 task2_vision 包根目录为准。
+yolo_model_path: models/task2_parts_best.pt
+yolo_confidence_threshold: 0.25
+yolo_iou_threshold: 0.70
+yolo_image_size: 1280
+yolo_device: ""
+yolo_half: false
 depth_image_topic: /cam_h/depth/image_raw/compressedDepth
 color_image_topic: /cam_h/color/image_raw/compressed
 depth_xy_publish_hz: 2.0
@@ -63,6 +71,13 @@ cad_yaw_refinement_steps_deg: [3.0, 1.0]
 # relative_position 编号模式：每个先验窗口各自 +/-20 degree，10 degree 粗搜。
 cad_yaw_prior_window_deg: 20.0
 cad_yaw_prior_window_step_deg: 5.0
+# 交接释放后的指定物体重定位不使用类别 yaw 先验，覆盖完整 360 degree。
+handoff_full_yaw_step_deg: 10.0
+# 模式 2 交接重定位不重新运行 YOLO；固定 ROI 是旧框 2 行 3 列中的下排中格。
+# 顺序为归一化 [center_x, center_y, width, height]。
+handoff_relocalization_fixed_roi: [0.50, 0.7425, 0.1666666667, 0.205]
+handoff_relocalization_valid_frames: 5
+handoff_relocalization_max_frames: 15
 # 窗口内使用 CAD 数据分 + weight*(yaw 偏离先验/sigma)^2。先验只提供搜索
 # 范围，因此该项仅作弱平局判定，明显更好的 CAD 证据仍可选择窗口边缘。
 cad_yaw_prior_regularization_weight: 0.2

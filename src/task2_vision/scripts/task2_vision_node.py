@@ -105,16 +105,17 @@ class Task2VisionNode:
     def __init__(self):
         self.seed = int(rospy.get_param("~seed", 0))
         self.vision_mode = int(rospy.get_param("~vision_mode", 0))
-        if self.vision_mode not in (0, 1):
-            raise RuntimeError("task2_vision vision_mode only supports 0 or 1")
+        if self.vision_mode not in (0, 1, 2):
+            raise RuntimeError("task2_vision vision_mode only supports 0, 1, or 2")
         self.requested_instance_naming_method = normalize_instance_naming_method(
             rospy.get_param("~instance_naming_method", "relative_position")
         )
-        # Mode 1 must not use truth yaw for naming. Relative-position names are
-        # temporary ROI identities; task2_depth_xy remaps them from fitted yaw.
+        # Mode 1 qpos ROIs need truth-independent temporary names. Mode 2 does
+        # not consume these truth objects as detections, so its requested
+        # naming is retained solely for correctly aligned diagnostics.
         self.instance_naming_method = (
             self.requested_instance_naming_method
-            if self.vision_mode == 0
+            if self.vision_mode in (0, 2)
             else INSTANCE_NAMING_RELATIVE_POSITION
         )
         self.publish_hz = max(0.1, float(rospy.get_param("~publish_hz", 2.0)))
@@ -491,6 +492,14 @@ class Task2VisionNode:
         self.world_base_quat_wxyz = list(base_quat_wxyz)
         self.truth_is_dynamic = True
 
+        # Mode 2 keeps live base-frame truth only for diagnostics. Its fitter
+        # receives class/bbox exclusively from YOLO, so qpos boxes stay absent.
+        if self.vision_mode == 2:
+            for item in objects:
+                item["bbox_projected"] = False
+                item["bbox_source"] = "qpos_bbox_disabled_in_yolo_mode"
+            return objects
+
         if self.camera_info is None:
             return objects
         transform = self._camera_transform()
@@ -518,16 +527,26 @@ class Task2VisionNode:
             "scene": "scene2",
             "seed": self.seed,
             "vision_mode": self.vision_mode,
-            "vision_mode_name": (
-                "full_truth" if self.vision_mode == 0 else "rgbd_cad_pose"
-            ),
+            "vision_mode_name": {
+                0: "full_truth",
+                1: "rgbd_cad_pose",
+                2: "yolo_bbox_rgbd_cad_pose",
+            }[self.vision_mode],
             "frozen": True,
             "locked": self.vision_mode == 0,
             "ready_for_motion": self.vision_mode == 0,
             "bbox_frozen": False,
             "position_source": POSITION_SOURCE,
-            "detection_mode": "qpos_category_bbox",
-            "bbox_source": BBOX_SOURCE,
+            "detection_mode": (
+                "qpos_category_bbox"
+                if self.vision_mode != 2
+                else "yolo_category_bbox_external_fitter"
+            ),
+            "bbox_source": (
+                BBOX_SOURCE
+                if self.vision_mode != 2
+                else "qpos_bbox_disabled_in_yolo_mode"
+            ),
             "camera_frame_id": (
                 self.camera_info.header.frame_id
                 if self.camera_info is not None

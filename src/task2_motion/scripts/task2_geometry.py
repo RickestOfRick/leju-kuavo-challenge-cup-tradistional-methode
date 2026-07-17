@@ -5,9 +5,13 @@ import math
 
 from task2_config import (
     CLASS_POSES,
-    GRASP_NARROW_EDGE_YAW_OFFSET,
     GRASP_OFFSETS_BASE,
+    GRASP_YAW_CANDIDATES_DEG_BY_CLASS,
     HANDOFF_CONFIG,
+    HANDOFF_MODE_BY_CLASS,
+    HANDOFF_MODE_SOURCE_FK_DELAY,
+    HANDOFF_MODE_VISION_RELOCALIZE,
+    HANDOFF_SOURCE_FK_RELATIVE_CONFIG,
     HAND_EE_CALIBRATION,
     SORTING_OBJECT_ORDER,
     SORTING_USE_DYNAMIC_PRIORITY,
@@ -124,6 +128,48 @@ def _tool_forward_x_score(pose_values, object_yaw, arm, yaw_offset):
     return float(-matrix[0][2])
 
 
+def grasp_yaw_candidates(observation):
+    class_name = str(observation["class_name"])
+    try:
+        candidates = [
+            math.radians(float(value))
+            for value in GRASP_YAW_CANDIDATES_DEG_BY_CLASS[class_name]
+        ]
+    except KeyError:
+        raise ValueError("no grasp yaw candidates for {}".format(class_name))
+    if len(candidates) != 2:
+        raise ValueError("{} grasp yaw candidates must contain two angles".format(class_name))
+    separation = abs(
+        math.atan2(
+            math.sin(candidates[0] - candidates[1]),
+            math.cos(candidates[0] - candidates[1]),
+        )
+    )
+    if abs(separation - math.pi) > 1e-6:
+        raise ValueError("{} grasp yaw candidates must differ by 180 deg".format(class_name))
+    return candidates
+
+
+def alternate_grasp_yaw_offset(observation, current_offset):
+    current = float(current_offset)
+    candidates = grasp_yaw_candidates(observation)
+    return max(
+        candidates,
+        key=lambda candidate: abs(
+            math.atan2(
+                math.sin(candidate - current),
+                math.cos(candidate - current),
+            )
+        ),
+    )
+
+
+def flipped_yaw_offset(current_offset):
+    """Return the equivalent wrist-yaw candidate 180 degrees away."""
+    value = float(current_offset) + math.pi
+    return math.atan2(math.sin(value), math.cos(value))
+
+
 def _other_narrow_edge(observation, arm):
     name = observation["name"]
     object_y = float(observation["position"][1])
@@ -152,13 +198,13 @@ def _other_narrow_edge(observation, arm):
 def narrow_edge_offset(observation, arm):
     pose_values = CLASS_POSES[observation["class_name"]]["grasp"]
     object_yaw = observation["yaw"]
-    candidates = [GRASP_NARROW_EDGE_YAW_OFFSET, -GRASP_NARROW_EDGE_YAW_OFFSET]
+    candidates = grasp_yaw_candidates(observation)
     selected = max(
         candidates,
         key=lambda value: _tool_forward_x_score(pose_values, object_yaw, arm, value),
     )
     if _other_narrow_edge(observation, arm):
-        selected = -selected
+        selected = alternate_grasp_yaw_offset(observation, selected)
     return selected
 
 
@@ -214,16 +260,117 @@ def handoff_target_arm(job):
     return None
 
 
-def handoff_values(job, target_arm):
-    key = "left_to_right" if job["arm"] == "left" else "right_to_left"
+def _handoff_vector(config, field, class_name):
+    try:
+        values = [float(value) for value in config[field][class_name]]
+    except KeyError:
+        raise ValueError("handoff config has no {} for {}".format(field, class_name))
+    if len(values) != 3:
+        raise ValueError("handoff {} for {} must contain xyz".format(field, class_name))
+    return values
+
+
+def _vision_relocalize_handoff_values(job, key, class_name):
     config = HANDOFF_CONFIG[key]
-    class_name = job["observation"]["class_name"]
     return {
-        "place_position": apply_hand_calibration(config["place_position"][class_name], job["arm"]),
+        "receiver_position_mode": "vision_relocalize",
+        "pre_place_position": _handoff_vector(
+            config, "pre_place_position", class_name
+        ),
+        "place_position": _handoff_vector(config, "place_position", class_name),
         "place_quaternion": pose_quaternion(config["place_pose"][class_name]),
-        "grasp_position": apply_hand_calibration(config["grasp_position"][class_name], target_arm),
+        "grasp_pose_values": list(config["grasp_pose"][class_name]),
+    }
+
+
+def _source_fk_relative_handoff_values(job, key, class_name):
+    config = HANDOFF_SOURCE_FK_RELATIVE_CONFIG[key]
+    return {
+        "receiver_position_mode": "source_fk_offset",
+        "pre_place_position": apply_hand_calibration(
+            _handoff_vector(config, "pre_place_position", class_name), job["arm"]
+        ),
+        "place_position": apply_hand_calibration(
+            _handoff_vector(config, "place_position", class_name), job["arm"]
+        ),
+        "place_quaternion": pose_quaternion(config["place_pose"][class_name]),
+        "pre_grasp_offset": _handoff_vector(
+            config, "pre_grasp_position", class_name
+        ),
+        "grasp_offset": _handoff_vector(config, "grasp_position", class_name),
         "grasp_quaternion": pose_quaternion(config["grasp_pose"][class_name]),
     }
+
+
+def handoff_values(job, target_arm):
+    key = "left_to_right" if job["arm"] == "left" else "right_to_left"
+    class_name = job["observation"]["class_name"]
+    try:
+        mode = str(HANDOFF_MODE_BY_CLASS[class_name])
+    except KeyError:
+        raise ValueError("no handoff mode for {}".format(class_name))
+    if mode == HANDOFF_MODE_SOURCE_FK_DELAY:
+        return _source_fk_relative_handoff_values(job, key, class_name)
+    if mode == HANDOFF_MODE_VISION_RELOCALIZE:
+        return _vision_relocalize_handoff_values(job, key, class_name)
+    raise ValueError("unsupported handoff mode for {}: {}".format(class_name, mode))
+
+
+def resolve_handoff_receiver_positions(targets, source_fk_position=None):
+    """Resolve source-FK receiver offsets after the giver reaches place."""
+    mode = str(targets.get("receiver_position_mode", ""))
+    if mode != "source_fk_offset":
+        raise ValueError("unknown handoff receiver position mode: {}".format(mode))
+    if "grasp_position" in targets or "pre_grasp_position" in targets:
+        raise ValueError("relative handoff targets contain absolute receiver positions")
+    if source_fk_position is None:
+        raise ValueError("relative handoff requires source-hand FK position")
+    source = [float(value) for value in source_fk_position]
+    if len(source) != 3:
+        raise ValueError("source-hand FK position must contain xyz")
+    pre_offset = [float(value) for value in targets["pre_grasp_offset"]]
+    grasp_offset = [float(value) for value in targets["grasp_offset"]]
+    if len(pre_offset) != 3 or len(grasp_offset) != 3:
+        raise ValueError("relative handoff receiver offsets must contain xyz")
+
+    resolved = dict(targets)
+    resolved.pop("pre_grasp_offset")
+    resolved.pop("grasp_offset")
+    resolved["receiver_position_mode"] = "resolved_source_fk"
+    resolved["source_fk_position"] = source
+    resolved["pre_grasp_position"] = [
+        source[index] + pre_offset[index] for index in range(3)
+    ]
+    resolved["grasp_position"] = [
+        source[index] + grasp_offset[index] for index in range(3)
+    ]
+    return resolved
+
+
+def resolve_relocalized_handoff_receiver(
+    targets, observation, target_arm
+):
+    """Build the receiver target from a fresh full-angle object observation."""
+    if str(targets.get("receiver_position_mode", "")) != "vision_relocalize":
+        raise ValueError("handoff targets do not request vision relocalization")
+    if str(observation.get("name", "")) == "":
+        raise ValueError("relocalized observation has no object name")
+    resolved = dict(targets)
+    resolved["receiver_position_mode"] = "resolved_vision_relocalize"
+    resolved["relocalized_observation"] = observation
+    resolved["grasp_position"] = grasp_target(observation, target_arm)
+    yaw_offset = 0.0
+    grasp_quaternion_value = pose_quaternion(
+        targets["grasp_pose_values"],
+        observation["yaw"],
+        arm=target_arm,
+        yaw_offset=yaw_offset,
+    )
+    resolved["grasp_yaw_offset"] = yaw_offset
+    resolved["grasp_quaternion"] = grasp_quaternion_value
+    resolved["lift_quaternion"] = list(grasp_quaternion_value)
+    resolved["pre_grasp_position"] = None
+    return resolved
 
 
 def build_jobs(observations):
@@ -255,7 +402,6 @@ def build_jobs(observations):
         jobs,
         key=lambda job: (
             1 if handoff_target_arm(job) else 0,
-            abs(float(job["observation"]["position"][1])),
             order_index[job["object"]],
         ),
     )

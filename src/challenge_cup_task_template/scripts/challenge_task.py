@@ -25,8 +25,9 @@ NEED_OPERATOR_ENTER = 0
 # 任务一视觉模式: 0=qpos 投影假框+深度拟合, 1=YOLO RGB 框+深度拟合。
 TASK1_VISION_MODE = 1
 
-# 任务二视觉模式: 0=完整真值, 1=qpos 类别框+RGB-D/CAD 拟合 XYZ 和 yaw。
-TASK2_VISION_MODE = 1
+# 任务二视觉模式: 0=完整真值, 1=qpos 类别框+RGB-D/CAD,
+# 2=YOLO 类别框+RGB-D/CAD 拟合 XYZ 和 yaw。
+TASK2_VISION_MODE = 2
 
 # 任务二同类工件编号: True=按拟合 yaw 与固定先验匹配；False=按相对 Y 位置。
 TASK2_USE_YAW_PRIOR_INSTANCE_MATCHING = True
@@ -34,6 +35,7 @@ TASK2_USE_YAW_PRIOR_INSTANCE_MATCHING = True
 TASK2_VISION_TOPICS = {
     0: "/task2_vision/objects_json",
     1: "/task2_depth_xy/objects_json",
+    2: "/task2_depth_xy/objects_json",
 }
 
 TASK1_PACKAGE = "task1_pick"
@@ -229,7 +231,7 @@ def _start_scene_services(scene, seed=0):
     if scene == "scene2":
         vision_mode = int(TASK2_VISION_MODE)
         if vision_mode not in TASK2_VISION_TOPICS:
-            raise RuntimeError("TASK2_VISION_MODE only supports 0 or 1")
+            raise RuntimeError("TASK2_VISION_MODE only supports 0, 1, or 2")
         instance_naming_method = _task2_instance_naming_method()
         return [
             ManagedProcess(
@@ -311,7 +313,7 @@ def _configure_task2_vision_source():
 
     vision_mode = int(TASK2_VISION_MODE)
     if vision_mode not in TASK2_VISION_TOPICS:
-        raise RuntimeError("TASK2_VISION_MODE only supports 0 or 1")
+        raise RuntimeError("TASK2_VISION_MODE only supports 0, 1, or 2")
     topic = TASK2_VISION_TOPICS[vision_mode]
     instance_naming_method = _task2_instance_naming_method()
     rospy.set_param("~task2_vision_mode", vision_mode)

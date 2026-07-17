@@ -33,6 +33,7 @@ catkin_install_python(PROGRAMS
 install(DIRECTORY
   config
   launch
+  models
   resource
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )

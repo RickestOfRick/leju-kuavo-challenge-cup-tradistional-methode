@@ -4,7 +4,7 @@
   <arg name="start_rqt" default="false"/>
   <arg name="vision_mode" default="0"/>
   <arg name="instance_naming_method" default="relative_position"/>
-  <arg name="start_depth_xy" default="$(eval arg('vision_mode') == 1)"/>
+  <arg name="start_depth_xy" default="$(eval int(arg('vision_mode')) in (1, 2))"/>
   <arg name="config" default="$(find task2_vision)/config/scene2_task2_vision.yaml"/>
 
   <node name="task2_vision" pkg="task2_vision" type="task2_vision_node.py" output="screen">

@@ -47,13 +47,22 @@ class Task2VisionPlugin(Plugin):
         self._base_drift = [0.0, 0.0, 0.0]
         self._latest_image = None
         self._image_error = ""
+        self._handoff_fixed_roi = [
+            float(value)
+            for value in rospy.get_param(
+                "/task2_depth_xy/handoff_relocalization_fixed_roi",
+                [0.50, 0.7425, 0.1666666667, 0.205],
+            )
+        ]
+        if len(self._handoff_fixed_roi) != 4:
+            self._handoff_fixed_roi = [0.50, 0.7425, 0.1666666667, 0.205]
         self._image_topic = rospy.get_param(
             "/task2_vision/head_image_topic",
             "/cam_h/color/image_raw/compressed",
         )
 
         self._widget = QWidget()
-        self._widget.setWindowTitle("Task 2 Vision - Qpos Category Boxes")
+        self._widget.setWindowTitle("Task 2 Vision - RGB-D/CAD Pose")
         layout = QVBoxLayout(self._widget)
 
         self._status = QLabel("Waiting for /task2_vision/objects_json")
@@ -184,7 +193,8 @@ class Task2VisionPlugin(Plugin):
             truth_objects = self._apply_fit_naming_to_truth_objects(
                 payload.get("objects", [])
             )
-            self._objects = self._ordered_motion_objects(truth_objects)
+            if new_mode != 2 or not self._fit_objects:
+                self._objects = self._ordered_motion_objects(truth_objects)
             drift = list(payload.get("base_translation_drift", []))
             if len(drift) >= 3:
                 self._base_drift = [float(value) for value in drift[:3]]
@@ -203,14 +213,18 @@ class Task2VisionPlugin(Plugin):
     def _fit_callback(self, message):
         try:
             payload = json.loads(message.data)
-            if int(payload.get("vision_mode", 1)) != 1:
+            fit_mode = int(payload.get("vision_mode", 1))
+            if fit_mode not in (1, 2):
                 return
             fit_items = [dict(item) for item in payload.get("objects", [])]
             self._fit_objects = {
                 self._motion_name(item): item
                 for item in fit_items
             }
-            if payload.get("instance_naming_method") == "yaw_prior":
+            if fit_mode == 2:
+                self._fit_motion_name_by_ground_truth = {}
+                self._objects = self._ordered_motion_objects(fit_items)
+            elif payload.get("instance_naming_method") == "yaw_prior":
                 self._fit_motion_name_by_ground_truth = {
                     str(item.get("ground_truth_name", "")): self._motion_name(item)
                     for item in fit_items
@@ -249,9 +263,21 @@ class Task2VisionPlugin(Plugin):
             )
             return
         state = "locked" if self._fit_locked else "waiting"
+        mode_label = "YOLO+RGB-D" if self._vision_mode == 2 else "Qpos+RGB-D"
+        fixed_handoff_roi = any(
+            obj.get("bbox_source") == "handoff_fixed_roi" for obj in self._objects
+        )
+        box_label = (
+            "ROIs"
+            if fixed_handoff_roi
+            else ("YOLO boxes" if self._vision_mode == 2 else "Qpos boxes")
+        )
         self._status.setText(
-            "Mode 1 RGB-D pose | Qpos boxes: {}/{} | Valid frames: "
+            "Mode {} {} pose | {}: {}/{} | Valid frames: "
             "{}/{} {} | {} | {}".format(
+                self._vision_mode,
+                mode_label,
+                box_label,
                 projected,
                 len(self._objects),
                 self._valid_frame_count,
@@ -278,6 +304,8 @@ class Task2VisionPlugin(Plugin):
         for obj in self._objects:
             if not obj.get("bbox_projected", False):
                 continue
+            if obj.get("bbox_source") == "handoff_fixed_roi":
+                continue
             center = obj.get("bbox_center", [])
             size = obj.get("bbox_size", [])
             if len(center) < 2 or len(size) < 2:
@@ -294,7 +322,7 @@ class Task2VisionPlugin(Plugin):
             cv2.circle(frame, (int(round(cx)), int(round(cy))), 3, color, -1)
             fit = (
                 self._fit_objects.get(self._motion_name(obj))
-                if self._vision_mode == 1
+                if self._vision_mode in (1, 2)
                 else None
             )
             if fit is not None:
@@ -335,6 +363,32 @@ class Task2VisionPlugin(Plugin):
                 cv2.LINE_AA,
             )
 
+    def _draw_handoff_fixed_roi(self, frame):
+        if self._vision_mode != 2:
+            return
+        center_x, center_y, roi_width, roi_height = self._handoff_fixed_roi
+        height, width = frame.shape[:2]
+        x1 = int(round((center_x - 0.5 * roi_width) * width))
+        y1 = int(round((center_y - 0.5 * roi_height) * height))
+        x2 = int(round((center_x + 0.5 * roi_width) * width))
+        y2 = int(round((center_y + 0.5 * roi_height) * height))
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(0, min(width - 1, x2))
+        y2 = max(0, min(height - 1, y2))
+        color = (255, 220, 70)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame,
+            "HANDOFF ROI",
+            (x1 + 4, min(y2 - 4, y1 + 18)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     def _refresh(self):
         self._refresh_image()
         self._refresh_table()
@@ -346,6 +400,7 @@ class Task2VisionPlugin(Plugin):
             return
         frame = self._latest_image.copy()
         self._draw_boxes(frame)
+        self._draw_handoff_fixed_roi(frame)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb.shape
         image = QImage(
@@ -486,7 +541,10 @@ class Task2VisionPlugin(Plugin):
                 rejection_reason = str(
                     fit.get("fit_alignment_rejection_reason", "")
                 )
-                if rejection_reason:
+                explicit_status = str(fit.get("fit_status", ""))
+                if explicit_status:
+                    fit_status = explicit_status
+                elif rejection_reason:
                     fit_status = rejection_reason
                 else:
                     fit_status = "locked" if self._fit_locked else "waiting"

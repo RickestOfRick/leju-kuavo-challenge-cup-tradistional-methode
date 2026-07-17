@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Fit task 2 object XYZ and yaw from qpos ROIs and RGB-D."""
+"""Fit task 2 object XYZ/yaw from qpos or YOLO ROIs and RGB-D/CAD."""
 
 import copy
 import json
 import math
 import os
 import struct
+import threading
 import time
 
 import cv2
@@ -51,10 +52,23 @@ from task2_vision.reference_frame import (
     transform_rotation_between_base_payloads,
 )
 from task2_vision.rest_pose import body_origin_z_from_table
+from task2_vision.target_relocalization import (
+    aggregate_target_pose,
+    create_target_session,
+    merge_target_payload,
+    record_target_fit,
+)
+from task2_vision.yolo_detection import (
+    Task2YoloDetector,
+    assign_fitted_detection_names,
+    has_complete_task2_detections,
+    task2_detection_counts,
+)
 
 
 FRAME_ID = "base_link"
 POSE_SOURCE = "qpos_bbox_region_depth_xyz_yaw_fit"
+YOLO_POSE_SOURCE = "yolo_bbox_region_depth_xyz_yaw_fit"
 Z_POSITION_SOURCE = "table_plane_class_rest_pose"
 
 
@@ -237,8 +251,14 @@ def _fit_horizontal_plane_ransac(
 class Task2DepthXYNode:
     def __init__(self):
         self.vision_mode = int(rospy.get_param("~vision_mode", 1))
-        if self.vision_mode != 1:
-            raise RuntimeError("task2_depth_xy only runs in task2 vision mode 1")
+        if self.vision_mode not in (1, 2):
+            raise RuntimeError("task2_depth_xy only runs in task2 vision mode 1 or 2")
+        self.pose_source = POSE_SOURCE if self.vision_mode == 1 else YOLO_POSE_SOURCE
+        self.vision_mode_name = (
+            "rgbd_cad_pose"
+            if self.vision_mode == 1
+            else "yolo_bbox_rgbd_cad_pose"
+        )
         self.instance_naming_method = normalize_instance_naming_method(
             rospy.get_param("~instance_naming_method", "relative_position")
         )
@@ -437,6 +457,47 @@ class Task2DepthXYNode:
             raise RuntimeError(
                 "cad_yaw_prior_window_deg and step must be positive"
             )
+        self.handoff_full_yaw_step = math.radians(
+            abs(float(rospy.get_param("~handoff_full_yaw_step_deg", 10.0)))
+        )
+        if self.handoff_full_yaw_step <= 0.0:
+            raise RuntimeError("handoff_full_yaw_step_deg must be positive")
+        self.handoff_relocalization_fixed_roi = [
+            float(value)
+            for value in rospy.get_param(
+                "~handoff_relocalization_fixed_roi",
+                [0.50, 0.7425, 0.1666666667, 0.205],
+            )
+        ]
+        if len(self.handoff_relocalization_fixed_roi) != 4:
+            raise RuntimeError(
+                "handoff_relocalization_fixed_roi must be [cx, cy, width, height]"
+            )
+        roi_cx, roi_cy, roi_width, roi_height = (
+            self.handoff_relocalization_fixed_roi
+        )
+        if (
+            not all(
+                math.isfinite(value)
+                for value in self.handoff_relocalization_fixed_roi
+            )
+            or roi_width <= 0.0
+            or roi_height <= 0.0
+            or roi_cx - 0.5 * roi_width < 0.0
+            or roi_cx + 0.5 * roi_width > 1.0
+            or roi_cy - 0.5 * roi_height < 0.0
+            or roi_cy + 0.5 * roi_height > 1.0
+        ):
+            raise RuntimeError(
+                "handoff_relocalization_fixed_roi must remain inside normalized image"
+            )
+        self.handoff_relocalization_valid_frames = max(
+            1, int(rospy.get_param("~handoff_relocalization_valid_frames", 5))
+        )
+        self.handoff_relocalization_max_frames = max(
+            self.handoff_relocalization_valid_frames,
+            int(rospy.get_param("~handoff_relocalization_max_frames", 15)),
+        )
         self.yaw_prior_regularization_weight = max(
             0.0,
             float(rospy.get_param("~cad_yaw_prior_regularization_weight", 0.1)),
@@ -622,6 +683,7 @@ class Task2DepthXYNode:
         self.latest_depth_stamp = None
         self.latest_color = None
         self.latest_color_stamp = None
+        self.color_sequence = 0
         self.depth_sequence = 0
         self.processed_depth_sequence = -1
         self.camera_info = None
@@ -629,6 +691,31 @@ class Task2DepthXYNode:
         self.mode0_reference = None
         self.valid_samples = []
         self.locked_payload = None
+        self.relocalization_lock = threading.Lock()
+        self.pending_relocalization = None
+        self.processed_relocalization_depth_sequence = -1
+        self.yolo_detector = None
+        self.yolo_model_path = ""
+        self.yolo_confidence_threshold = float(
+            rospy.get_param("~yolo_confidence_threshold", 0.25)
+        )
+        self.yolo_iou_threshold = float(
+            rospy.get_param("~yolo_iou_threshold", 0.70)
+        )
+        self.yolo_image_size = int(rospy.get_param("~yolo_image_size", 1280))
+        self.yolo_device = str(rospy.get_param("~yolo_device", ""))
+        self.yolo_half = bool(rospy.get_param("~yolo_half", False))
+        self.yolo_cached_color_sequence = -1
+        self.yolo_cached_detections = []
+        if self.vision_mode == 2:
+            self.yolo_model_path = self._resolve_yolo_model_path()
+            if not os.path.isfile(self.yolo_model_path):
+                raise RuntimeError(
+                    "task2 vision mode 2 YOLO weights not found: {}".format(
+                        self.yolo_model_path
+                    )
+                )
+            self._ensure_yolo_detector()
 
         self.truth_sub = rospy.Subscriber(
             self.truth_topic, String, self._truth_callback, queue_size=1
@@ -649,10 +736,20 @@ class Task2DepthXYNode:
             self.camera_info_topic, CameraInfo, self._camera_info_callback, queue_size=1
         )
         self.objects_pub = rospy.Publisher("~objects_json", String, queue_size=1, latch=True)
+        self.relocalization_result_pub = rospy.Publisher(
+            "~handoff_relocalize_result", String, queue_size=1, latch=True
+        )
+        self.relocalization_request_sub = rospy.Subscriber(
+            "~handoff_relocalize_request",
+            String,
+            self._handoff_relocalization_request_callback,
+            queue_size=1,
+        )
         rospy.loginfo(
             "task2_depth_xy: truth=%s mode0_reference=%s depth=%s color=%s "
             "output=%s CAD samples=%d "
-            "region+depth GN iterations=%d green_hsv=%s..%s instance_naming=%s",
+            "region+depth GN iterations=%d green_hsv=%s..%s instance_naming=%s "
+            "vision_mode=%d yolo=%s",
             self.truth_topic,
             self.mode0_reference_topic,
             self.depth_topic,
@@ -663,6 +760,168 @@ class Task2DepthXYNode:
             self.green_hsv_lower,
             self.green_hsv_upper,
             self.instance_naming_method,
+            self.vision_mode,
+            self.yolo_model_path or "disabled",
+        )
+
+    def _resolve_yolo_model_path(self):
+        configured = str(
+            rospy.get_param("~yolo_model_path", "models/task2_parts_best.pt")
+        ).strip()
+        if not configured:
+            configured = "models/task2_parts_best.pt"
+        configured = os.path.expandvars(os.path.expanduser(configured))
+        if configured.startswith("package://"):
+            package_and_path = configured[len("package://") :].split("/", 1)
+            if len(package_and_path) != 2:
+                raise RuntimeError("invalid yolo_model_path: {}".format(configured))
+            try:
+                import rospkg
+
+                package_root = rospkg.RosPack().get_path(package_and_path[0])
+            except Exception as exc:
+                raise RuntimeError(
+                    "cannot resolve YOLO package path {}: {}".format(configured, exc)
+                )
+            return os.path.abspath(os.path.join(package_root, package_and_path[1]))
+        if os.path.isabs(configured):
+            return configured
+        try:
+            import rospkg
+
+            package_root = rospkg.RosPack().get_path("task2_vision")
+        except Exception:
+            package_root = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+            )
+        return os.path.abspath(os.path.join(package_root, configured))
+
+    def _ensure_yolo_detector(self):
+        if self.vision_mode != 2 or self.yolo_detector is not None:
+            return
+        if not self.yolo_model_path or not os.path.isfile(self.yolo_model_path):
+            raise RuntimeError(
+                "task2 handoff relocalization YOLO weights unavailable: {}".format(
+                    self.yolo_model_path
+                )
+            )
+        self.yolo_detector = Task2YoloDetector(
+            self.yolo_model_path,
+            confidence=self.yolo_confidence_threshold,
+            iou=self.yolo_iou_threshold,
+            image_size=self.yolo_image_size,
+            device=self.yolo_device,
+            half=self.yolo_half,
+        )
+        self.yolo_cached_color_sequence = -1
+        self.yolo_cached_detections = []
+
+    def _has_pending_relocalization(self):
+        with self.relocalization_lock:
+            return self.pending_relocalization is not None
+
+    def _handoff_fixed_roi_candidate(self, pending):
+        width = int(self.camera_info.width) if self.camera_info is not None else 0
+        height = int(self.camera_info.height) if self.camera_info is not None else 0
+        if (width <= 0 or height <= 0) and self.latest_color is not None:
+            height, width = self.latest_color.shape[:2]
+        if width <= 0 or height <= 0:
+            return None
+        center_x, center_y, roi_width, roi_height = (
+            self.handoff_relocalization_fixed_roi
+        )
+        return {
+            "name": pending["name"],
+            "ground_truth_name": pending["ground_truth_name"],
+            "class_name": pending["class_name"],
+            "bbox_center": [center_x * width, center_y * height],
+            "bbox_size": [roi_width * width, roi_height * height],
+            "bbox_projected": True,
+            "bbox_source": "handoff_fixed_roi",
+            "detection_source": "handoff_fixed_roi",
+        }
+
+    @staticmethod
+    def _handoff_roi_preview_fit(candidate):
+        if candidate is None:
+            return None
+        return {
+            "accepted": False,
+            "rejection_reason": "",
+            "detection_bbox_center": list(candidate["bbox_center"]),
+            "detection_bbox_size": list(candidate["bbox_size"]),
+            "detection_bbox_source": str(candidate["bbox_source"]),
+        }
+
+    def _handoff_relocalization_request_callback(self, message):
+        try:
+            payload = json.loads(message.data)
+            request_id = str(payload["request_id"])
+            name = str(payload["name"])
+            ground_truth_name = str(payload.get("ground_truth_name", name))
+            class_name = str(payload["class_name"])
+            request_vision_mode = int(payload.get("vision_mode", self.vision_mode))
+            expected_position = [
+                float(value) for value in payload["expected_position"]
+            ]
+            if name not in OBJECT_NAMES:
+                raise ValueError("unsupported object {}".format(name))
+            if ground_truth_name not in OBJECT_NAMES:
+                raise ValueError(
+                    "unsupported ground-truth object {}".format(ground_truth_name)
+                )
+            if class_name not in CLASS_NAMES or not name.startswith(class_name + "_"):
+                raise ValueError("object/class mismatch")
+            if request_vision_mode != self.vision_mode:
+                raise ValueError(
+                    "request vision mode {} does not match node mode {}".format(
+                        request_vision_mode, self.vision_mode
+                    )
+                )
+            if len(expected_position) != 3 or not all(
+                math.isfinite(value) for value in expected_position
+            ):
+                raise ValueError("expected_position must contain finite xyz")
+            if self.locked_payload is None:
+                raise ValueError("initial motion payload is not locked")
+        except Exception as exc:
+            rospy.logwarn("task2_depth_xy: invalid handoff relocalization request: %s", exc)
+            return
+
+        pending = create_target_session(
+            {
+                "request_id": request_id,
+                "name": name,
+                "ground_truth_name": ground_truth_name,
+                "class_name": class_name,
+                "expected_position": expected_position,
+            },
+            self.locked_payload,
+            self.handoff_relocalization_valid_frames,
+            self.handoff_relocalization_max_frames,
+        )
+        with self.relocalization_lock:
+            current = self.pending_relocalization
+            if current is not None and current["request_id"] == request_id:
+                return
+            self.pending_relocalization = pending
+            # Do not process the stale RGB-D frame retained from the initial lock.
+            self.processed_relocalization_depth_sequence = self.depth_sequence
+        preview_fit = None
+        if self.vision_mode == 2:
+            preview_fit = self._handoff_roi_preview_fit(
+                self._handoff_fixed_roi_candidate(pending)
+            )
+        self._publish_handoff_relocalization_view(
+            pending, preview_fit, "waiting", locked=False
+        )
+        rospy.loginfo(
+            "task2_depth_xy: accepted handoff full-angle request id=%s "
+            "motion=%s truth=%s expected=%s",
+            request_id,
+            name,
+            ground_truth_name,
+            [round(value, 4) for value in expected_position],
         )
 
     def _truth_callback(self, message):
@@ -676,6 +935,8 @@ class Task2DepthXYNode:
             self.valid_samples = []
             self.locked_payload = None
             self.mode0_reference = None
+            self.yolo_cached_color_sequence = -1
+            self.yolo_cached_detections = []
         self.current_seed = seed
         self.latest_truth = payload
 
@@ -714,7 +975,7 @@ class Task2DepthXYNode:
         )
 
     def _depth_callback(self, message):
-        if self.locked_payload is not None:
+        if self.locked_payload is not None and not self._has_pending_relocalization():
             return
         try:
             self.latest_depth = _decode_compressed_depth(message)
@@ -725,11 +986,12 @@ class Task2DepthXYNode:
             rospy.logwarn_throttle(2.0, "task2_depth_xy: depth decode failed: %s", exc)
 
     def _color_callback(self, message):
-        if self.locked_payload is not None:
+        if self.locked_payload is not None and not self._has_pending_relocalization():
             return
         try:
             self.latest_color = _decode_compressed_color(message)
             self.latest_color_stamp = message.header.stamp
+            self.color_sequence += 1
         except Exception as exc:
             rospy.logwarn_throttle(2.0, "task2_depth_xy: color decode failed: %s", exc)
 
@@ -772,6 +1034,50 @@ class Task2DepthXYNode:
         if any(name not in objects for name in OBJECT_NAMES):
             return None
         return objects
+
+    def _raw_yolo_detections(self):
+        if self.yolo_detector is None or self.latest_color is None:
+            return None
+        if self.yolo_cached_color_sequence != self.color_sequence:
+            output_shape = (
+                int(self.camera_info.height),
+                int(self.camera_info.width),
+            ) if self.camera_info is not None else self.latest_color.shape[:2]
+            try:
+                detections = self.yolo_detector.infer(
+                    self.latest_color, output_shape
+                )
+            except Exception as exc:
+                rospy.logwarn_throttle(
+                    1.0, "task2_depth_xy: YOLO inference failed: %s", exc
+                )
+                detections = []
+            self.yolo_cached_color_sequence = self.color_sequence
+            self.yolo_cached_detections = copy.deepcopy(detections)
+        detections = copy.deepcopy(self.yolo_cached_detections)
+        return detections
+
+    def _yolo_objects(self):
+        detections = self._raw_yolo_detections()
+        if detections is None:
+            return None
+        if not has_complete_task2_detections(detections):
+            counts = task2_detection_counts(detections)
+            rospy.logwarn_throttle(
+                1.0,
+                "task2_depth_xy: mode 2 requires two YOLO boxes per class, got %s",
+                counts,
+            )
+            return None
+        by_name = {str(item["name"]): item for item in detections}
+        if any(name not in by_name for name in OBJECT_NAMES):
+            return None
+        return by_name
+
+    def _detection_objects(self, truth_payload):
+        if self.vision_mode == 1:
+            return self._truth_objects(truth_payload)
+        return self._yolo_objects()
 
     @staticmethod
     def _reference_objects(reference_payload):
@@ -1072,10 +1378,25 @@ class Task2DepthXYNode:
         observed_points,
         observed_center,
         forced_yaw_prior_name=None,
+        full_yaw_search=False,
     ):
         prior_candidates = []
         active_window_priors = []
-        if self.instance_naming_method == INSTANCE_NAMING_YAW_PRIOR:
+        if full_yaw_search:
+            if forced_yaw_prior_name is not None:
+                raise ValueError("full yaw search cannot force a yaw prior")
+            anisotropy = 0.0
+            step_count = max(
+                1, int(math.ceil((2.0 * math.pi) / self.handoff_full_yaw_step))
+            )
+            yaw_candidates = [
+                -math.pi + index * (2.0 * math.pi / float(step_count))
+                for index in range(step_count)
+            ]
+            yaw_search_mode = "handoff_full_360_step_{:.1f}".format(
+                360.0 / float(step_count)
+            )
+        elif self.instance_naming_method == INSTANCE_NAMING_YAW_PRIOR:
             anisotropy = 0.0
             yaw_search_mode = "class_yaw_prior_match"
             prior_candidates = [
@@ -1197,7 +1518,7 @@ class Task2DepthXYNode:
         best = min(refined, key=lambda value: value["selection_score"])
         yaw_evaluations = len(evaluations) + len(refined)
 
-        if self.instance_naming_method != INSTANCE_NAMING_YAW_PRIOR:
+        if full_yaw_search or self.instance_naming_method != INSTANCE_NAMING_YAW_PRIOR:
             for step in self.yaw_refinement_steps:
                 cad_center = (
                     np.asarray(best["alignment"]["xy"], dtype=np.float64)
@@ -1206,13 +1527,8 @@ class Task2DepthXYNode:
                 local = []
                 for direction in (-1.0, 1.0):
                     candidate_yaw = best["yaw"] + direction * step
-                    inside_prior_window = any(
-                        abs(
-                            angle_difference(
-                                candidate_yaw,
-                                prior_yaw,
-                            )
-                        )
+                    inside_prior_window = full_yaw_search or any(
+                        abs(angle_difference(candidate_yaw, prior_yaw))
                         <= self.yaw_prior_window + 1e-9
                         for _, prior_yaw in active_window_priors
                     )
@@ -1274,6 +1590,10 @@ class Task2DepthXYNode:
         return final
 
     def _assign_output_motion_names(self, output_objects):
+        if self.vision_mode == 2:
+            for item in output_objects:
+                item["instance_naming_method"] = self.instance_naming_method
+            return output_objects, self.instance_naming_method
         if self.instance_naming_method == INSTANCE_NAMING_RELATIVE_POSITION:
             for item in output_objects:
                 item["instance_naming_method"] = INSTANCE_NAMING_RELATIVE_POSITION
@@ -1290,6 +1610,32 @@ class Task2DepthXYNode:
             assign_motion_names(output_objects, INSTANCE_NAMING_YAW_PRIOR),
             INSTANCE_NAMING_YAW_PRIOR,
         )
+
+    def _assign_mode2_frame_names(self, detection_objects, current_fits):
+        """Name every YOLO frame from its fitted pose before median collection."""
+        if self.vision_mode != 2:
+            return detection_objects, current_fits
+        remapped_detections, remapped_fits, assigned = (
+            assign_fitted_detection_names(
+                detection_objects, current_fits, self.instance_naming_method
+            )
+        )
+        if not assigned:
+            return detection_objects, current_fits
+        return remapped_detections, remapped_fits
+
+    @staticmethod
+    def _mode2_diagnostic_item(detection, current_truth_item):
+        """Attach truth only after fitting, for RQT/test diagnostics."""
+        output = copy.deepcopy(current_truth_item)
+        output["detection_name"] = str(detection.get("detection_name", ""))
+        output["detection_confidence"] = float(detection.get("confidence", 0.0))
+        output["bbox_center"] = list(detection["bbox_center"])
+        output["bbox_size"] = list(detection["bbox_size"])
+        output["bbox_projected"] = True
+        output["bbox_source"] = "yolo_rgb"
+        output["detection_source"] = "yolo_rgb"
+        return output
 
     def _c_handle_mask(self, color_roi, foreground_mask):
         if color_roi is None or self.c_handle_aligner is None:
@@ -1333,6 +1679,7 @@ class Task2DepthXYNode:
         table_green_pixels,
         yaw_prior_frame_offset,
         forced_yaw_prior_name=None,
+        full_yaw_search=False,
     ):
         x1, y1, x2, y2 = self._roi_bounds(item, depth.shape)
         if x2 - x1 < 2 or y2 - y1 < 2:
@@ -1446,6 +1793,7 @@ class Task2DepthXYNode:
             selected_points,
             observed_center,
             forced_yaw_prior_name=forced_yaw_prior_name,
+            full_yaw_search=full_yaw_search,
         )
         if pose_fit is None:
             return {
@@ -1748,11 +2096,11 @@ class Task2DepthXYNode:
         output["orientation"] = []
         output["truth_reference"] = "same_run_mode0_equivalent_input"
         output["fit_coordinate_reference"] = "same_run_mode0_equivalent_input"
-        output["position_source"] = POSE_SOURCE
-        output["xy_position_source"] = POSE_SOURCE
+        output["position_source"] = self.pose_source
+        output["xy_position_source"] = self.pose_source
         output["z_position_source"] = Z_POSITION_SOURCE
-        output["yaw_source"] = POSE_SOURCE
-        output["orientation_source"] = POSE_SOURCE
+        output["yaw_source"] = self.pose_source
+        output["orientation_source"] = self.pose_source
         output["fit_method"] = "pca_cad_region_depth_xy_yaw_fit"
         output["fit_valid"] = False
         output["confidence"] = 0.0
@@ -1911,7 +2259,447 @@ class Task2DepthXYNode:
         )
         return output
 
+    def _handoff_target_truth_item(self, pending):
+        payload = self.latest_truth or {}
+        for item in payload.get("objects", []):
+            ground_truth_name = str(
+                item.get("ground_truth_name", item.get("name", ""))
+            )
+            if ground_truth_name == pending["ground_truth_name"]:
+                return copy.deepcopy(item)
+        return None
+
+    @staticmethod
+    def _base_handoff_target_object(pending):
+        for item in pending["base_payload"].get("objects", []):
+            motion_name = str(item.get("motion_name") or item.get("name", ""))
+            if motion_name == pending["name"]:
+                return copy.deepcopy(item)
+        raise ValueError(
+            "locked payload has no handoff target {}".format(pending["name"])
+        )
+
+    def _handoff_target_update(self, pending, fit, locked):
+        output = self._base_handoff_target_object(pending)
+        for key in list(output):
+            if key.startswith("fit_") or key in (
+                "x_error_m",
+                "y_error_m",
+                "z_error_m",
+                "yaw_error_rad",
+                "yaw_error_deg",
+            ):
+                output.pop(key, None)
+        truth_item = self._handoff_target_truth_item(pending)
+        if truth_item is not None and len(truth_item.get("position", [])) >= 3:
+            truth_position = [
+                float(value) for value in truth_item["position"][:3]
+            ]
+            truth_yaw = float(truth_item.get("yaw", 0.0))
+            output["current_truth_position"] = list(truth_position)
+            output["current_truth_yaw"] = truth_yaw
+            output["truth_position"] = list(truth_position)
+            output["truth_yaw"] = truth_yaw
+            output["truth_yaw_deg"] = math.degrees(truth_yaw)
+            output["truth_orientation"] = copy.deepcopy(
+                truth_item.get("orientation", [])
+            )
+        else:
+            truth_position = [
+                float(value) for value in output.get("truth_position", [])[:3]
+            ]
+            truth_yaw = float(output.get("truth_yaw", 0.0))
+
+        output["name"] = pending["name"]
+        output["motion_name"] = pending["name"]
+        output["ground_truth_name"] = pending["ground_truth_name"]
+        output["class_name"] = pending["class_name"]
+        output["position"] = []
+        output["orientation"] = []
+        output["confidence"] = 0.0
+        output["position_source"] = "handoff_full_yaw_rgbd_cad_fit"
+        output["xy_position_source"] = "handoff_full_yaw_rgbd_cad_fit"
+        output["yaw_source"] = "handoff_full_yaw_rgbd_cad_fit"
+        output["orientation_source"] = "handoff_full_yaw_rgbd_cad_fit"
+        output["truth_reference"] = "current_mujoco_qpos_base_link"
+        output["fit_coordinate_reference"] = "current_base_link"
+        output["fit_method"] = "target_full_360_cad_region_depth_xy_yaw_fit"
+        output["fit_alignment_accepted"] = bool(
+            fit is not None and fit.get("accepted", False)
+        )
+        output["fit_alignment_rejection_reason"] = (
+            str(fit.get("rejection_reason", "")) if fit is not None else ""
+        )
+        output["bbox_projected"] = False
+        output["bbox_center"] = []
+        output["bbox_size"] = []
+        if fit is not None and len(fit.get("detection_bbox_center", [])) >= 2:
+            output["bbox_center"] = list(fit["detection_bbox_center"][:2])
+            output["bbox_size"] = list(fit.get("detection_bbox_size", [])[:2])
+            output["bbox_projected"] = len(output["bbox_size"]) >= 2
+            output["bbox_source"] = str(
+                fit.get("detection_bbox_source", "handoff_relocalization")
+            )
+        if fit is None or "xy" not in fit:
+            output["fit_position"] = []
+            output["fit_yaw"] = None
+            return output
+
+        fit_position = [
+            float(fit["xy"][0]),
+            float(fit["xy"][1]),
+            float(fit["z"]),
+        ]
+        fit_yaw = float(fit["yaw"])
+        fit_orientation = orientation_xyzw_from_yaw(
+            pending["class_name"], fit_yaw
+        )
+        output["fit_position"] = list(fit_position)
+        output["fit_yaw"] = fit_yaw
+        output["fit_yaw_deg"] = math.degrees(fit_yaw)
+        output["fit_orientation"] = list(fit_orientation)
+        output["yaw"] = fit_yaw
+        output["yaw_deg"] = math.degrees(fit_yaw)
+        output["yaw_orientation"] = yaw_orientation_xyzw(fit_yaw)
+        if locked:
+            output["position"] = list(fit_position)
+            output["orientation"] = list(fit_orientation)
+            output["confidence"] = 1.0
+        if len(truth_position) >= 3:
+            output["x_error_m"] = fit_position[0] - truth_position[0]
+            output["y_error_m"] = fit_position[1] - truth_position[1]
+            output["z_error_m"] = fit_position[2] - truth_position[2]
+            yaw_error = angle_difference(fit_yaw, truth_yaw)
+            output["yaw_error_rad"] = yaw_error
+            output["yaw_error_deg"] = math.degrees(yaw_error)
+
+        field_map = {
+            "points": "fit_points",
+            "render_score": "fit_render_score",
+            "render_depth_error_m": "fit_render_depth_error_m",
+            "render_coverage": "fit_render_coverage",
+            "render_observed_coverage": "fit_render_observed_coverage",
+            "render_iou": "fit_render_iou",
+            "alignment_iterations": "fit_alignment_iterations",
+            "alignment_depth_inliers": "fit_alignment_depth_inliers",
+            "yaw_initial": "fit_yaw_initial",
+            "yaw_evaluations": "fit_yaw_evaluations",
+            "yaw_search_mode": "fit_yaw_search_mode",
+            "yaw_data_score": "fit_yaw_data_score",
+            "yaw_prior_penalty": "fit_yaw_prior_penalty",
+        }
+        for source_key, output_key in field_map.items():
+            if source_key in fit:
+                output[output_key] = copy.deepcopy(fit[source_key])
+        if "yaw_initial" in fit:
+            output["fit_yaw_initial_deg"] = math.degrees(
+                float(fit["yaw_initial"])
+            )
+        return output
+
+    def _publish_handoff_relocalization_view(
+        self, pending, fit, status, locked
+    ):
+        target_update = self._handoff_target_update(pending, fit, locked)
+        sample_count = len(pending.get("samples", []))
+        payload = merge_target_payload(
+            pending["base_payload"],
+            pending["name"],
+            target_update,
+            pending["request_id"],
+            status,
+            locked,
+            sample_count,
+            pending["required_samples"],
+            rospy.Time.now().to_sec(),
+        )
+        self.objects_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        )
+        return payload
+
+    def _finish_handoff_relocalization(self, request_id, payload):
+        with self.relocalization_lock:
+            current = self.pending_relocalization
+            if current is None or current["request_id"] != request_id:
+                return False
+            self.pending_relocalization = None
+        self.relocalization_result_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        )
+        if self.vision_mode == 2 and self.yolo_detector is not None:
+            self.yolo_detector.release()
+            self.yolo_detector = None
+            rospy.loginfo(
+                "task2_depth_xy: released YOLO model after handoff relocalization"
+            )
+        return True
+
+    def _record_handoff_relocalization_frame(self, pending, fit):
+        request_id = pending["request_id"]
+        with self.relocalization_lock:
+            current = self.pending_relocalization
+            if current is None or current["request_id"] != request_id:
+                return
+            state = record_target_fit(current, fit)
+            attempts = state["attempts"]
+            samples = state["samples"]
+            view_pending = copy.deepcopy(current)
+
+        if state["ready"]:
+            selected, position, yaw = aggregate_target_pose(
+                samples,
+                view_pending["required_samples"],
+                circular_median,
+            )
+            aggregate_fit = copy.deepcopy(selected[-1])
+            aggregate_fit["accepted"] = True
+            aggregate_fit["rejection_reason"] = ""
+            aggregate_fit["xy"] = position[:2]
+            aggregate_fit["z"] = position[2]
+            aggregate_fit["yaw"] = yaw
+            aggregate_fit["yaw_deg"] = math.degrees(yaw)
+            aggregate_fit["orientation"] = orientation_xyzw_from_yaw(
+                pending["class_name"], yaw
+            )
+            aggregate_fit["yaw_orientation"] = yaw_orientation_xyzw(yaw)
+            result_object = {
+                "name": pending["name"],
+                "motion_name": pending["name"],
+                "ground_truth_name": pending["ground_truth_name"],
+                "class_name": pending["class_name"],
+                "position": position,
+                "orientation": orientation_xyzw_from_yaw(
+                    pending["class_name"], yaw
+                ),
+                "yaw": yaw,
+                "yaw_orientation": yaw_orientation_xyzw(yaw),
+                "confidence": 1.0,
+                "position_source": "handoff_full_yaw_rgbd_cad_fit",
+                "yaw_source": "handoff_full_yaw_rgbd_cad_fit",
+                "fit_yaw_search_mode": str(selected[-1]["yaw_search_mode"]),
+                "fit_render_score": float(selected[-1]["render_score"]),
+                "selection_sample_count": len(selected),
+            }
+            locked_payload = self._publish_handoff_relocalization_view(
+                view_pending, aggregate_fit, "locked", locked=True
+            )
+            self.locked_payload = copy.deepcopy(locked_payload)
+            payload = {
+                "stamp": rospy.Time.now().to_sec(),
+                "frame_id": FRAME_ID,
+                "request_id": request_id,
+                "success": True,
+                "reason": "",
+                "vision_mode": self.vision_mode,
+                "object": result_object,
+            }
+            if self._finish_handoff_relocalization(request_id, payload):
+                rospy.loginfo(
+                    "task2_depth_xy: handoff relocalization complete id=%s "
+                    "object=%s fit=%s yaw=%.2f deg frames=%d/%d",
+                    request_id,
+                    pending["name"],
+                    [round(value, 5) for value in position],
+                    math.degrees(yaw),
+                    len(selected),
+                    attempts,
+                )
+            return
+
+        if state["exhausted"]:
+            reason = (
+                str(fit.get("rejection_reason", "no_valid_fit"))
+                if fit is not None
+                else "target_detection_unavailable"
+            )
+            self._publish_handoff_relocalization_view(
+                view_pending, fit, "failed", locked=False
+            )
+            self._finish_handoff_relocalization(
+                request_id,
+                {
+                    "stamp": rospy.Time.now().to_sec(),
+                    "frame_id": FRAME_ID,
+                    "request_id": request_id,
+                    "success": False,
+                    "reason": "{} after {} frames".format(reason, attempts),
+                    "vision_mode": self.vision_mode,
+                },
+            )
+            return
+
+        self._publish_handoff_relocalization_view(
+            view_pending, fit, "waiting", locked=False
+        )
+
+    def _process_handoff_relocalization_once(self):
+        with self.relocalization_lock:
+            pending = copy.deepcopy(self.pending_relocalization)
+        if pending is None:
+            return
+        if (
+            self.latest_depth is None
+            or (self.green_filter_enabled and self.latest_color is None)
+            or self.camera_info is None
+            or self.latest_truth is None
+            or self.depth_sequence == self.processed_relocalization_depth_sequence
+        ):
+            return
+        depth = self.latest_depth
+        depth_stamp = self.latest_depth_stamp
+        color = self.latest_color
+        color_stamp = self.latest_color_stamp
+        if (
+            self.green_filter_enabled
+            and depth_stamp is not None
+            and color_stamp is not None
+            and self.color_depth_max_skew > 0.0
+            and abs((depth_stamp - color_stamp).to_sec()) > self.color_depth_max_skew
+        ):
+            return
+        transform = self._camera_to_base_transform()
+        if transform is None:
+            return
+        truth_payload = copy.deepcopy(self.latest_truth)
+        target_candidates = []
+        plane_detections = {}
+        if self.vision_mode == 1:
+            for item in truth_payload.get("objects", []):
+                name = str(item.get("name", ""))
+                if name in OBJECT_NAMES and item.get("bbox_projected", False):
+                    plane_detections[name] = item
+            source = next(
+                (
+                    item
+                    for item in plane_detections.values()
+                    if str(item.get("ground_truth_name", item.get("name", "")))
+                    == pending["ground_truth_name"]
+                ),
+                None,
+            )
+            if source is not None:
+                candidate = copy.deepcopy(source)
+                candidate["name"] = pending["name"]
+                candidate["ground_truth_name"] = pending["ground_truth_name"]
+                candidate["class_name"] = pending["class_name"]
+                target_candidates.append(candidate)
+        else:
+            candidate = self._handoff_fixed_roi_candidate(pending)
+            if candidate is not None:
+                plane_detections["handoff_fixed_roi"] = candidate
+                target_candidates.append(candidate)
+
+        color_bgr = color
+        if color_bgr is not None and color_bgr.shape[:2] != depth.shape[:2]:
+            color_bgr = cv2.resize(
+                color_bgr,
+                (depth.shape[1], depth.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        if self.green_filter_enabled:
+            table_green_pixels = green_table_mask(
+                color,
+                depth.shape,
+                self.green_hsv_lower,
+                self.green_hsv_upper,
+                self.green_dilate_pixels,
+                self.green_chroma_min,
+                self.green_chroma_dominance_min,
+                self.green_shadow_min_intensity_sum,
+            )
+        else:
+            table_green_pixels = np.zeros(depth.shape, dtype=bool)
+        intrinsics = _scaled_intrinsics(self.camera_info, depth.shape)
+        if target_candidates:
+            detection = target_candidates[0]
+            self._publish_handoff_relocalization_view(
+                pending,
+                {
+                    "accepted": False,
+                    "rejection_reason": "",
+                    "detection_bbox_center": list(
+                        detection.get("bbox_center", [])
+                    ),
+                    "detection_bbox_size": list(detection.get("bbox_size", [])),
+                    "detection_bbox_source": str(
+                        detection.get("bbox_source", "handoff_relocalization")
+                    ),
+                },
+                "waiting",
+                locked=False,
+            )
+        plane = self._fit_table_plane(
+            depth, plane_detections, intrinsics, transform
+        )
+        self.processed_relocalization_depth_sequence = self.depth_sequence
+        if plane is None:
+            failed_fit = self._handoff_roi_preview_fit(
+                target_candidates[0] if target_candidates else None
+            ) or {}
+            failed_fit["rejection_reason"] = "table_plane_fit_failed"
+            self._record_handoff_relocalization_frame(
+                pending, failed_fit
+            )
+            return
+
+        fits = []
+        last_rejected_fit = None
+        for candidate in target_candidates:
+            try:
+                fit = self._fit_object(
+                    candidate,
+                    depth,
+                    color_bgr,
+                    intrinsics,
+                    transform,
+                    plane,
+                    table_green_pixels,
+                    0.0,
+                    full_yaw_search=True,
+                )
+            except Exception as exc:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "task2_depth_xy: handoff candidate fit failed: %s",
+                    exc,
+                )
+                fit = {
+                    "accepted": False,
+                    "rejection_reason": "candidate_fit_exception: {}".format(exc),
+                }
+            if fit is not None:
+                fit["detection_bbox_center"] = list(
+                    candidate.get("bbox_center", [])
+                )
+                fit["detection_bbox_size"] = list(candidate.get("bbox_size", []))
+                fit["detection_bbox_source"] = str(
+                    candidate.get("bbox_source", "handoff_relocalization")
+                )
+            if fit is not None and bool(fit.get("accepted", False)):
+                fits.append(fit)
+            elif fit is not None:
+                last_rejected_fit = fit
+        expected_xy = pending["expected_position"][:2]
+        selected_fit = (
+            min(
+                fits,
+                key=lambda value: math.hypot(
+                    float(value["xy"][0]) - expected_xy[0],
+                    float(value["xy"][1]) - expected_xy[1],
+                ),
+            )
+            if fits
+            else None
+        )
+        self._record_handoff_relocalization_frame(
+            pending, selected_fit if selected_fit is not None else last_rejected_fit
+        )
+
     def process_once(self):
+        if self._has_pending_relocalization():
+            self._process_handoff_relocalization_once()
+            return
         if self.locked_payload is not None:
             return
         if (
@@ -1934,9 +2722,14 @@ class Task2DepthXYNode:
                 truth_payload.get("seed"),
             )
             return
-        truth_objects = self._truth_objects(truth_payload)
+        detection_objects = self._detection_objects(truth_payload)
+        current_truth_objects = self._reference_objects(truth_payload)
         reference_objects = self._reference_objects(reference_payload)
-        if truth_objects is None or reference_objects is None:
+        if (
+            detection_objects is None
+            or current_truth_objects is None
+            or reference_objects is None
+        ):
             return
         transform = self._camera_to_base_transform()
         if transform is None:
@@ -1980,7 +2773,7 @@ class Task2DepthXYNode:
                 interpolation=cv2.INTER_NEAREST,
             )
         intrinsics = _scaled_intrinsics(self.camera_info, depth.shape)
-        plane = self._fit_table_plane(depth, truth_objects, intrinsics, transform)
+        plane = self._fit_table_plane(depth, detection_objects, intrinsics, transform)
         self.processed_depth_sequence = depth_sequence
         if plane is None:
             rospy.logwarn_throttle(2.0, "task2_depth_xy: table plane fit failed")
@@ -2001,7 +2794,7 @@ class Task2DepthXYNode:
 
         def fit_object(name, forced_yaw_prior_name=None):
             return self._fit_object(
-                truth_objects[name],
+                detection_objects[name],
                 depth,
                 color_bgr,
                 intrinsics,
@@ -2017,7 +2810,7 @@ class Task2DepthXYNode:
         if self.instance_naming_method == INSTANCE_NAMING_RELATIVE_POSITION:
             window_fits = {}
             for name in OBJECT_NAMES:
-                class_name = str(truth_objects[name].get("class_name", ""))
+                class_name = str(detection_objects[name].get("class_name", ""))
                 window_fits[name] = {
                     prior_name: fit_object(
                         name, forced_yaw_prior_name=prior_name
@@ -2029,7 +2822,7 @@ class Task2DepthXYNode:
                 class_objects = [
                     name
                     for name in OBJECT_NAMES
-                    if truth_objects[name].get("class_name") == class_name
+                    if detection_objects[name].get("class_name") == class_name
                 ]
                 decision = joint_yaw_window_assignment(
                     class_name, class_objects, window_fits
@@ -2079,7 +2872,7 @@ class Task2DepthXYNode:
                 class_objects = [
                     name
                     for name in OBJECT_NAMES
-                    if truth_objects[name].get("class_name") == class_name
+                    if detection_objects[name].get("class_name") == class_name
                 ]
                 assignment = joint_yaw_prior_assignment(
                     class_name, class_objects, raw_fits
@@ -2129,13 +2922,16 @@ class Task2DepthXYNode:
 
         current_fits = {}
         for name in OBJECT_NAMES:
-            truth_item = truth_objects[name]
+            detection_item = detection_objects[name]
             current_fits[name] = self._fit_in_mode0_reference(
                 raw_fits[name],
-                truth_item,
+                detection_item,
                 truth_payload,
                 reference_payload,
             )
+        detection_objects, current_fits = self._assign_mode2_frame_names(
+            detection_objects, current_fits
+        )
 
         complete = all(
             current_fits[name] is not None
@@ -2162,9 +2958,14 @@ class Task2DepthXYNode:
             displayed_fit = (
                 self._aggregate_fit(name) if locked else current_fits.get(name)
             )
+            source_item = detection_objects[name]
+            if self.vision_mode == 2:
+                source_item = self._mode2_diagnostic_item(
+                    source_item, current_truth_objects[name]
+                )
             output_objects.append(
                 self._make_output_object(
-                    truth_objects[name],
+                    source_item,
                     reference_objects[name],
                     displayed_fit,
                     locked,
@@ -2186,13 +2987,21 @@ class Task2DepthXYNode:
             "camera_frame_id": self.latest_depth_frame,
             "scene": "scene2",
             "seed": truth_payload.get("seed"),
-            "vision_mode": 1,
-            "vision_mode_name": "rgbd_cad_pose",
+            "vision_mode": self.vision_mode,
+            "vision_mode_name": self.vision_mode_name,
             "frozen": locked,
             "locked": locked,
-            "position_source": POSE_SOURCE,
+            "position_source": self.pose_source,
             "z_position_source": Z_POSITION_SOURCE,
-            "yaw_source": POSE_SOURCE,
+            "yaw_source": self.pose_source,
+            "detection_mode": (
+                "qpos_category_bbox" if self.vision_mode == 1 else "yolo_category_bbox"
+            ),
+            "bbox_source": (
+                "mujoco_qpos_projected_visual_mesh"
+                if self.vision_mode == 1
+                else "yolo_rgb"
+            ),
             "ready_for_motion": locked,
             "selection_method": (
                 "xyz_median_circular_yaw_and_{}_instance_matching".format(
@@ -2237,6 +3046,10 @@ class Task2DepthXYNode:
         )
         if locked:
             self.locked_payload = copy.deepcopy(payload)
+            if self.yolo_detector is not None:
+                self.yolo_detector.release()
+                self.yolo_detector = None
+                rospy.loginfo("task2_depth_xy: released YOLO model after pose lock")
             rospy.loginfo(
                 "task2_depth_xy: locked coordinate median from %d complete valid frames",
                 len(self.valid_samples),

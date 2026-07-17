@@ -151,10 +151,18 @@ class GripperHold:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def _publish_locked(self):
+        message = JointState()
+        message.header.stamp = rospy.Time.now()
+        message.name = ["left_gripper_joint", "right_gripper_joint"]
+        message.position = [self._left, self._right]
+        self._publisher.publish(message)
+
     def open_all(self):
         with self._lock:
             self._left = 0.0
             self._right = 0.0
+            self._publish_locked()
 
     def open(self, side):
         with self._lock:
@@ -164,6 +172,7 @@ class GripperHold:
                 self._right = 0.0
             else:
                 raise ValueError("unknown arm {}".format(side))
+            self._publish_locked()
 
     def close(self, side):
         with self._lock:
@@ -173,6 +182,7 @@ class GripperHold:
                 self._right = 255.0
             else:
                 raise ValueError("unknown arm {}".format(side))
+            self._publish_locked()
 
     def stop(self):
         self._stop.set()
@@ -182,13 +192,82 @@ class GripperHold:
         rate = rospy.Rate(100.0)
         while not self._stop.is_set() and not rospy.is_shutdown():
             with self._lock:
-                left, right = self._left, self._right
-            message = JointState()
-            message.header.stamp = rospy.Time.now()
-            message.name = ["left_gripper_joint", "right_gripper_joint"]
-            message.position = [left, right]
-            self._publisher.publish(message)
+                self._publish_locked()
             rate.sleep()
+
+
+class SimTimeTracker:
+    """跟踪 MuJoCo sensor_time，用墙钟超时仅防止仿真停止时永久阻塞。"""
+
+    def __init__(self, topic="/sensors_data_raw"):
+        from kuavo_msgs.msg import sensorsData
+
+        self._topic = str(topic)
+        self._condition = threading.Condition()
+        self._seconds = None
+        self._sequence = 0
+        self._subscriber = rospy.Subscriber(
+            self._topic, sensorsData, self._callback, queue_size=1
+        )
+
+    def _callback(self, message):
+        seconds = float(message.sensor_time.to_sec())
+        if not math.isfinite(seconds):
+            return
+        with self._condition:
+            self._seconds = seconds
+            self._sequence += 1
+            self._condition.notify_all()
+
+    def stop(self):
+        self._subscriber.unregister()
+
+    def marker(self, timeout=TOPIC_TIMEOUT):
+        deadline = time.monotonic() + float(timeout)
+        with self._condition:
+            while self._seconds is None and not rospy.is_shutdown():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for {} sensor_time".format(self._topic)
+                    )
+                self._condition.wait(timeout=min(0.1, remaining))
+            if rospy.is_shutdown():
+                raise RuntimeError("shutdown while waiting for simulation time")
+            return self._sequence
+
+    def wait_duration(self, duration, after_sequence, timeout=TOPIC_TIMEOUT):
+        duration = float(duration)
+        if not math.isfinite(duration) or duration < 0.0:
+            raise ValueError("simulation duration must be finite and non-negative")
+        deadline = time.monotonic() + max(float(timeout), 10.0 * duration)
+        with self._condition:
+            while self._sequence <= int(after_sequence) and not rospy.is_shutdown():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "simulation time did not advance after gripper command"
+                    )
+                self._condition.wait(timeout=min(0.1, remaining))
+            if rospy.is_shutdown():
+                raise RuntimeError("shutdown while waiting for simulation time")
+            start = float(self._seconds)
+            previous = start
+            while self._seconds - start + 1e-12 < duration:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for {:.3f} s of simulation time".format(
+                            duration
+                        )
+                    )
+                self._condition.wait(timeout=min(0.1, remaining))
+                if self._seconds + 1e-12 < previous:
+                    raise RuntimeError("simulation time moved backwards")
+                previous = float(self._seconds)
+                if rospy.is_shutdown():
+                    raise RuntimeError("shutdown while waiting for simulation time")
+            return start, float(self._seconds)
 
 
 class RobotController:
@@ -208,6 +287,7 @@ class RobotController:
         _wait_connection(self.arm_traj_pub)
         _wait_connection(self.gripper_pub)
 
+        self.sim_time = SimTimeTracker()
         initial = rad_to_deg(self.read_arm_joints())
         self._command_lock = threading.RLock()
         self._trajectory_degrees = list(initial)
@@ -219,11 +299,13 @@ class RobotController:
         except Exception:
             self.gripper.stop()
             self.arm_hold.stop()
+            self.sim_time.stop()
             raise
 
     def stop(self):
         self.gripper.stop()
         self.arm_hold.stop()
+        self.sim_time.stop()
 
     def sync_command_to_actual(self):
         """用当前实测 q 初始化后续单臂轨迹的非活动侧保持目标。"""
@@ -340,6 +422,13 @@ class RobotController:
     @staticmethod
     def _pose_for_side(hand_poses, side):
         return hand_poses.left_pose if side == "left" else hand_poses.right_pose
+
+    def fk_pose(self, side, joints=None):
+        """返回指定实测/给定 q 对应手臂的 FK 位姿。"""
+        if side not in ("left", "right"):
+            raise ValueError("FK pose side must be left or right")
+        q = self.read_arm_joints() if joints is None else list(joints)
+        return self._pose_for_side(self.call_fk(q), side)
 
     def wait_arm_stable(self, side):
         """等待对应手臂动作完成；超时属于软检查，只告警并返回最新关节角。"""
@@ -749,18 +838,56 @@ class RobotController:
         label,
         pos_cost_weight=IK_POS_COST_WEIGHT,
         move_time=ARM_MOVE_TIME,
+        cartesian_subdivisions=None,
     ):
-        """经多个 IK 中间解连续执行 q 插值，只在最终目标等待稳定和检查 FK。"""
+        """经多个 IK q 约束连续插值，只在最终目标等待稳定和检查 FK。"""
         current = list(self.read_arm_joints())
-        intermediate_positions = [
-            [float(value) for value in position]
-            for position in intermediate_positions
-        ]
-        if not intermediate_positions or any(
-            len(position) != 3 for position in intermediate_positions
-        ):
-            raise ValueError("IK intermediate positions must contain XYZ points")
         target_position = [float(value) for value in target_position]
+        if len(target_position) != 3:
+            raise ValueError("IK target position must contain XYZ")
+
+        if cartesian_subdivisions is not None:
+            if intermediate_positions:
+                raise ValueError(
+                    "explicit IK positions and Cartesian subdivisions cannot be combined"
+                )
+            try:
+                subdivision_value = float(cartesian_subdivisions)
+                subdivision_count = int(subdivision_value)
+            except (TypeError, ValueError):
+                raise ValueError("Cartesian IK subdivisions must be an integer")
+            if subdivision_value != subdivision_count or subdivision_count < 2:
+                raise ValueError("Cartesian IK subdivisions must be an integer >= 2")
+            current_pose = self._pose_for_side(self.call_fk(current), side)
+            start_position = [float(value) for value in current_pose.pos_xyz]
+            intermediate_positions = [
+                [
+                    start_position[axis]
+                    + float(step)
+                    / float(subdivision_count)
+                    * (target_position[axis] - start_position[axis])
+                    for axis in range(3)
+                ]
+                for step in range(1, subdivision_count)
+            ]
+            rospy.loginfo(
+                "task2: [%s] current FK=%s -> target=%s divided into %d q legs "
+                "with %d intermediate IK q constraints",
+                label,
+                fmt(start_position),
+                fmt(target_position),
+                subdivision_count,
+                len(intermediate_positions),
+            )
+        else:
+            intermediate_positions = [
+                [float(value) for value in position]
+                for position in intermediate_positions
+            ]
+            if not intermediate_positions or any(
+                len(position) != 3 for position in intermediate_positions
+            ):
+                raise ValueError("IK intermediate positions must contain XYZ points")
 
         constraint_positions = list(intermediate_positions) + [target_position]
         constraint_labels = [
