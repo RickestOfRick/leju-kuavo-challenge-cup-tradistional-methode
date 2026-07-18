@@ -4,9 +4,11 @@
 import json
 import math
 import statistics
+import threading
 import time
 
 import rospy
+from kuavo_msgs.msg import sensorsData
 from std_msgs.msg import String
 
 from task1_config import (
@@ -16,6 +18,7 @@ from task1_config import (
     TASK1_VISION_MEDIAN_FRAMES,
     TASK1_VISION_MIN_CONFIDENCE,
     TASK1_VISION_TIMEOUT,
+    TASK1_VISION_WARN_TIME,
     TASK1_VISION_TOPIC,
     TASK1_VISION_USED_TOPIC,
     PARCEL_NAMES,
@@ -25,6 +28,100 @@ _vision_to_ik_offset = [0.0, 0.0, 0.0]
 _warned_generic_mapping = False
 _warned_position_sources = set()
 _used_vision_pub = None
+
+
+class _SensorTimeClock:
+    """Track simulator time without depending on the host real-time factor."""
+
+    def __init__(self, topic="/sensors_data_raw"):
+        self.topic = str(topic)
+        self._condition = threading.Condition()
+        self._seconds = None
+        self._subscriber = rospy.Subscriber(
+            self.topic, sensorsData, self._callback, queue_size=1
+        )
+
+    def _callback(self, message):
+        seconds = float(message.sensor_time.to_sec())
+        if not math.isfinite(seconds):
+            return
+        with self._condition:
+            self._seconds = seconds
+            self._condition.notify_all()
+
+    def wait_until_ready(self, wall_timeout=20.0):
+        wall_deadline = time.monotonic() + float(wall_timeout)
+        with self._condition:
+            while self._seconds is None and not rospy.is_shutdown():
+                remaining = wall_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        "timed out waiting for {} sensor_time".format(self.topic)
+                    )
+                self._condition.wait(timeout=min(0.1, remaining))
+            if rospy.is_shutdown():
+                raise RuntimeError("shutdown while waiting for simulation time")
+            return float(self._seconds)
+
+    def seconds(self):
+        with self._condition:
+            if self._seconds is None:
+                raise RuntimeError("{} sensor_time is unavailable".format(self.topic))
+            return float(self._seconds)
+
+
+class _SimulationDeadline:
+    def __init__(self, duration, warning_time, label, stall_timeout=20.0):
+        self.duration = float(duration)
+        self.warning_time = max(0.0, float(warning_time))
+        self.label = str(label)
+        if not math.isfinite(self.duration) or self.duration <= 0.0:
+            raise ValueError("simulation timeout must be finite and positive")
+        self.clock = _sensor_time_clock()
+        self.start = self.clock.wait_until_ready()
+        self.previous = self.start
+        self.last_progress_wall = time.monotonic()
+        self.stall_timeout = float(stall_timeout)
+        self.warned = False
+
+    def expired(self):
+        now = self.clock.seconds()
+        if now + 1e-12 < self.previous:
+            raise RuntimeError("simulation time moved backwards")
+        if now > self.previous + 1e-12:
+            self.last_progress_wall = time.monotonic()
+        elif time.monotonic() - self.last_progress_wall >= self.stall_timeout:
+            raise RuntimeError(
+                "{} sensor_time stopped advancing".format(self.clock.topic)
+            )
+        self.previous = now
+        elapsed = now - self.start
+        if (
+            not self.warned
+            and self.warning_time > 0.0
+            and elapsed + 1e-12 >= self.warning_time
+            and elapsed + 1e-12 < self.duration
+        ):
+            rospy.logwarn(
+                "%s still waiting after %.1fs simulation time; continuing until %.1fs",
+                self.label,
+                self.warning_time,
+                self.duration,
+            )
+            self.warned = True
+        return elapsed + 1e-12 >= self.duration
+
+
+_SENSOR_TIME_CLOCK = None
+_SENSOR_TIME_CLOCK_LOCK = threading.Lock()
+
+
+def _sensor_time_clock():
+    global _SENSOR_TIME_CLOCK
+    with _SENSOR_TIME_CLOCK_LOCK:
+        if _SENSOR_TIME_CLOCK is None:
+            _SENSOR_TIME_CLOCK = _SensorTimeClock()
+        return _SENSOR_TIME_CLOCK
 
 
 def _fmt(values, digits=4):
@@ -195,6 +292,9 @@ def init_from_task1_vision():
     global _vision_to_ik_offset
     topic = rospy.get_param("~task1_vision_topic", TASK1_VISION_TOPIC)
     timeout = float(rospy.get_param("~task1_vision_timeout", TASK1_VISION_TIMEOUT))
+    warning_time = float(
+        rospy.get_param("~task1_vision_warn_time", TASK1_VISION_WARN_TIME)
+    )
     min_confidence = float(
         rospy.get_param("~task1_vision_min_confidence", TASK1_VISION_MIN_CONFIDENCE)
     )
@@ -212,7 +312,11 @@ def init_from_task1_vision():
         "~vision_to_ik_offset", DEFAULT_VISION_TO_IK_OFFSET, 3
     )
 
-    deadline = time.time() + timeout
+    deadline = _SimulationDeadline(
+        timeout,
+        warning_time,
+        "task1 vision",
+    )
     last_result = {}
     samples = []
     rospy.loginfo(
@@ -220,13 +324,14 @@ def init_from_task1_vision():
         median_frames,
         topic,
     )
-    while not rospy.is_shutdown() and time.time() < deadline:
-        remaining = max(0.1, deadline - time.time())
+    while not rospy.is_shutdown() and not deadline.expired():
         try:
-            msg = rospy.wait_for_message(topic, String, timeout=min(1.0, remaining))
+            msg = rospy.wait_for_message(topic, String, timeout=1.0)
             payload = json.loads(msg.data)
         except Exception:
             continue
+        if deadline.expired():
+            break
         frame_id = str(payload.get("frame_id", expected_frame))
         if frame_id != expected_frame:
             raise RuntimeError(
@@ -284,7 +389,7 @@ def init_from_task1_vision():
         return selected
     raise RuntimeError(
         "task1_vision did not provide {} valid frames with required parcels on {} "
-        "within {:.1f}s; collected {}, last got {}".format(
+        "within {:.1f}s simulation time; collected {}, last got {}".format(
             median_frames, topic, timeout, len(samples), sorted(last_result)
         )
     )

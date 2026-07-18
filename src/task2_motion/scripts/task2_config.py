@@ -6,9 +6,11 @@ import math
 # 独立运行 task2_motion 时默认使用完整真值；统一入口会按模式覆盖该话题。
 VISION_TOPIC = "/task2_vision/objects_json"
 VISION_TRUTH_TOPIC = "/task2_vision/objects_json"
-VISION_MODE0_REFERENCE_TOPIC = "/task2_vision/mode0_reference_json"
 VISION_FRAME_ID = "base_link"
-VISION_TIMEOUT = 60.0
+VISION_FIT_COORDINATE_REFERENCE = "current_base_link"
+# 视觉等待使用 /sensors_data_raw.sensor_time：先告警，达到硬超时才中断。
+VISION_WARN_TIME = 60.0
+VISION_TIMEOUT = 180.0
 VISION_MIN_CONFIDENCE = 0.0
 VISION_ALLOWED_POSITION_SOURCES = [
     "challenge_secret_layout_ground_truth",
@@ -42,15 +44,15 @@ GRASP_OFFSETS_BASE = {
     },
     "part_type_a_2": {
         "left": [0.051611612, 0.010389598, 0.05],
-        "right": [0.03110907, -0.030345481, 0.05],
+        "right": [0.0410907, -0.030345481, 0.05],
     },
     "part_type_b_1": {
-        "left": [0.018787454, -0.006857956, 0.05],
+        "left": [0.013787454, 0.010857956, 0.05],
         "right": [0.021181181, -0.012286934, 0.05],
     },
     "part_type_b_2": {
         "left": [0.012518057, 0.026593847, 0.05],
-        "right": [0.020924211, 0.003111904, 0.05],
+        "right": [0.020924211, -0.003111904, 0.05],
     },
     "part_type_c_1": {
         "left": [0.01564838, 0.044912331, 0.03],
@@ -98,13 +100,14 @@ PRE_GRASP_ORIENTATION_RETRY_DEG = 30.0
 
 # base_link 下的末端经验修正。旧数采的 X/Z 常量是 world 到基座的平移，现已由视觉完成。
 HAND_EE_CALIBRATION = {
-    "left": [-0.04, -0.02, -0.02],
-    "right": [-0.04, 0.02, -0.02],
+    "left": [-0.02, -0.02, -0.02],
+    "right": [-0.02, 0.02, -0.02],
 }
 
 # 视觉重定位交接：pre/place 都是直接编码的 base_link 绝对末端坐标，不叠加
-# HAND_EE_CALIBRATION。place_pose/grasp_pose 由 degree 转为内部 radian。
-# [物体 yaw 偏置, 自适应 Y 轴 pitch, 预留 roll（当前无用）,手动 Z 轴 yaw, 手动 Y 轴 pitch, 手动 X 轴 roll]。
+# HAND_EE_CALIBRATION；grasp_offset 与 GRASP_OFFSETS_BASE 语义相同，目标为
+# 视觉 XYZ + grasp_offset + HAND_EE_CALIBRATION。grasp_pose/lift_pose 分别与
+# CLASS_POSES 中的 grasp/lift 语义相同，左右手由交接方向确定。
 HANDOFF_CONFIG = {
     "left_to_right": {
         "pre_place_position": {
@@ -112,34 +115,50 @@ HANDOFF_CONFIG = {
             "part_type_c": [0.366, 0.0, 0.218783],
         },
         "place_position": {
-            "part_type_a": [0.366, 0.1, 0.078783],
-            "part_type_c": [0.366, 0.1, 0.078783],
+            "part_type_a": [0.366, 0.2, 0.078783],
+            "part_type_c": [0.366, 0.2, 0.078783],
         },
         "place_pose": {
-            "part_type_a": pose_degrees([0.0, -90.0, 0.0, -90.0, 0.0, -90.0]),
-            "part_type_c": pose_degrees([0.0, -90.0, 0.0, -90.0, 0.0, -90.0]),
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, -45.0, 0.0, -90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, -45.0, 0.0, -90.0]),
+        },
+        "grasp_offset": {
+            "part_type_a": [0.0, 0.0, 0.0],
+            "part_type_c": [0.0, 0.0, 0.0],
         },
         "grasp_pose": {
+            "part_type_a": pose_degrees([0.0, -30.0, 0.0, 90.0, 0.0, 90.0]),
+            "part_type_c": pose_degrees([0.0, -30.0, 0.0, 90.0, 0.0, 90.0]),
+        },
+        "lift_pose": {
             "part_type_a": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
             "part_type_c": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
         },
     },
     "right_to_left": {
         "pre_place_position": {
-            "part_type_a": [0.266, 0.0, 0.278783],
-            "part_type_c": [0.306, 0.0, 0.278783],
+            "part_type_a": [0.366, 0.0, 0.218783],
+            "part_type_c": [0.366, 0.0, 0.218783],
         },
         "place_position": {
-            "part_type_a": [0.266, 0.0, 0.078783],
-            "part_type_c": [0.306, 0.0, 0.078783],
+            "part_type_a": [0.366, 0.2, 0.078783],
+            "part_type_c": [0.366, 0.2, 0.078783],
         },
         "place_pose": {
-            "part_type_a": pose_degrees([0.0, -90.0, 0.0, 135.0, 0.0, 90.0]),
-            "part_type_c": pose_degrees([0.0, -90.0, 0.0, 135.0, 0.0, 90.0]),
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, 90.0, 0.0, 90.0]),
+        },
+        "grasp_offset": {
+            "part_type_a": [0.0, 0.0, 0.0],
+            "part_type_c": [0.05, 0.02, 0.03],
         },
         "grasp_pose": {
-            "part_type_a": pose_degrees([0.0, -90.0, 0.0, -120.0, 0.0, -90.0]),
-            "part_type_c": pose_degrees([0.0, -90.0, 0.0, -120.0, 0.0, -90.0]),
+            "part_type_a": pose_degrees([-45.0, -30.0, 0.0, 90.0, 0.0, 0.0]),
+            "part_type_c": pose_degrees([-45.0, -30.0, 0.0, 90.0, 0.0, 0.0]),
+        },
+        "lift_pose": {
+            "part_type_a": pose_degrees([-45.0, -30.0, 0.0, 90.0, 0.0, 0.0]),
+            "part_type_c": pose_degrees([-45.0, -30.0, 0.0, 90.0, 0.0, 0.0]),
         },
     },
 }
@@ -155,7 +174,9 @@ HANDOFF_MODE_BY_CLASS = {
 
 HANDOFF_RELOCALIZATION_REQUEST_TOPIC = "/task2_depth_xy/handoff_relocalize_request"
 HANDOFF_RELOCALIZATION_RESULT_TOPIC = "/task2_depth_xy/handoff_relocalize_result"
-HANDOFF_RELOCALIZATION_TIMEOUT = 60.0
+# 交接重新视觉检测使用相同的仿真时间软告警/硬超时规则。
+HANDOFF_RELOCALIZATION_WARN_TIME = 60.0
+HANDOFF_RELOCALIZATION_TIMEOUT = 180.0
 
 # 新交接配置：pre_place_position/place_position/place_pose 为给出手的绝对目标。
 # A/C 的接手 pre/grasp 偏移相对给手 place 实测 FK。
@@ -164,7 +185,7 @@ HANDOFF_RELOCALIZATION_TIMEOUT = 60.0
 # 正数=先 open 给手；0=同时切换；负数=先 close 接手，再 open 给手。
 # 调度器使用 /sensors_data_raw.sensor_time 计时，不受仿真实时率影响。
 HANDOFF_RECEIVER_CLOSE_DELAY_BY_CLASS = {
-    "part_type_a": 0.055,
+    "part_type_a": 0.05,
     "part_type_c": -0.08,
 }
 
@@ -179,8 +200,8 @@ HANDOFF_SOURCE_FK_RELATIVE_CONFIG = {
             "part_type_c": [0.346, 0.0, 0.298783],
         },
         "place_pose": {
-            "part_type_a": pose_degrees([0.0, -100.0, 0.0, -90.0, 0.0, -90.0]),
-            "part_type_c": pose_degrees([0.0, -100.0, 0.0, -90.0, 0.0, -90.0]),
+            "part_type_a": pose_degrees([0.0, -90.0, 0.0, -90.0, 0.0, -90.0]),
+            "part_type_c": pose_degrees([0.0, -90.0, 0.0, -90.0, 0.0, -90.0]),
         },
         "pre_grasp_position": {
             "part_type_a": [0.0, -0.06, -0.05],
@@ -333,8 +354,10 @@ PLACE_Y_OFFSETS_BY_CLASS = {
     "part_type_c": [-0.02, 0.02],
 }
 
-# 抓取、交接与放置关键点。
-PRE_GRASP_Z_OFFSET = 0.06
+# 抓取接近点，均为 grasp_position 沿 base_link Z 正方向的偏移。
+PRE_GRASP_Z_OFFSET = 0.1
+# 设为 -1 禁用 mid；非负值表示 mid 相对 grasp_position 的 Z 偏移。
+MID_GRASP_Z_OFFSET = 0.04
 LIFT_OFFSETS_BY_CLASS = {
     "part_type_a": [0.0, 0.0, 0.32],
     "part_type_b": [0.0, 0.0, 0.32],

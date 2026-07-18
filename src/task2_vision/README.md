@@ -101,9 +101,9 @@ launch 参数 `vision_mode` 使用相同语义，`instance_naming_method` 可设
 `instance_naming_method` 和 `ready_for_motion`，motion 会核对模式和命名方式后
 再接受消息。
 
-真值工件位姿和 qpos 框每帧都使用同一份当前 MuJoCo qpos 转换到当前 `base_link`。模式 1/2 的 motion 开始等待时，会先从该真值话题完整读取一次模式 0 本来会采用的六件位姿，并发布到 `/task2_vision/mode0_reference_json`。这份数据只用于同次运行的误差对照；位姿求解不读取其中的工件 XYZ、orientation 或 yaw。深度节点只使用两个消息中的机器人 world-base 位姿，把实时相机参考系下的拟合结果刚体换算到模式 0 的同一 `base_link` 快照。最终 5 帧中位数因此可以与模式 0 直接逐轴比较。模式 2 的原始真值消息不发布 qpos 框，拟合主链只接触 YOLO 的类别、置信度和 bbox。
+真值工件位姿和 qpos 框每帧都使用当前 MuJoCo qpos 转换到当前 `base_link`。深度点使用该深度帧时间戳查询 `base_link <- camera` TF，直接进入当前 `base_link`；拟合结果不再经过 world、MPC、真值基座或初始化参考基座转换。模式 2 的拟合主链只使用 YOLO 类别、置信度、bbox、RGB-D/CAD 和固定 yaw 先验；当前真值工件位姿只在输出组装时补入 RQT/test 误差字段。
 
-RQT 在模式 0 直接将真值作为当前模式的 XYZ/yaw，`dx/dy/dz/dyaw` 均显示 0；在模式 1/2 锁定前实时显示当前深度帧的拟合 XYZ/yaw、逐轴误差、点数、双向覆盖率、IoU、GN 迭代数和深度内点数，行状态保持 `waiting`，同时显示 5 个完整有效帧的累计进度。模式 2 图像叠加的是 YOLO 框。达到 5 帧后切换为最终中位数和 `locked` 状态，之后位姿、框和误差不再变化，YOLO 模型同时释放。
+RQT 在模式 0 直接将真值作为当前模式的 XYZ/yaw，`dx/dy/dz/dyaw` 均显示 0；在模式 1/2 锁定前实时显示当前深度帧的拟合 XYZ/yaw 与当前 `base_link` 真值的逐轴误差、点数、双向覆盖率、IoU、GN 迭代数和深度内点数，行状态保持 `waiting`，同时显示 5 个完整有效帧的累计进度。模式 2 图像叠加的是 YOLO 框。达到 5 帧后切换为最终中位数和 `locked` 状态，之后位姿、框和误差不再变化，YOLO 模型同时释放。
 
 ## RGB-D/CAD 位姿拟合
 
@@ -123,8 +123,8 @@ RQT 在模式 0 直接将真值作为当前模式的 XYZ/yaw，`dx/dy/dz/dyaw` �
 3. 排除六个物体 ROI，在工作台范围内用高度直方图选择候选平面，再做带水平法向约束的 RANSAC 和最小二乘精修。
 4. 将同一头部相机 RGB 缩放到深度分辨率；正常亮度用 OpenCV HSV、阴影区域用亮度无关的归一化绿色色度和绿色优势量，把地面、桌面及其 1 px 抗锯齿边缘严格标记为背景。物体前景必须同时满足离桌高度条件和非绿色条件，再通过闭运算与连通域面积过滤去除散点；完全失去色彩信息的黑色阴影仍由桌面平面高度排除。
 5. Z 使用拟合桌面平面、统一标定偏置 -0.9 mm，再叠加类别静置 body 原点偏置（A=-27.2 mm、B=-0.04 mm、C=0）。类别静置姿态固定为 A/B 水平、C 绕局部 X 侧躺 90 度。
-6. A/B/C 的两个固定 world-yaw 先验分别为 `0.05/0.82 rad`、`-0.35/0.72 rad`、`pi/2+0.22` 和 `pi/2-0.55 rad`。候选先减去当前机器人基座 world yaw。默认相对位置模式将两个先验各自 `+/-20 degree`、步长 5 degree 的候选分别纳入 CAD 评分；每一帧都比较同类两个物体的 direct/swap 总成本，先完成窗口一对一分配，再把选中的拟合送入多帧样本。显式 yaw 匹配模式只比较两个中心先验。
-7. 每个 yaw 候选都用 z-buffer 渲染 CAD 可见面和轮廓。region 项计算轮廓到观测前景有符号距离，depth 项计算 CAD 可见点到 RGB-D 点的点到面残差；两项使用 Huber 权重求解 XY。窗口内候选按 `CAD 数据分 + weight*(yaw 偏离先验/sigma)^2` 排序，默认 weight=0.2，A/B/C 的 sigma 分别为 12/8/12 degree。先验主要限定搜索范围，正则项只在 CAD 分数接近时作弱平局判定，明显更好的 CAD 证据仍可选择窗口边缘。相对位置模式在每个窗口内各自保留最佳粗候选，再按 3、1 degree 细化，绝不越过所属的 `+/-20 degree` 窗口；yaw 匹配模式不连续优化角度。候选阶段使用 1200 个 CAD 表面点和最多 2 次 XY 迭代；最终姿态使用 5000 点和最多 6 次迭代。C 使用红色手柄参与候选评分，最终手柄修正最多 6 次迭代。
+6. A/B/C 的两个固定 yaw 先验分别为 `0.05/0.82 rad`、`-0.35/0.72 rad`、`pi/2+0.22` 和 `pi/2-0.55 rad`，直接作为当前 `base_link` 下的搜索中心。yaw 先验命名和相对位置命名使用完全相同的搜索：两个先验各自 `+/-20 degree`、步长 5 degree，每一帧都比较同类两个物体的 direct/swap 总 CAD 成本并完成窗口一对一分配，再进行逐帧命名和多帧样本累计。
+7. 每个 yaw 候选都用 z-buffer 渲染 CAD 可见面和轮廓。region 项计算轮廓到观测前景有符号距离，depth 项计算 CAD 可见点到 RGB-D 点的点到面残差；两项使用 Huber 权重求解 XY。窗口内候选按 `CAD 数据分 + weight*(yaw 偏离先验/sigma)^2` 排序；当前 `weight=0`，因此粗搜、3/1 degree 局部细化和同类 direct/swap 分配都完全按 CAD 数据分选择，先验只限定 `+/-20 degree` 范围。候选阶段使用 1200 个 CAD 表面点和最多 2 次 XY 迭代；最终姿态使用 5000 点和最多 6 次迭代。C 使用红色手柄参与候选评分，最终手柄修正最多 6 次迭代。
 8. 最终质量门限按类别设置：A/B 允许更低的轮廓覆盖率，C 保持双向覆盖率 0.45、IoU 0.30。被拒绝的拟合仍发布诊断，但不计入 5 帧。
 9. 同类窗口分配发生在每一帧计数之前；模式 2 还会在同一帧内根据拟合后的 Y 或 yaw 先验把 YOLO 临时检测映射为 motion `_1/_2`，映射完成后才进入样本。只有分配后的六个物体全部拟合成功才计为一个完整有效帧。有效帧直接进入样本，不与已有样本的中位数比较，也不在收满 5 帧后重新分配。累计 5 帧后，XYZ 分别取中位数，yaw 取跨越 +/-180 degree 安全的环形中位数并一次性锁定。
 
@@ -142,7 +142,7 @@ orientation_source        qpos_bbox_region_depth_xyz_yaw_fit
 `yolo_bbox_region_depth_xyz_yaw_fit`，Z 来源仍为
 `table_plane_class_rest_pose`。
 
-每个对象还输出 `fit_initial_xy`、`fit_yaw_initial_deg`、`fit_yaw_pca_anisotropy`、`fit_yaw_evaluations`、`fit_yaw_search_mode`、`fit_render_depth_error_m`、`fit_render_coverage`、`fit_render_observed_coverage`、`fit_render_iou`、`fit_alignment_iterations`、`fit_alignment_depth_inliers`、`fit_render_score` 和 `fit_green_rejected_pixels`。默认相对位置模式显示 `fit_yaw_search_mode=class_yaw_prior_window_20_joint_candidate`，并输出选中先验、CAD 原始 yaw 分数、先验惩罚、偏离先验角度、direct/swap 成本、分配余量和距离窗口边界的角度；显式先验匹配模式显示 `class_yaw_prior_match`。
+每个对象还输出 `fit_initial_xy`、`fit_yaw_initial_deg`、`fit_yaw_pca_anisotropy`、`fit_yaw_evaluations`、`fit_yaw_search_mode`、`fit_render_depth_error_m`、`fit_render_coverage`、`fit_render_observed_coverage`、`fit_render_iou`、`fit_alignment_iterations`、`fit_alignment_depth_inliers`、`fit_render_score` 和 `fit_green_rejected_pixels`。两种命名都显示 `fit_yaw_search_mode=class_yaw_prior_window_20_independent_joint_candidate`，并输出选中先验、CAD 原始 yaw 分数、先验惩罚、偏离先验角度、direct/swap 成本、分配余量和距离窗口边界的角度。
 
 交接重定位使用独立话题
 `/task2_depth_xy/handoff_relocalize_request` 和
@@ -159,11 +159,11 @@ orientation_source        qpos_bbox_region_depth_xyz_yaw_fit
 该值与返回给 motion 的结果完全相同。RQT 因此在重定位期间显示实时 waiting，
 完成后显示 motion 实际采用的新 locked 数据，而不是最后一帧瞬时拟合。
 
-位姿拟合本身不使用物体真值 XYZ、orientation 或 yaw。模式 1 的检测框仍由 qpos 生成；模式 2 的类别和检测框完全来自 YOLO，因此检测与位姿主链都不依赖工件真值。同次运行模式 0 位姿仅在最终 motion 命名确定后补入 RQT/test 误差输出，不进入候选生成、CAD 渲染、优化或多帧命名。
+位姿拟合本身不使用物体真值 XYZ、orientation 或 yaw。模式 1 的检测框仍由 qpos 生成；模式 2 的类别和检测框完全来自 YOLO。相机 TF 直接给出当前 `base_link` 拟合坐标，不读取 MPC 或真值基座姿态。当前真值工件位姿只在输出组装阶段计算物体拟合误差，不进入候选生成、CAD 渲染、优化、逐帧命名、多帧聚合或动作坐标转换。
 
 `task2_motion` 已允许新的 `position_source`。统一入口按模式覆盖 motion 输入话题；单独启动 motion 时默认 `VISION_TOPIC=/task2_vision/objects_json`。未收满 5 个完整有效帧时，输出中的 `fit_position` 可供 RQT 显示，而 `position=[]`，确保动作解析器不会提前采用预热数据。锁定后节点停止解码新深度和更新拟合结果，latched 输出、RQT 坐标和 RQT 误差保持不变。
 
-RQT 表格直接显示每个物体的 truth/motion `x/y/z/yaw` 以及 `dx/dy/dz/dyaw`，并显示当前帧选中的 yaw 先验窗口、direct/swap 成本、分配方式、分配余量和距窗口边界角度。模式 1/2 的 truth 列是同次运行模式 0 的 `truth_position/truth_yaw`，motion 列是等待阶段的拟合预览或锁定后实际交给动作的位姿。图像中的白色十字表示拟合 body 原点。
+RQT 表格直接显示每个物体当前 `base_link` 下的 truth/motion `x/y/z/yaw` 以及 `dx/dy/dz/dyaw`，并显示当前帧选中的 yaw 先验窗口、direct/swap 成本、分配方式、分配余量和距窗口边界角度。motion 列是等待阶段的拟合预览或锁定后实际交给动作的位姿。图像中的白色十字表示拟合 body 原点。
 
 ## YOLO 部署
 

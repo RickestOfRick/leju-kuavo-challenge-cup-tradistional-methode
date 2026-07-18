@@ -15,14 +15,16 @@ from task2_config import (
     HANDOFF_RELOCALIZATION_REQUEST_TOPIC,
     HANDOFF_RELOCALIZATION_RESULT_TOPIC,
     HANDOFF_RELOCALIZATION_TIMEOUT,
+    HANDOFF_RELOCALIZATION_WARN_TIME,
     TOPIC_TIMEOUT,
     VISION_ALLOWED_POSITION_SOURCES,
+    VISION_FIT_COORDINATE_REFERENCE,
     VISION_FRAME_ID,
-    VISION_MODE0_REFERENCE_TOPIC,
     VISION_MIN_CONFIDENCE,
     VISION_TIMEOUT,
     VISION_TOPIC,
     VISION_TRUTH_TOPIC,
+    VISION_WARN_TIME,
 )
 
 
@@ -69,8 +71,16 @@ class _SensorTimeClock:
 class _SimulationDeadline:
     """Expire after simulation seconds; wall time only detects a stopped clock."""
 
-    def __init__(self, duration, stall_timeout=TOPIC_TIMEOUT):
+    def __init__(
+        self,
+        duration,
+        warning_time=0.0,
+        label="vision",
+        stall_timeout=TOPIC_TIMEOUT,
+    ):
         self.duration = float(duration)
+        self.warning_time = max(0.0, float(warning_time))
+        self.label = str(label)
         if not math.isfinite(self.duration) or self.duration <= 0.0:
             raise ValueError("simulation timeout must be finite and positive")
         self.clock = _sensor_time_clock()
@@ -78,6 +88,7 @@ class _SimulationDeadline:
         self.previous = self.start
         self.last_progress_wall = time.monotonic()
         self.stall_timeout = float(stall_timeout)
+        self.warned = False
 
     def expired(self):
         now = self.clock.seconds()
@@ -90,7 +101,21 @@ class _SimulationDeadline:
                 "{} sensor_time stopped advancing".format(self.clock.topic)
             )
         self.previous = now
-        return now - self.start + 1e-12 >= self.duration
+        elapsed = now - self.start
+        if (
+            not self.warned
+            and self.warning_time > 0.0
+            and elapsed + 1e-12 >= self.warning_time
+            and elapsed + 1e-12 < self.duration
+        ):
+            rospy.logwarn(
+                "%s still waiting after %.1fs simulation time; continuing until %.1fs",
+                self.label,
+                self.warning_time,
+                self.duration,
+            )
+            self.warned = True
+        return elapsed + 1e-12 >= self.duration
 
 
 _SENSOR_TIME_CLOCK = None
@@ -181,87 +206,15 @@ def wait_for_task2_objects():
     )
     expected_frame = rospy.get_param("~task2_vision_frame_id", VISION_FRAME_ID)
     timeout = float(rospy.get_param("~task2_vision_timeout", VISION_TIMEOUT))
-    deadline = _SimulationDeadline(timeout)
+    warning_time = float(
+        rospy.get_param("~task2_vision_warn_time", VISION_WARN_TIME)
+    )
+    deadline = _SimulationDeadline(
+        timeout,
+        warning_time=warning_time,
+        label="task2 initial vision",
+    )
     last_missing = list(motion_names)
-    reference_publisher = None
-
-    if expected_mode in (1, 2):
-        truth_topic = str(
-            rospy.get_param("~task2_truth_topic", VISION_TRUTH_TOPIC)
-        )
-        reference_topic = str(
-            rospy.get_param(
-                "~task2_mode0_reference_topic",
-                VISION_MODE0_REFERENCE_TOPIC,
-            )
-        )
-        rospy.loginfo(
-            "task2: mode %d first reading mode-0 truth reference from %s",
-            expected_mode,
-            truth_topic,
-        )
-        reference_message = _wait_for_message_before_deadline(
-            truth_topic,
-            String,
-            deadline,
-            "task2 mode-0 reference",
-        )
-        reference_payload = json.loads(reference_message.data)
-        if str(reference_payload.get("frame_id", "")) != expected_frame:
-            raise RuntimeError(
-                "task2 mode-0 reference frame={} expected={}".format(
-                    reference_payload.get("frame_id"), expected_frame
-                )
-            )
-        reference_names = {
-            str(item.get("name", ""))
-            for item in reference_payload.get("objects", [])
-            if len(item.get("position", [])) >= 3
-        }
-        reference_missing = [
-            name for name in motion_names if name not in reference_names
-        ]
-        if reference_missing:
-            raise RuntimeError(
-                "task2 mode-0 reference missing {}".format(
-                    ", ".join(reference_missing)
-                )
-            )
-        reference_payload["reference_role"] = "mode0_equivalent_motion_input"
-        reference_by_name = {
-            str(item.get("name", "")): item
-            for item in reference_payload.get("objects", [])
-        }
-        for name in motion_names:
-            item = reference_by_name[name]
-            rospy.loginfo(
-                "task2: same-run mode-0 reference %s base_link=%.4f %.4f %.4f "
-                "yaw=%.2f deg",
-                name,
-                float(item["position"][0]),
-                float(item["position"][1]),
-                float(item["position"][2]),
-                math.degrees(float(item.get("yaw", 0.0))),
-            )
-        reference_message = String(
-            data=json.dumps(reference_payload, ensure_ascii=True, sort_keys=True)
-        )
-        reference_publisher = rospy.Publisher(
-            reference_topic, String, queue_size=1, latch=True
-        )
-        connection_deadline = time.monotonic() + min(5.0, timeout)
-        while (
-            not rospy.is_shutdown()
-            and reference_publisher.get_num_connections() == 0
-            and time.monotonic() < connection_deadline
-        ):
-            rospy.sleep(0.05)
-        reference_publisher.publish(reference_message)
-        rospy.loginfo(
-            "task2: fixed same-run mode-0 reference for %d objects on %s",
-            len(reference_names),
-            reference_topic,
-        )
 
     rospy.loginfo("task2: waiting for complete object poses from %s", topic)
     while not rospy.is_shutdown() and not deadline.expired():
@@ -297,6 +250,18 @@ def wait_for_task2_objects():
                 expected_mode,
             )
             continue
+        if expected_mode in (1, 2):
+            coordinate_reference = str(
+                payload.get("fit_coordinate_reference", "")
+            )
+            if coordinate_reference != VISION_FIT_COORDINATE_REFERENCE:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "task2: ignore fit coordinate reference=%s, expected=%s",
+                    coordinate_reference,
+                    VISION_FIT_COORDINATE_REFERENCE,
+                )
+                continue
         payload_naming_method = str(payload.get("instance_naming_method", ""))
         if (
             expected_naming_method
@@ -334,14 +299,18 @@ def wait_for_task2_objects():
     )
 
 
-def _mode0_relocalized_object(source_observation, timeout):
+def _mode0_relocalized_object(source_observation, timeout, warning_time):
     """Read the corresponding live truth object when the whole task uses mode 0."""
     truth_name = str(
         source_observation.get("ground_truth_name", source_observation["name"])
     )
     motion_name = str(source_observation["name"])
     topic = str(rospy.get_param("~task2_truth_topic", VISION_TRUTH_TOPIC))
-    deadline = _SimulationDeadline(timeout)
+    deadline = _SimulationDeadline(
+        timeout,
+        warning_time=warning_time,
+        label="task2 mode-0 handoff relocalization",
+    )
     while not rospy.is_shutdown() and not deadline.expired():
         try:
             message = rospy.wait_for_message(topic, String, timeout=1.0)
@@ -373,9 +342,17 @@ def relocalize_handoff_object(source_observation, expected_position):
             HANDOFF_RELOCALIZATION_TIMEOUT,
         )
     )
+    warning_time = float(
+        rospy.get_param(
+            "~task2_handoff_relocalization_warn_time",
+            HANDOFF_RELOCALIZATION_WARN_TIME,
+        )
+    )
     expected_mode = int(rospy.get_param("~task2_vision_mode", -1))
     if expected_mode == 0:
-        return _mode0_relocalized_object(source_observation, timeout)
+        return _mode0_relocalized_object(
+            source_observation, timeout, warning_time
+        )
     if expected_mode not in (1, 2):
         raise RuntimeError(
             "task2 handoff relocalization requires vision mode 0, 1, or 2"
@@ -436,7 +413,13 @@ def relocalize_handoff_object(source_observation, expected_position):
         [round(value, 4) for value in expected],
     )
 
-    deadline = _SimulationDeadline(timeout)
+    deadline = _SimulationDeadline(
+        timeout,
+        warning_time=warning_time,
+        label="task2 handoff relocalization for {}".format(
+            source_observation["name"]
+        ),
+    )
     while not rospy.is_shutdown() and not deadline.expired():
         try:
             message = rospy.wait_for_message(result_topic, String, timeout=1.0)

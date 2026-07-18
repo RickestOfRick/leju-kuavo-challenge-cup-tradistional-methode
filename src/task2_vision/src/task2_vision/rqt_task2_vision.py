@@ -51,11 +51,16 @@ class Task2VisionPlugin(Plugin):
             float(value)
             for value in rospy.get_param(
                 "/task2_depth_xy/handoff_relocalization_fixed_roi",
-                [0.50, 0.7425, 0.1666666667, 0.205],
+                [0.4166666667, 0.7425, 0.1666666667, 0.205],
             )
         ]
         if len(self._handoff_fixed_roi) != 4:
-            self._handoff_fixed_roi = [0.50, 0.7425, 0.1666666667, 0.205]
+            self._handoff_fixed_roi = [
+                0.4166666667,
+                0.7425,
+                0.1666666667,
+                0.205,
+            ]
         self._image_topic = rospy.get_param(
             "/task2_vision/head_image_topic",
             "/cam_h/color/image_raw/compressed",

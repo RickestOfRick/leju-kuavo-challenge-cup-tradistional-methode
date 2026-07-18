@@ -83,6 +83,7 @@ from task1_config import (
 
 GREEN = "\033[32m"
 RESET = "\033[0m"
+_TASK1_MOTION_CONTEXT = threading.local()
 
 # =============================================================================
 # 工具
@@ -91,6 +92,29 @@ RESET = "\033[0m"
 
 def _fmt(v, d=4):
     return " ".join(f"{x:.{d}f}" for x in v)
+
+
+def _register_task1_motion_context(arm_pub, arm_hold):
+    """为当前任务线程保存 task1 自己的运动发布上下文。"""
+    _TASK1_MOTION_CONTEXT.arm_pub = arm_pub
+    _TASK1_MOTION_CONTEXT.arm_hold = arm_hold
+
+
+def _default_soft_ik_temporary_executor(side, label):
+    arm_pub = getattr(_TASK1_MOTION_CONTEXT, "arm_pub", None)
+    arm_hold = getattr(_TASK1_MOTION_CONTEXT, "arm_hold", None)
+    if arm_pub is None or arm_hold is None:
+        raise RuntimeError(
+            "task1 motion context is not initialized before soft IK fallback"
+        )
+    return _make_soft_ik_temporary_executor(
+        arm_pub,
+        arm_hold,
+        side,
+        label,
+        move_time=0.5,
+        settle=SETTLE_TIME,
+    )
 
 
 def _q_from_ypr(ypr1, ypr2=None):
@@ -432,6 +456,7 @@ def _solve_soft_ik_path(
     pos_cost_weight=HANDOFF_POS_COST_WEIGHT,
     major_iterations_limit=IK_MAJOR_ITERATIONS_LIMIT,
     fallback_label=None,
+    execute_temporary=None,
 ):
     """返回软 IK 关节路径；直接失败时插入逐级二分的临时末端点。"""
     try:
@@ -464,68 +489,115 @@ def _solve_soft_ik_path(
         _fmt(current_pos),
     )
 
-    for attempt in range(1, SOFT_IK_BISECT_ATTEMPTS + 1):
-        fraction = 0.5**attempt
-        temporary_pos = [
-            current_pos[axis] + fraction * (pos[axis] - current_pos[axis])
-            for axis in range(3)
-        ]
-        rospy.logwarn(
-            "task1: [SOFT IK FALLBACK] %s attempt %d/%d, temporary "
-            "fraction=1/%d target=%s",
-            context,
-            attempt,
-            SOFT_IK_BISECT_ATTEMPTS,
-            2**attempt,
-            _fmt(temporary_pos),
-        )
-        try:
-            temporary_solution = _solve_ik_one_hand_once(
-                cur_joints,
-                side,
-                temporary_pos,
-                quat,
-                constraint_mode=IK_MODE_THREE_POINT_MIXED,
-                pos_cost_weight=pos_cost_weight,
-                major_iterations_limit=major_iterations_limit,
-            )
-            target_solution = _solve_ik_one_hand_once(
-                temporary_solution,
-                side,
-                pos,
-                quat,
-                constraint_mode=IK_MODE_THREE_POINT_MIXED,
-                pos_cost_weight=pos_cost_weight,
-                major_iterations_limit=major_iterations_limit,
-            )
-        except RuntimeError as exc:
-            if not _is_ik_failure(exc):
-                raise
-            last_error = exc
+    if execute_temporary is None:
+        execute_temporary = _default_soft_ik_temporary_executor(side, context)
+
+    if execute_temporary is not None:
+        recovery_round = 0
+        while not rospy.is_shutdown():
+            recovery_round += 1
+            temporary_solution = None
+            temporary_denominator = None
+            for attempt in range(1, SOFT_IK_BISECT_ATTEMPTS + 1):
+                fraction = 0.5**attempt
+                temporary_pos = [
+                    current_pos[axis]
+                    + fraction * (pos[axis] - current_pos[axis])
+                    for axis in range(3)
+                ]
+                rospy.logwarn(
+                    "task1: [SOFT IK FALLBACK] %s recovery round %d, "
+                    "temporary attempt %d/%d fraction=1/%d target=%s",
+                    context,
+                    recovery_round,
+                    attempt,
+                    SOFT_IK_BISECT_ATTEMPTS,
+                    2**attempt,
+                    _fmt(temporary_pos),
+                )
+                try:
+                    temporary_solution = _solve_ik_one_hand_once(
+                        cur_joints,
+                        side,
+                        temporary_pos,
+                        quat,
+                        constraint_mode=IK_MODE_THREE_POINT_MIXED,
+                        pos_cost_weight=pos_cost_weight,
+                        major_iterations_limit=major_iterations_limit,
+                    )
+                    temporary_denominator = 2**attempt
+                    break
+                except RuntimeError as exc:
+                    if not _is_ik_failure(exc):
+                        raise
+                    last_error = exc
+                    rospy.logwarn(
+                        "task1: [SOFT IK FALLBACK] %s temporary fraction=1/%d "
+                        "IK failed: %s",
+                        context,
+                        2**attempt,
+                        exc,
+                    )
+
+            if temporary_solution is None:
+                raise RuntimeError(
+                    "{} soft IK fallback failed: all {} temporary points "
+                    "failed in recovery round {}".format(
+                        context,
+                        SOFT_IK_BISECT_ATTEMPTS,
+                        recovery_round,
+                    )
+                ) from last_error
+
             rospy.logwarn(
-                "task1: [SOFT IK FALLBACK] %s fraction=1/%d failed: %s",
+                "task1: [SOFT IK FALLBACK] %s fraction=1/%d IK succeeded; "
+                "executing temporary q before retrying the original target",
                 context,
-                2**attempt,
-                exc,
+                temporary_denominator,
             )
-            continue
+            cur_joints = list(
+                execute_temporary(temporary_solution, temporary_denominator)
+            )
+            current_pose = _pose_for_side(
+                call_fk(cur_joints, TOPIC_TIMEOUT), side
+            )
+            current_pos = [float(value) for value in current_pose.pos_xyz]
+            rospy.logwarn(
+                "task1: [SOFT IK FALLBACK] %s temporary q executed and "
+                "stable at FK=%s; retrying original target=%s from actual q",
+                context,
+                _fmt(current_pos),
+                _fmt(pos),
+            )
+            try:
+                return [
+                    _solve_ik_one_hand_once(
+                        cur_joints,
+                        side,
+                        pos,
+                        quat,
+                        constraint_mode=IK_MODE_THREE_POINT_MIXED,
+                        pos_cost_weight=pos_cost_weight,
+                        major_iterations_limit=major_iterations_limit,
+                    )
+                ]
+            except RuntimeError as exc:
+                if not _is_ik_failure(exc):
+                    raise
+                last_error = exc
+                rospy.logwarn(
+                    "task1: [SOFT IK FALLBACK] %s original target retry "
+                    "failed after recovery round %d; restarting from actual FK: %s",
+                    context,
+                    recovery_round,
+                    exc,
+                )
 
-        rospy.logwarn(
-            "task1: [SOFT IK FALLBACK] %s fraction=1/%d succeeded; "
-            "temporary q will be used before the original target",
-            context,
-            2**attempt,
-        )
-        return [temporary_solution, target_solution]
+        raise RuntimeError(
+            "{} soft IK fallback stopped during ROS shutdown".format(context)
+        ) from last_error
 
-    raise RuntimeError(
-        "{} soft IK failed after {} temporary subdivisions "
-        "(minimum fraction=1/{})".format(
-            context,
-            SOFT_IK_BISECT_ATTEMPTS,
-            2**SOFT_IK_BISECT_ATTEMPTS,
-        )
-    ) from last_error
+    raise RuntimeError("{} soft IK fallback has no executor".format(context))
 
 
 def solve_ik_one_hand(
@@ -537,6 +609,7 @@ def solve_ik_one_hand(
     pos_cost_weight=HANDOFF_POS_COST_WEIGHT,
     major_iterations_limit=IK_MAJOR_ITERATIONS_LIMIT,
     fallback_label=None,
+    execute_temporary=None,
 ):
     if constraint_mode == IK_MODE_THREE_POINT_MIXED:
         return _solve_soft_ik_path(
@@ -547,6 +620,7 @@ def solve_ik_one_hand(
             pos_cost_weight=pos_cost_weight,
             major_iterations_limit=major_iterations_limit,
             fallback_label=fallback_label,
+            execute_temporary=execute_temporary,
         )[-1]
     return _solve_ik_one_hand_once(
         cur_joints,
@@ -567,6 +641,7 @@ def solve_ik_one_hand_strict_multi(
     use_right_r6_offset=False,
     right_r6_offset=None,
     right_q7_lock_value=None,
+    execute_temporary=None,
 ):
     """优先调用严格多参考 IK，失败时仅将求解器降级为软 IK。"""
     if right_r6_offset is None:
@@ -650,6 +725,7 @@ def solve_ik_one_hand_strict_multi(
             soft_pos,
             soft_quat,
             constraint_mode=IK_MODE_THREE_POINT_MIXED,
+            execute_temporary=execute_temporary,
         )
 
     rospy.logwarn(
@@ -665,10 +741,13 @@ def solve_ik_one_hand_strict_multi(
         pos,
         quat,
         constraint_mode=IK_MODE_THREE_POINT_MIXED,
+        execute_temporary=execute_temporary,
     )
 
 
-def solve_right_r6_offset_path(start_joints, offset_xyz, locked_q7):
+def solve_right_r6_offset_path(
+    start_joints, offset_xyz, locked_q7, execute_temporary=None
+):
     """优先锁定 q7 求解 r6 路径；严格 IK 失败的路径点允许软 IK 降级。"""
     offset_xyz = [float(value) for value in offset_xyz]
     if len(offset_xyz) != 3:
@@ -690,6 +769,7 @@ def solve_right_r6_offset_path(start_joints, offset_xyz, locked_q7):
             use_right_r6_offset=True,
             right_r6_offset=cumulative_offset,
             right_q7_lock_value=locked_q7,
+            execute_temporary=execute_temporary,
         )
         max_joint_step_deg = max(
             abs(math.degrees(solved[joint] - previous[joint])) for joint in range(14)
@@ -714,7 +794,9 @@ def solve_right_r6_offset_path(start_joints, offset_xyz, locked_q7):
     return path
 
 
-def solve_right_eef_offset_path_soft(start_joints, offset_xyz):
+def solve_right_eef_offset_path_soft(
+    start_joints, offset_xyz, execute_temporary=None
+):
     """按原累计偏移生成 EEF 软 IK 调试路径，不锁定 q7。"""
     offset_xyz = [float(value) for value in offset_xyz]
     if len(offset_xyz) != 3:
@@ -741,6 +823,7 @@ def solve_right_eef_offset_path_soft(start_joints, offset_xyz):
             target_pos,
             target_quat,
             constraint_mode=IK_MODE_THREE_POINT_MIXED,
+            execute_temporary=execute_temporary,
         )
         max_joint_step_deg = max(
             abs(math.degrees(solved[joint] - previous[joint])) for joint in range(14)
@@ -842,6 +925,91 @@ def _to_deg_14(joints_rad):
     return _rad2deg(joints_rad[:14])
 
 
+def _interpolate_q_target(
+    arm_pub, arm_hold, start_deg, target_deg, move_time
+):
+    """通过任务一标准 WBC 通道执行一段 14 关节线性插值。"""
+    previous = [float(value) for value in start_deg]
+    target_deg = [float(value) for value in target_deg]
+    segment_count = max(1, int(float(move_time) / 0.1))
+    segment_time = float(move_time) / segment_count
+    leg_start = list(previous)
+    for segment in range(1, segment_count + 1):
+        alpha = float(segment) / segment_count
+        endpoint = [
+            leg_start[index]
+            + (target_deg[index] - leg_start[index]) * alpha
+            for index in range(14)
+        ]
+        message = armTargetPoses()
+        message.times = [segment_time]
+        message.values = [float(value) for value in endpoint]
+        arm_pub.publish(message)
+
+        steps = max(1, int(segment_time * 100.0))
+        for step in range(steps + 1):
+            ratio = float(step) / steps
+            command = [
+                previous[index]
+                + (endpoint[index] - previous[index]) * ratio
+                for index in range(14)
+            ]
+            arm_hold.set_degrees(command)
+            rospy.sleep(0.01)
+        previous = endpoint
+    return target_deg
+
+
+def _make_soft_ik_temporary_executor(
+    arm_pub,
+    arm_hold,
+    side,
+    label,
+    move_time=0.5,
+    settle=0.05,
+    locked_right_deg=None,
+):
+    """创建 task1 自用的 fallback 临时 q 执行器。"""
+    locked_right_deg = (
+        None
+        if locked_right_deg is None
+        else [float(value) for value in locked_right_deg]
+    )
+    if locked_right_deg is not None and len(locked_right_deg) != 7:
+        raise ValueError("locked_right_deg expects 7 values")
+
+    def execute(temporary_solution, denominator):
+        actual_q = list(read_arm_joints())
+        start_deg = _to_deg_14(actual_q)
+        target_deg = _to_deg_14(temporary_solution)
+        if locked_right_deg is not None:
+            start_deg[7:14] = locked_right_deg
+            target_deg[7:14] = locked_right_deg
+        _interpolate_q_target(
+            arm_pub,
+            arm_hold,
+            start_deg,
+            target_deg,
+            move_time,
+        )
+        rospy.sleep(settle)
+        stable_q = list(wait_arm_stable(side=side))
+        if locked_right_deg is not None:
+            stable_q[7:14] = [
+                math.radians(value) for value in locked_right_deg
+            ]
+        rospy.logwarn(
+            "task1: [SOFT IK FALLBACK] [%s] temporary fraction=1/%d "
+            "motion completed and %s arm is stable",
+            label,
+            denominator,
+            side,
+        )
+        return stable_q
+
+    return execute
+
+
 def _segmented_preset_return(arm_pub, arm_hold, start_deg, target_deg, move_time):
     """从当前关节角分段插值回到预设关节角。"""
     segs = max(1, int(move_time / 0.1))
@@ -883,25 +1051,78 @@ def move_one_step_v2(
 ):
     """单步运动：顺序求解 IK 路径点，再连续执行关节插值。
 
-    每个 IK 解使用前一个解作为初值；所有解求出后，将总时长平均分配
-    给各段关节路径，每 0.1 秒发送一个分段目标并以 100Hz 更新保持值。
+    每个 IK 解使用前一个解作为初值，并以 100Hz 更新保持值。仅在软 IK
+    fallback 时先实际执行临时二分点，稳定后再以实测关节角重求原目标。
     """
+    _register_task1_motion_context(arm_pub, arm_hold)
     cur = read_arm_joints()
     waypoint_positions = [list(pos) for pos in (intermediate_positions or [])]
     waypoint_positions.append(list(target_pos))
     previous_solution = list(cur)
-    target_frames_deg = []
+    previous_command_deg = _to_deg_14(cur)
+    path_time = float(move_time) / len(waypoint_positions)
+    target_deg = None
+
+    def execute_leg(start_deg, end_deg):
+        previous = list(start_deg)
+        leg_start = list(start_deg)
+        segs = max(1, int(path_time / 0.1))
+        seg_t = path_time / segs
+        for seg in range(1, segs + 1):
+            alpha = seg / segs
+            point = [
+                leg_start[i] + (end_deg[i] - leg_start[i]) * alpha
+                for i in range(14)
+            ]
+
+            msg = armTargetPoses()
+            msg.times = [float(seg_t)]
+            msg.values = [float(v) for v in point]
+            arm_pub.publish(msg)
+
+            steps = max(1, int(seg_t * 100))
+            for step in range(steps + 1):
+                ratio = step / steps
+                command = [
+                    previous[i] + (point[i] - previous[i]) * ratio
+                    for i in range(14)
+                ]
+                arm_hold.set_degrees(command)
+                rospy.sleep(0.01)
+            previous = point
+        return list(end_deg)
+
     for waypoint_index, waypoint_pos in enumerate(waypoint_positions):
         if constraint_mode == IK_MODE_THREE_POINT_MIXED:
+            fallback_context = "[{}] waypoint {}/{}".format(
+                label, waypoint_index + 1, len(waypoint_positions)
+            )
+
+            def execute_temporary(temporary_solution, denominator):
+                nonlocal previous_command_deg, previous_solution
+                temporary_deg = _to_deg_14(temporary_solution)
+                previous_command_deg = execute_leg(
+                    previous_command_deg, temporary_deg
+                )
+                rospy.sleep(settle)
+                previous_solution = list(wait_arm_stable(side=side))
+                previous_command_deg = _to_deg_14(previous_solution)
+                rospy.logwarn(
+                    "task1: [SOFT IK FALLBACK] %s temporary fraction=1/%d "
+                    "motion completed; arm is stable",
+                    fallback_context,
+                    denominator,
+                )
+                return previous_solution
+
             solved_path = _solve_soft_ik_path(
                 previous_solution,
                 side,
                 waypoint_pos,
                 target_quat,
                 pos_cost_weight=pos_cost_weight,
-                fallback_label="[{}] waypoint {}/{}".format(
-                    label, waypoint_index + 1, len(waypoint_positions)
-                ),
+                fallback_label=fallback_context,
+                execute_temporary=execute_temporary,
             )
         else:
             solved_path = [
@@ -915,8 +1136,9 @@ def move_one_step_v2(
                     fallback_label=label,
                 )
             ]
-        target_frames_deg.extend(_to_deg_14(solved) for solved in solved_path)
-        previous_solution = solved_path[-1]
+        target_deg = _to_deg_14(solved_path[-1])
+        previous_command_deg = execute_leg(previous_command_deg, target_deg)
+        previous_solution = list(solved_path[-1])
         if waypoint_index < len(waypoint_positions) - 1:
             rospy.loginfo(
                 "task1: [%s] IK intermediate %d/%d=%s",
@@ -926,38 +1148,7 @@ def move_one_step_v2(
                 _fmt(waypoint_pos),
             )
 
-    start_deg = _to_deg_14(cur)
-    path_time = float(move_time) / len(target_frames_deg)
-    prev = start_deg
-
-    for target_deg in target_frames_deg:
-        leg_start = list(prev)
-        segs = max(1, int(path_time / 0.1))
-        seg_t = path_time / segs
-        for seg in range(1, segs + 1):
-            alpha = seg / segs
-            pt = [
-                leg_start[i] + (target_deg[i] - leg_start[i]) * alpha
-                for i in range(14)
-            ]
-
-            # armTargetPoses 告诉控制器这段的终点
-            msg = armTargetPoses()
-            msg.times = [float(seg_t)]
-            msg.values = [float(v) for v in pt]
-            arm_pub.publish(msg)
-
-            # 段内持续广播逐帧线性插值
-            steps = max(1, int(seg_t * 100))
-            for st in range(steps + 1):
-                a2 = st / steps
-                cur_pt = [prev[i] + (pt[i] - prev[i]) * a2 for i in range(14)]
-                arm_hold.set_degrees(cur_pt)
-                rospy.sleep(0.01)
-            prev = pt
-
     # 最后持续广播目标值 0.2s (确保停稳)
-    target_deg = target_frames_deg[-1]
     deadline = time.time() + 0.0
     while time.time() < deadline and not rospy.is_shutdown():
         arm_hold.set_degrees(target_deg)
@@ -1293,6 +1484,15 @@ def right_weigh_and_regrasp(
     current_q = list(release_stable_q)
     if WEIGH_REGRASP_USE_STRICT_R6_IK:
         locked_q7 = float(current_q[13])
+        trajectory_label = f"{parcel_name}_step6_strict_r6_regrasp"
+        fallback_executor = _make_soft_ik_temporary_executor(
+            arm_pub,
+            arm_hold,
+            "right",
+            trajectory_label,
+            move_time=STRICT_TRAJECTORY_MOVE_TIME,
+            settle=SETTLE_TIME,
+        )
         rospy.loginfo(
             "task1: %s strict r6 regrasp offset=%s m, lock q7=%.3f deg",
             parcel_name,
@@ -1303,9 +1503,18 @@ def right_weigh_and_regrasp(
             current_q,
             WEIGH_REGRASP_R6_OFFSET,
             locked_q7,
+            execute_temporary=fallback_executor,
         )
-        trajectory_label = f"{parcel_name}_step6_strict_r6_regrasp"
     else:
+        trajectory_label = f"{parcel_name}_step6_soft_eef_regrasp"
+        fallback_executor = _make_soft_ik_temporary_executor(
+            arm_pub,
+            arm_hold,
+            "right",
+            trajectory_label,
+            move_time=STRICT_TRAJECTORY_MOVE_TIME,
+            settle=SETTLE_TIME,
+        )
         rospy.logwarn(
             "task1: %s debug regrasp uses direct soft EEF IK 0x06, "
             "q7 unlocked, offset=%s m",
@@ -1315,8 +1524,8 @@ def right_weigh_and_regrasp(
         regrasp_path = solve_right_eef_offset_path_soft(
             current_q,
             WEIGH_REGRASP_R6_OFFSET,
+            execute_temporary=fallback_executor,
         )
-        trajectory_label = f"{parcel_name}_step6_soft_eef_regrasp"
     direct_disabled = False
     try:
         set_wbc_direct_mode(False)
@@ -1349,7 +1558,12 @@ def right_weigh_and_regrasp(
     rospy.loginfo("task1: %s 称重完成", parcel_name)
 
 
-def _solve_left_with_locked_right(locked_right_deg, left_pos, left_quat):
+def _solve_left_with_locked_right(
+    locked_right_deg,
+    left_pos,
+    left_quat,
+    execute_temporary=None,
+):
     locked_right_deg = [float(v) for v in locked_right_deg]
     if len(locked_right_deg) != 7:
         raise ValueError(
@@ -1358,7 +1572,13 @@ def _solve_left_with_locked_right(locked_right_deg, left_pos, left_quat):
     cur = read_arm_joints()
     cur_for_ik = list(cur[:14])
     cur_for_ik[7:14] = [math.radians(v) for v in locked_right_deg]
-    ik_q = solve_ik_one_hand(cur_for_ik, "left", left_pos, left_quat)
+    ik_q = solve_ik_one_hand(
+        cur_for_ik,
+        "left",
+        left_pos,
+        left_quat,
+        execute_temporary=execute_temporary,
+    )
     target_deg = _rad2deg(ik_q)
     target_deg[7:14] = locked_right_deg
     return cur, target_deg
@@ -1368,8 +1588,21 @@ def _move_left_with_locked_right(
     arm_pub, arm_hold, locked_right_deg, left_pos, left_quat, label
 ):
     """执行既有的左手 IK 和线性 q 插值，并持续锁定右臂。"""
+    _register_task1_motion_context(arm_pub, arm_hold)
+    fallback_executor = _make_soft_ik_temporary_executor(
+        arm_pub,
+        arm_hold,
+        "left",
+        label,
+        move_time=0.5,
+        settle=SETTLE_TIME,
+        locked_right_deg=locked_right_deg,
+    )
     cur, target_deg = _solve_left_with_locked_right(
-        locked_right_deg, left_pos, left_quat
+        locked_right_deg,
+        left_pos,
+        left_quat,
+        execute_temporary=fallback_executor,
     )
 
     start_deg = _rad2deg(cur)
@@ -1552,11 +1785,21 @@ def handoff_transfer_right_to_left(
     left_ready_stable_q = wait_arm_stable(side="left")
     left_ready_stable_q[7:14] = locked_right_rad
     rospy.loginfo("task1: step12 strict left_receive %s", _fmt(left_receive))
+    strict_receive_fallback_executor = _make_soft_ik_temporary_executor(
+        arm_pub,
+        arm_hold,
+        "left",
+        "step12_left_receive_strict_soft_fallback",
+        move_time=STRICT_TRAJECTORY_MOVE_TIME,
+        settle=SETTLE_TIME,
+        locked_right_deg=locked_right,
+    )
     strict_receive_q = solve_ik_one_hand_strict_multi(
         left_ready_stable_q,
         "left",
         left_receive,
         receive_quat,
+        execute_temporary=strict_receive_fallback_executor,
     )
     strict_receive_q[7:14] = locked_right_rad
 
@@ -1771,6 +2014,7 @@ def init_robot():
     tpub = rospy.Publisher("/kuavo_arm_traj", JointState, queue_size=10)
     _wait_conn(tpub)
     ah = ArmHold(tpub, _rad2deg(read_arm_joints()))
+    _register_task1_motion_context(apub, ah)
     set_arm_ext_control()
     return apub, ah, gh
 

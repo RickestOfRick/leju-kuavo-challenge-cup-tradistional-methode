@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 
 import rospy
 from geometry_msgs.msg import Point, Quaternion, Vector3
+from kuavo_msgs.msg import sensorsData
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import Float64MultiArray, String
 import tf2_ros
@@ -404,7 +405,14 @@ class Task1VisionNode:
         self.camera_info_topic = rospy.get_param("~camera_info_topic", "/cam_h/color/camera_info")
         self.depth_image_topic = rospy.get_param("~depth_image_topic", "/cam_h/depth/image_raw/compressedDepth")
         self.depth_image_type = rospy.get_param("~depth_image_type", "auto")
-        self.startup_wait_timeout = float(rospy.get_param("~startup_wait_timeout", 60.0))
+        self.startup_warn_time = float(rospy.get_param("~startup_warn_time", 60.0))
+        self.startup_wait_timeout = float(
+            rospy.get_param("~startup_wait_timeout", 180.0)
+        )
+        self.sensor_time_topic = str(
+            rospy.get_param("~sensor_time_topic", "/sensors_data_raw")
+        )
+        self.latest_sensor_time = None
         self.camera_info = None
         self.latest_depth = None
         self.latest_depth_stamp = None
@@ -447,6 +455,12 @@ class Task1VisionNode:
             self.qpos_topic,
             Float64MultiArray,
             self._qpos_callback,
+            queue_size=1,
+        )
+        self.sensor_time_sub = rospy.Subscriber(
+            self.sensor_time_topic,
+            sensorsData,
+            self._sensor_time_callback,
             queue_size=1,
         )
         self.camera_info_sub = rospy.Subscriber(
@@ -546,6 +560,11 @@ class Task1VisionNode:
 
     def _qpos_callback(self, msg):
         self.latest_qpos = list(msg.data)
+
+    def _sensor_time_callback(self, msg):
+        seconds = float(msg.sensor_time.to_sec())
+        if math.isfinite(seconds):
+            self.latest_sensor_time = seconds
 
     def _camera_info_callback(self, msg):
         self.camera_info = msg
@@ -1869,6 +1888,8 @@ class Task1VisionNode:
 
     def _startup_missing_requirements(self):
         missing = []
+        if self.latest_sensor_time is None:
+            missing.append(self.sensor_time_topic + ".sensor_time")
         if self.vision_mode == 0 and self.latest_qpos is None:
             missing.append(self.qpos_topic)
         if self.camera_info is None:
@@ -1907,25 +1928,58 @@ class Task1VisionNode:
     def _wait_until_ready(self):
         if self.startup_wait_timeout <= 0.0:
             return True
-        deadline = time.time() + self.startup_wait_timeout
         rate = rospy.Rate(5.0)
         last_report = 0.0
+        start_sim_time = None
+        previous_sim_time = None
+        warned = False
         while not rospy.is_shutdown():
             missing = self._startup_missing_requirements()
             if not missing:
                 rospy.loginfo("task1_vision: startup inputs ready; begin publishing detections")
                 return True
-            now = time.time()
-            if now >= deadline:
+
+            now_wall = time.monotonic()
+            now_sim = self.latest_sensor_time
+            if now_sim is not None:
+                if previous_sim_time is not None and now_sim + 1e-12 < previous_sim_time:
+                    rospy.logwarn(
+                        "task1_vision: sensor_time moved backwards; restarting startup timeout"
+                    )
+                    start_sim_time = now_sim
+                    warned = False
+                elif start_sim_time is None:
+                    start_sim_time = now_sim
+                previous_sim_time = now_sim
+                elapsed = now_sim - start_sim_time
+            else:
+                elapsed = 0.0
+
+            if (
+                not warned
+                and self.startup_warn_time > 0.0
+                and elapsed + 1e-12 >= self.startup_warn_time
+                and elapsed + 1e-12 < self.startup_wait_timeout
+            ):
                 rospy.logwarn(
-                    "task1_vision: startup wait timed out after %.1fs; still missing: %s",
+                    "task1_vision: startup inputs still missing after %.1fs simulation "
+                    "time; continuing until %.1fs: %s",
+                    self.startup_warn_time,
+                    self.startup_wait_timeout,
+                    ", ".join(missing),
+                )
+                warned = True
+            if elapsed + 1e-12 >= self.startup_wait_timeout:
+                rospy.logwarn(
+                    "task1_vision: startup wait timed out after %.1fs simulation "
+                    "time; still missing: %s",
                     self.startup_wait_timeout,
                     ", ".join(missing),
                 )
                 return False
-            if now - last_report >= 2.0:
+            if now_wall - last_report >= 2.0:
                 rospy.loginfo("task1_vision: waiting startup inputs: %s", ", ".join(missing))
-                last_report = now
+                last_report = now_wall
             rate.sleep()
         return False
 

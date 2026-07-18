@@ -31,7 +31,7 @@ except Exception as exc:
     _CV_IMPORT_ERROR = exc
 
 
-# 将位置误差转换为毫米文本, 供图像叠加和表格实时显示。
+# Format position errors in millimeters for image overlays and table cells.
 def _format_error_mm(value):
     if value is None:
         return "n/a"
@@ -79,7 +79,7 @@ CAMERA_MODES = {
 }
 
 
-# 解析 rqt 插件参数, -h/-r/-l 分别选择头部/右臂/左臂 RGB 图像。
+# Parse plugin arguments: -h/-r/-l select head/right-arm/left-arm RGB images.
 def _parse_camera_mode(argv):
     mode = "head"
     for arg in argv:

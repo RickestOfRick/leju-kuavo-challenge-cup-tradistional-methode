@@ -8,10 +8,9 @@ def object_motion_name(item):
     return str(item.get("motion_name") or item.get("name", ""))
 
 
-def create_target_session(request, base_payload, required_samples, max_attempts):
+def create_target_session(request, base_payload, required_samples):
     """Create mutable state for a target-only relocalization request."""
     required = max(1, int(required_samples))
-    maximum = max(required, int(max_attempts))
     return {
         "request_id": str(request["request_id"]),
         "name": str(request["name"]),
@@ -21,7 +20,6 @@ def create_target_session(request, base_payload, required_samples, max_attempts)
             float(value) for value in request["expected_position"]
         ],
         "required_samples": required,
-        "max_attempts": maximum,
         "samples": [],
         "attempts": 0,
         "base_payload": copy.deepcopy(base_payload),
@@ -37,7 +35,6 @@ def record_target_fit(session, fit):
         "attempts": int(session["attempts"]),
         "samples": copy.deepcopy(session["samples"]),
         "ready": len(session["samples"]) >= int(session["required_samples"]),
-        "exhausted": int(session["attempts"]) >= int(session["max_attempts"]),
     }
 
 

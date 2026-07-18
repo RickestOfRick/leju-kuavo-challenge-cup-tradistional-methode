@@ -18,6 +18,7 @@ from task2_config import (
     IK_LIFT_POS_COST_WEIGHT,
     IK_POS_COST_WEIGHT,
     LIFT_OFFSETS_BY_CLASS,
+    MID_GRASP_Z_OFFSET,
     PLACE_POSITIONS_BASE,
     PLACE_Y_OFFSETS_BY_CLASS,
     PRE_GRASP_Z_OFFSET,
@@ -77,12 +78,28 @@ def _c_initial_lift_offset():
     return offset
 
 
+def _optional_mid_grasp_position(grasp_position):
+    offset = float(MID_GRASP_Z_OFFSET)
+    if offset == -1.0:
+        return None
+    if not math.isfinite(offset) or offset < 0.0:
+        raise ValueError(
+            "MID_GRASP_Z_OFFSET must be -1 or a finite non-negative value"
+        )
+    position = [float(value) for value in grasp_position]
+    if len(position) != 3:
+        raise ValueError("grasp position must contain xyz")
+    position[2] += offset
+    return position
+
+
 def _approach_pre_grasp_with_yaw_retry(
     controller,
     object_name,
     side,
     observation,
     pre_grasp,
+    mid_grasp,
     original_yaw_offset,
     original_grasp,
     original_lift,
@@ -91,22 +108,38 @@ def _approach_pre_grasp_with_yaw_retry(
     lift_for_yaw_offset,
     label_prefix,
 ):
-    """Try the 180-degree yaw alternative at pre-grasp and keep the better FK."""
+    """Compare yaw candidates at stable pre, then descend through optional mid."""
+    def move_to_pre_yaw_check(quaternion, label_suffix=""):
+        _, orientation_error = controller.move_pose(
+            side,
+            pre_grasp,
+            quaternion,
+            "{}_pre_grasp{}".format(label_prefix, label_suffix),
+            pos_cost_weight=IK_POS_COST_WEIGHT,
+            return_orientation_error=True,
+        )
+        return orientation_error
+
+    def move_to_mid(quaternion, label_suffix=""):
+        if mid_grasp is None:
+            return
+        controller.move_pose(
+            side,
+            mid_grasp,
+            quaternion,
+            "{}_mid_grasp{}".format(label_prefix, label_suffix),
+            pos_cost_weight=IK_POS_COST_WEIGHT,
+        )
+
     controller.gripper.open(side)
-    _, original_error = controller.move_pose(
-        side,
-        pre_grasp,
-        original_grasp,
-        "{}_pre_grasp".format(label_prefix),
-        pos_cost_weight=IK_POS_COST_WEIGHT,
-        return_orientation_error=True,
-    )
+    original_error = move_to_pre_yaw_check(original_grasp)
     original_error_deg = math.degrees(original_error)
     if (
         observation["class_name"]
         not in ("part_type_a", "part_type_b", "part_type_c")
         or original_error_deg <= PRE_GRASP_ORIENTATION_RETRY_DEG
     ):
+        move_to_mid(original_grasp)
         return original_yaw_offset, original_grasp, original_lift
 
     alternative_yaw_offset = alternate_yaw_offset_for(original_yaw_offset)
@@ -128,13 +161,8 @@ def _approach_pre_grasp_with_yaw_retry(
     alternative_error = None
     alternative_failure = None
     try:
-        _, alternative_error = controller.move_pose(
-            side,
-            pre_grasp,
-            alternative_grasp,
-            "{}_pre_grasp_yaw_flipped".format(label_prefix),
-            pos_cost_weight=IK_POS_COST_WEIGHT,
-            return_orientation_error=True,
+        alternative_error = move_to_pre_yaw_check(
+            alternative_grasp, "_yaw_flipped"
         )
     except RuntimeError as error:
         if rospy.is_shutdown():
@@ -150,11 +178,13 @@ def _approach_pre_grasp_with_yaw_retry(
             original_error_deg,
             alternative_error_deg,
         )
+        move_to_mid(alternative_grasp, "_yaw_flipped")
         return alternative_yaw_offset, alternative_grasp, alternative_lift
 
     if alternative_error is None:
         rospy.logwarn(
-            "task2: %s flipped yaw pre-grasp failed (%s); restoring original yaw",
+            "task2: %s flipped yaw pre-grasp failed (%s); "
+            "restoring original yaw",
             object_name,
             alternative_failure,
         )
@@ -172,22 +202,18 @@ def _approach_pre_grasp_with_yaw_retry(
         side=side,
         checked_keypoint=True,
     )
-    controller.move_pose(
-        side,
-        pre_grasp,
-        original_grasp,
-        "{}_pre_grasp_yaw_restored".format(label_prefix),
-        pos_cost_weight=IK_POS_COST_WEIGHT,
-    )
+    move_to_pre_yaw_check(original_grasp, "_yaw_restored")
+    move_to_mid(original_grasp, "_yaw_restored")
     return original_yaw_offset, original_grasp, original_lift
 
 
 def _approach_initial_pre_grasp(controller, job):
-    """A/B/C 在 pre-grasp 实测两个 yaw 候选，并保留 FK 误差较小者。"""
+    """A/B/C 在稳定 pre 选择 yaw，再经过可选 mid 接近抓取点。"""
     observation = job["observation"]
     side = job["arm"]
     pre_grasp = list(job["grasp_position"])
     pre_grasp[2] += PRE_GRASP_Z_OFFSET
+    mid_grasp = _optional_mid_grasp_position(job["grasp_position"])
     yaw_offset, grasp_quaternion, lift_quaternion = (
         _approach_pre_grasp_with_yaw_retry(
             controller,
@@ -195,6 +221,7 @@ def _approach_initial_pre_grasp(controller, job):
             side,
             observation,
             pre_grasp,
+            mid_grasp,
             job["grasp_yaw_offset"],
             list(job["grasp_quaternion"]),
             list(job["lift_quaternion"]),
@@ -216,7 +243,7 @@ def _approach_initial_pre_grasp(controller, job):
 
 
 def _approach_relocalized_pre_grasp(controller, job, target_arm, targets):
-    """Apply the same two-yaw FK trial to the receiver's visual re-grasp."""
+    """Choose re-grasp yaw at stable pre, then descend through optional mid."""
     observation = targets["relocalized_observation"]
     pre_grasp = targets.get("pre_grasp_position")
     if pre_grasp is None:
@@ -224,11 +251,20 @@ def _approach_relocalized_pre_grasp(controller, job, target_arm, targets):
         pre_grasp[2] += PRE_GRASP_Z_OFFSET
     else:
         pre_grasp = [float(value) for value in pre_grasp]
+    mid_grasp = _optional_mid_grasp_position(targets["grasp_position"])
     label_prefix = "{}_vision_regrasp".format(job["object"])
 
-    def quaternion_for_yaw_offset(yaw_offset):
+    def grasp_for_yaw_offset(yaw_offset):
         return geometry.pose_quaternion(
             targets["grasp_pose_values"],
+            observation["yaw"],
+            arm=target_arm,
+            yaw_offset=yaw_offset,
+        )
+
+    def lift_for_yaw_offset(yaw_offset):
+        return geometry.pose_quaternion(
+            targets["lift_pose_values"],
             observation["yaw"],
             arm=target_arm,
             yaw_offset=yaw_offset,
@@ -241,12 +277,15 @@ def _approach_relocalized_pre_grasp(controller, job, target_arm, targets):
             target_arm,
             observation,
             pre_grasp,
+            mid_grasp,
             targets["grasp_yaw_offset"],
             list(targets["grasp_quaternion"]),
             list(targets["lift_quaternion"]),
-            geometry.flipped_yaw_offset,
-            quaternion_for_yaw_offset,
-            quaternion_for_yaw_offset,
+            lambda value: geometry.alternate_grasp_yaw_offset(
+                observation, value
+            ),
+            grasp_for_yaw_offset,
+            lift_for_yaw_offset,
             label_prefix,
         )
     )
@@ -254,6 +293,7 @@ def _approach_relocalized_pre_grasp(controller, job, target_arm, targets):
     targets["grasp_quaternion"] = grasp_quaternion
     targets["lift_quaternion"] = lift_quaternion
     targets["pre_grasp_position"] = pre_grasp
+    targets["mid_grasp_position"] = mid_grasp
     return targets
 
 

@@ -195,8 +195,9 @@ def _other_narrow_edge(observation, arm):
     return cosine < math.cos(math.radians(45.0))
 
 
-def narrow_edge_offset(observation, arm):
-    pose_values = CLASS_POSES[observation["class_name"]]["grasp"]
+def narrow_edge_offset(observation, arm, pose_values=None):
+    if pose_values is None:
+        pose_values = CLASS_POSES[observation["class_name"]]["grasp"]
     object_yaw = observation["yaw"]
     candidates = grasp_yaw_candidates(observation)
     selected = max(
@@ -279,7 +280,9 @@ def _vision_relocalize_handoff_values(job, key, class_name):
         ),
         "place_position": _handoff_vector(config, "place_position", class_name),
         "place_quaternion": pose_quaternion(config["place_pose"][class_name]),
+        "grasp_offset": _handoff_vector(config, "grasp_offset", class_name),
         "grasp_pose_values": list(config["grasp_pose"][class_name]),
+        "lift_pose_values": list(config["lift_pose"][class_name]),
     }
 
 
@@ -358,17 +361,36 @@ def resolve_relocalized_handoff_receiver(
     resolved = dict(targets)
     resolved["receiver_position_mode"] = "resolved_vision_relocalize"
     resolved["relocalized_observation"] = observation
-    resolved["grasp_position"] = grasp_target(observation, target_arm)
-    yaw_offset = 0.0
+    grasp_offset = [float(value) for value in targets["grasp_offset"]]
+    if len(grasp_offset) != 3:
+        raise ValueError("visual handoff grasp offset must contain xyz")
+    visual_reference = [
+        float(observation["position"][index]) + grasp_offset[index]
+        for index in range(3)
+    ]
+    resolved["grasp_position"] = apply_hand_calibration(
+        visual_reference, target_arm
+    )
+    grasp_pose_values = targets["grasp_pose_values"]
+    lift_pose_values = targets["lift_pose_values"]
+    yaw_offset = narrow_edge_offset(
+        observation, target_arm, pose_values=grasp_pose_values
+    )
     grasp_quaternion_value = pose_quaternion(
-        targets["grasp_pose_values"],
+        grasp_pose_values,
+        observation["yaw"],
+        arm=target_arm,
+        yaw_offset=yaw_offset,
+    )
+    lift_quaternion_value = pose_quaternion(
+        lift_pose_values,
         observation["yaw"],
         arm=target_arm,
         yaw_offset=yaw_offset,
     )
     resolved["grasp_yaw_offset"] = yaw_offset
     resolved["grasp_quaternion"] = grasp_quaternion_value
-    resolved["lift_quaternion"] = list(grasp_quaternion_value)
+    resolved["lift_quaternion"] = lift_quaternion_value
     resolved["pre_grasp_position"] = None
     return resolved
 

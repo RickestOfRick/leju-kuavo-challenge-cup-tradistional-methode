@@ -123,7 +123,9 @@ ARM_JOINT_NAMES = ["arm_joint_" + str(i) for i in range(1, 15)]
 TOPIC_TIMEOUT = 20.0
 ARM_TRAJ_HZ = 100.0
 TASK1_VISION_TOPIC = "/task1_vision/objects_json"
-TASK1_VISION_TIMEOUT = 70.0
+# 视觉等待使用 /sensors_data_raw.sensor_time：先告警，达到硬超时才中断。
+TASK1_VISION_WARN_TIME = 60.0
+TASK1_VISION_TIMEOUT = 180.0
 TASK1_VISION_MIN_CONFIDENCE = 0.0
 TASK1_VISION_FRAME_ID = "base_link"
 TASK1_VISION_MEDIAN_FRAMES = 10

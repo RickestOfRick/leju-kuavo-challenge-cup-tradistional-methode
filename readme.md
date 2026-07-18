@@ -109,7 +109,9 @@ float64[3] right_r6_offset
 ### task2_vision
 
 支持模式 1 的 qpos 假框和模式 2 的三类别 YOLO 框，两者共用 RGB-D/CAD
-XYZ/yaw 拟合与 5 帧中位数锁定。
+XYZ/yaw 拟合与 5 帧中位数锁定。RGB/depth 会检查时间差，相机 TF 按当前
+depth 帧时间戳查询；相机点通过 `base_link <- camera` TF 直接拟合并输出到当前
+`base_link`，不读取 MPC 或真值基座姿态做二次坐标转换。
 
 ### data.py
 
@@ -117,12 +119,17 @@ XYZ/yaw 拟合与 5 帧中位数锁定。
 
 ### task2_motion问题
 
-目前的问题为: A类的交接为空接, 稳定性没有完全验证; C类的交接为放置后交接, 但是放置的位置不在左臂的舒适工作区之内, 需要进一步优化.  
+目前的问题为: A类的交接为空接, 稳定性没有完全验证; C类的交接为放置后交接, 稳定性没有完全验证
 动作偏置参数都在task2_config.py中
 
 ## 运行
 
 ### 任务二
+
+seed  
+仅 A 交接：72、73、74  
+仅 C 交接：32、33、34  
+A 和 C 都交接：80、81、82
 
 ```bash
 catkin build kuavo_msgs task2_vision task2_motion challenge_cup_task_template

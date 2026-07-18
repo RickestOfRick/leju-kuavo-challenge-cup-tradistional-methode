@@ -10,7 +10,8 @@
   <node name="task1" pkg="task1_pick" type="task1_node.py" output="screen">
     <param name="task1_vision_topic" value="/task1_vision/objects_json"/>
     <param name="task1_vision_frame_id" value="base_link"/>
-    <param name="task1_vision_timeout" value="70.0"/>
+    <param name="task1_vision_warn_time" value="60.0"/>
+    <param name="task1_vision_timeout" value="180.0"/>
     <param name="task1_vision_min_confidence" value="0.0"/>
     <param name="require_all_parcels" value="true"/>
     <param name="head_yaw_deg" value="0.0"/>

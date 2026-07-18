@@ -1,7 +1,7 @@
 """Task 2 class-specific resting body heights above the table plane."""
 
 
-# Shared correction from fitted table Z to the mode-0 motion reference Z.
+# Shared correction from the fitted table plane to the body origin in base_link.
 GLOBAL_Z_CALIBRATION_OFFSET = -0.0009
 
 # MuJoCo body-frame origin relative to the supporting table surface.

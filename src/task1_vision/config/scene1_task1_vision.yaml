@@ -7,7 +7,9 @@ output_frame_id: base_link
 base_frame_id: base_link
 qpos_topic: /mujoco/qpos
 publish_rate: 10.0
-startup_wait_timeout: 60.0
+# 使用 /sensors_data_raw.sensor_time；60s 只告警，180s 才结束视觉节点。
+startup_warn_time: 60.0
+startup_wait_timeout: 180.0
 
 # 头部 RGB-D 输入与坐标变换。
 head_image_topic: /cam_h/color/image_raw/compressed

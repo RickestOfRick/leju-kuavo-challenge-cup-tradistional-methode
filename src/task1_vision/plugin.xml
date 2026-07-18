@@ -3,15 +3,15 @@
          type="task1_vision.rqt_task1_vision.Task1VisionPlugin"
          base_class_type="rqt_gui_py::Plugin">
     <description>
-      显示任务一包裹二维框、深度拟合坐标和真值误差。
+      Displays task 1 parcel boxes, depth-fitted coordinates, and truth errors.
     </description>
     <qtgui>
       <group>
         <label>Challenge Cup</label>
       </group>
-      <label>任务一视觉</label>
+      <label>Task 1 Vision</label>
       <icon type="theme">camera-photo</icon>
-      <statustip>显示任务一视觉检测结果。</statustip>
+      <statustip>Displays task 1 vision detections.</statustip>
     </qtgui>
   </class>
 </library>

@@ -317,6 +317,24 @@ class DynamicTruthLayoutTest(unittest.TestCase):
         self.assertAlmostEqual(boundary_score["prior_penalty"], 0.50625)
         self.assertLess(boundary_score["objective_score"], 10.0)
 
+    def test_zero_yaw_prior_weight_uses_only_cad_data_score(self):
+        center = math.radians(41.252961)
+        center_score = yaw_prior_regularized_score(
+            10.0, center, center, math.radians(8.0), weight=0.0
+        )
+        boundary_score = yaw_prior_regularized_score(
+            7.0,
+            center - math.radians(18.0),
+            center,
+            math.radians(8.0),
+            weight=0.0,
+        )
+
+        self.assertEqual(center_score["prior_penalty"], 0.0)
+        self.assertEqual(boundary_score["prior_penalty"], 0.0)
+        self.assertEqual(center_score["objective_score"], 10.0)
+        self.assertEqual(boundary_score["objective_score"], 7.0)
+
 
 if __name__ == "__main__":
     unittest.main()
