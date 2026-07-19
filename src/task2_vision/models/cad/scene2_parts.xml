@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="Task 2 CAD Parts">
+  <asset>
+    <mesh name="part_type_a_1_mesh" file="part_type_a.stl" scale="0.0006667 0.0006667 0.0006667"/>
+    <mesh name="part_type_a_2_mesh" file="part_type_a.stl" scale="0.0006667 0.0006667 0.0006667"/>
+    <mesh name="part_type_b_1_mesh" file="part_type_b.stl" scale="0.003 0.003 0.003"/>
+    <mesh name="part_type_b_2_mesh" file="part_type_b.stl" scale="0.003 0.003 0.003"/>
+    <mesh name="part_type_c_1_handle_mesh" file="part_type_c_handle.obj" scale="0.018 0.018 0.018"/>
+    <mesh name="part_type_c_1_neck_mesh" file="part_type_c_neck.obj" scale="0.018 0.018 0.018"/>
+    <mesh name="part_type_c_1_tip_mesh" file="part_type_c_tip.obj" scale="0.018 0.018 0.018"/>
+    <mesh name="part_type_c_2_handle_mesh" file="part_type_c_handle.obj" scale="0.018 0.018 0.018"/>
+    <mesh name="part_type_c_2_neck_mesh" file="part_type_c_neck.obj" scale="0.018 0.018 0.018"/>
+    <mesh name="part_type_c_2_tip_mesh" file="part_type_c_tip.obj" scale="0.018 0.018 0.018"/>
+  </asset>
+  <worldbody>
+    <body name="part_type_a_1">
+      <geom name="part_type_a_1_visual" type="mesh" mesh="part_type_a_1_mesh"/>
+    </body>
+    <body name="part_type_a_2">
+      <geom name="part_type_a_2_visual" type="mesh" mesh="part_type_a_2_mesh"/>
+    </body>
+    <body name="part_type_b_1">
+      <geom name="part_type_b_1_visual" type="mesh" mesh="part_type_b_1_mesh"/>
+    </body>
+    <body name="part_type_b_2">
+      <geom name="part_type_b_2_visual" type="mesh" mesh="part_type_b_2_mesh"/>
+    </body>
+    <body name="part_type_c_1">
+      <geom name="part_type_c_1_handle_visual" type="mesh" mesh="part_type_c_1_handle_mesh"/>
+      <geom name="part_type_c_1_neck_visual" type="mesh" mesh="part_type_c_1_neck_mesh"/>
+      <geom name="part_type_c_1_tip_visual" type="mesh" mesh="part_type_c_1_tip_mesh"/>
+    </body>
+    <body name="part_type_c_2">
+      <geom name="part_type_c_2_handle_visual" type="mesh" mesh="part_type_c_2_handle_mesh"/>
+      <geom name="part_type_c_2_neck_visual" type="mesh" mesh="part_type_c_2_neck_mesh"/>
+      <geom name="part_type_c_2_tip_visual" type="mesh" mesh="part_type_c_2_tip_mesh"/>
+    </body>
+  </worldbody>
+</mujoco>

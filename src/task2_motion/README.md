@@ -1,13 +1,10 @@
 # task2_motion：任务二传统抓取与分类放箱
 
-`task2_motion` 将原任务二数采脚本转换为正式任务包，输入统一为 `task2_vision` 发布的 `base_link` 工件位姿。目前使用场景生成器提供的六个工件完整真值。
+`task2_motion` 输入统一为 `/task2_depth_xy/objects_json` 发布的 `base_link` 工件位姿。当前生产模式使用 YOLO+RGB-D/CAD，动作层不订阅仿真真值接口。
 
 输入必须包含 `part_type_a_1` 到 `part_type_c_2` 六个 motion 实例名。编号由
-`task2_vision` 根据 `base_link` 下的位置生成：A、B 类从右到左编号，C 类
-从左到右编号。motion 使用该名字选择实例偏置；真值模式另以
-`ground_truth_name` 和顶层 `motion_to_ground_truth` 保存 `.so` 原始实例名，
-从而确保重新编号后仍读取对应真值对象的位置、姿态和 yaw。以后替换为
-YOLO、深度和 yaw 拟合时，应直接输出相同的 motion 空间编号。
+视觉节点根据配置的实例命名策略，在每帧 CAD 拟合后完成同类两个工件的一对一
+命名。motion 直接使用该名字选择实例抓取偏置。
 
 ## 模块结构
 

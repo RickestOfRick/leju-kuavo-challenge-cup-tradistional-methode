@@ -4,7 +4,7 @@ import copy
 
 import numpy as np
 
-from task2_vision.layout import OBJECT_NAMES, assign_motion_names
+from task2_vision.layout import OBJECT_NAMES
 
 
 CLASS_NAME_BY_ID = {
@@ -120,47 +120,44 @@ def has_complete_task2_detections(detections):
     return task2_detection_counts(detections) == EXPECTED_CLASS_COUNTS
 
 
-def assign_fitted_detection_names(detection_objects, fits, naming_method):
-    """Remap one complete fitted YOLO frame to motion names before aggregation."""
-    if not all(
-        fits.get(name) is not None
-        and len(fits[name].get("xy", [])) >= 2
-        and "z" in fits[name]
-        and "yaw" in fits[name]
-        for name in OBJECT_NAMES
-    ):
-        return copy.deepcopy(detection_objects), copy.deepcopy(fits), False
+def remap_fitted_detections_by_assignment(
+    detection_objects, fits, source_to_motion_name, naming_method
+):
+    """Apply per-class naming decisions without coupling unrelated classes."""
+    expected_names = set(OBJECT_NAMES)
+    if set(detection_objects) != expected_names or set(fits) != expected_names:
+        raise ValueError("task2 detection and fit maps must contain all object keys")
 
-    descriptors = []
-    for temporary_name in OBJECT_NAMES:
-        detection = detection_objects[temporary_name]
-        fit = fits[temporary_name]
-        descriptors.append(
-            {
-                "name": temporary_name,
-                "class_name": detection["class_name"],
-                "position": [
-                    float(fit["xy"][0]),
-                    float(fit["xy"][1]),
-                    float(fit["z"]),
-                ],
-                "yaw": float(fit["yaw"]),
-            }
-        )
-    assigned = assign_motion_names(descriptors, naming_method)
+    assignment = {
+        source_name: str(source_to_motion_name.get(source_name, source_name))
+        for source_name in OBJECT_NAMES
+    }
+    if set(assignment.values()) != expected_names:
+        raise ValueError("task2 motion-name assignment must be one-to-one")
+
     remapped_detections = {}
     remapped_fits = {}
-    for descriptor in assigned:
-        motion_name = str(descriptor["name"])
-        temporary_name = str(descriptor["instance_naming_source_name"])
-        detection = copy.deepcopy(detection_objects[temporary_name])
+    for source_name in OBJECT_NAMES:
+        motion_name = assignment[source_name]
+        detection = copy.deepcopy(detection_objects[source_name])
+        class_name = str(detection.get("class_name", ""))
+        if not motion_name.startswith(class_name + "_"):
+            raise ValueError(
+                "task2 assignment crosses classes: {} -> {}".format(
+                    source_name, motion_name
+                )
+            )
         detection["name"] = motion_name
         detection["motion_name"] = motion_name
-        detection["detection_name"] = temporary_name
+        detection["detection_name"] = source_name
+        detection["instance_naming_source_name"] = source_name
         detection["instance_naming_method"] = str(naming_method)
         remapped_detections[motion_name] = detection
-        remapped_fits[motion_name] = copy.deepcopy(fits[temporary_name])
-    return remapped_detections, remapped_fits, True
+        fit = copy.deepcopy(fits[source_name])
+        fit["motion_name"] = motion_name
+        fit["instance_naming_source_name"] = source_name
+        remapped_fits[motion_name] = fit
+    return remapped_detections, remapped_fits
 
 
 class Task2YoloDetector:
@@ -177,7 +174,7 @@ class Task2YoloDetector:
             from ultralytics import YOLO
         except ImportError as exc:
             raise RuntimeError(
-                "task2 vision mode 2 requires ultralytics in the ROS Python environment"
+                "task2 vision requires ultralytics in the ROS Python environment"
             ) from exc
         self.model_path = str(model_path)
         self.model = YOLO(self.model_path)

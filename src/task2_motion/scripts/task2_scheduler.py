@@ -744,9 +744,8 @@ def run_scene2_task(seed, object_poses=None):
         for name in sorted(observations):
             item = observations[name]
             rospy.loginfo(
-                "task2: motion=%s ground_truth=%s base_link=%s yaw=%.2f deg source=%s",
+                "task2: object=%s base_link=%s yaw=%.2f deg source=%s",
                 name,
-                item.get("ground_truth_name", name),
                 fmt(item["position"]),
                 math.degrees(item["yaw"]),
                 item["position_source"],

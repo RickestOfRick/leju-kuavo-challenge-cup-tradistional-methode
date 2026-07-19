@@ -31,29 +31,6 @@ except Exception as exc:
     _CV_IMPORT_ERROR = exc
 
 
-# Format position errors in millimeters for image overlays and table cells.
-def _format_error_mm(value):
-    if value is None:
-        return "n/a"
-    try:
-        return "{:.1f}".format(float(value) * 1000.0)
-    except Exception:
-        return "n/a"
-
-
-def _xy_position_error(obj):
-    position = obj.get("position", [])
-    truth_position = obj.get("truth_position", [])
-    if len(position) < 2 or len(truth_position) < 2:
-        return None
-    try:
-        dx = float(position[0]) - float(truth_position[0])
-        dy = float(position[1]) - float(truth_position[1])
-        return math.hypot(dx, dy)
-    except (TypeError, ValueError):
-        return None
-
-
 CAMERA_MODES = {
     "head": {
         "title": "Task1 Vision - Head Camera",
@@ -127,8 +104,8 @@ class Task1VisionPlugin(Plugin):
         self._sub = None
         if self._camera_config["show_detection_ui"]:
             self._status.setText("Waiting for /task1_vision/objects_json")
-            self._table = QTableWidget(0, 10)
-            self._table.setHorizontalHeaderLabels(["name", "class", "conf", "x", "y", "z", "xy err mm", "yaw", "valid", "source"])
+            self._table = QTableWidget(0, 9)
+            self._table.setHorizontalHeaderLabels(["name", "class", "conf", "x", "y", "z", "yaw", "valid", "source"])
             self._table.verticalHeader().setVisible(False)
             self._table.setAlternatingRowColors(True)
             layout.addWidget(self._table)
@@ -172,16 +149,6 @@ class Task1VisionPlugin(Plugin):
                 self._status.setText(
                     "YOLO RGB + RANSAC top plane  boxes: {}  fitted: {}  objects: {}".format(
                         len(self._bbox_candidates), fitted, len(self._objects)
-                    )
-                )
-            else:
-                projected = sum(
-                    1 for obj in self._objects if obj.get("bbox_projected", False)
-                )
-                invalid = len(self._objects) - projected
-                self._status.setText(
-                    "qpos bbox + RANSAC top plane  objects: {}  projected: {}  invalid: {}".format(
-                        len(self._objects), projected, invalid
                     )
                 )
         except Exception as exc:
@@ -260,11 +227,7 @@ class Task1VisionPlugin(Plugin):
             color = self._color_for_object(obj)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.circle(frame, (int(cx), int(cy)), 4, color, -1)
-            used = self._used_measurement(obj)
-            label = "{} err={}mm".format(
-                str(obj.get("name") or obj.get("class_name") or ""),
-                _format_error_mm(_xy_position_error(used)),
-            )
+            label = str(obj.get("name") or obj.get("class_name") or "")
             cv2.putText(
                 frame,
                 label,
@@ -328,7 +291,6 @@ class Task1VisionPlugin(Plugin):
                 "{:.3f}".format(float(position[0])),
                 "{:.3f}".format(float(position[1])),
                 "{:.3f}".format(float(position[2])),
-                _format_error_mm(_xy_position_error(obj)),
                 "{:.1f}".format(math.degrees(float(yaw))),
                 "yes" if obj.get("yaw_valid", False) else "no",
                 obj.get("position_source", ""),

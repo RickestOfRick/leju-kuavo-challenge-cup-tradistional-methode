@@ -69,7 +69,7 @@ rospy.spin()
 rostopic echo /task1_vision/objects_json
 ```
 
-`position` 是 YOLO + 深度顶面拟合的包裹中心，不是二维像素框中心 `bbox_center`，也不包含抓取模块之后叠加的 `PICK_OFFSET`。YOLO 部署模式中的 qpos 不参与 `position` 计算。
+`position` 是 YOLO + 深度顶面拟合的包裹中心，不是二维像素框中心 `bbox_center`，也不包含抓取模块之后叠加的 `PICK_OFFSET`。生产节点只订阅 RGB-D、CameraInfo、TF 和仿真时钟，不订阅仿真真值接口。
 
 ## 中心怎么得到
 

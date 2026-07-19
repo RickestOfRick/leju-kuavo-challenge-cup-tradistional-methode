@@ -2,7 +2,7 @@
 <package format="2">
   <name>task2_vision</name>
   <version>0.0.1</version>
-  <description>任务二零件在 base_link 下的完整位姿与偏航角真值发布包。</description>
+  <description>任务二 YOLO、RGB-D 与 CAD 工件位姿拟合包。</description>
 
   <maintainer email="zwx@example.com">zwx</maintainer>
   <license>MIT</license>
@@ -13,10 +13,7 @@
   <depend>kuavo_msgs</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
-  <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
-  <depend>vision_msgs</depend>
-  <exec_depend>challenge_cup_simulator</exec_depend>
   <exec_depend>rqt_gui</exec_depend>
   <exec_depend>rqt_gui_py</exec_depend>
   <exec_depend>python_qt_binding</exec_depend>

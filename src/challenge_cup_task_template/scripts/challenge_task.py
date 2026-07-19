@@ -19,24 +19,9 @@ import threading
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
-# 动作开始确认: 1=需要人工按 Enter, 0=固定初始位姿后等待 1s 自动开始。
-NEED_OPERATOR_ENTER = 0
-
-# 任务一视觉模式: 0=qpos 投影假框+深度拟合, 1=YOLO RGB 框+深度拟合。
-TASK1_VISION_MODE = 1
-
-# 任务二视觉模式: 0=完整真值, 1=qpos 类别框+RGB-D/CAD,
-# 2=YOLO 类别框+RGB-D/CAD 拟合 XYZ 和 yaw。
-TASK2_VISION_MODE = 2
-
 # 任务二同类工件编号: True=按拟合 yaw 与固定先验匹配；False=按相对 Y 位置。
 TASK2_USE_YAW_PRIOR_INSTANCE_MATCHING = True
-
-TASK2_VISION_TOPICS = {
-    0: "/task2_vision/objects_json",
-    1: "/task2_depth_xy/objects_json",
-    2: "/task2_depth_xy/objects_json",
-}
+TASK2_VISION_TOPIC = "/task2_depth_xy/objects_json"
 
 TASK1_PACKAGE = "task1_pick"
 TASK1_MODULE = "task1_node"
@@ -224,14 +209,11 @@ def _start_scene_services(scene, seed=0):
                     "task1_vision",
                     "task1_vision_scene1.launch",
                     "start_rqt:=false",
-                    "vision_mode:={}".format(int(TASK1_VISION_MODE)),
+                    "vision_mode:=1",
                 ],
             ).start()
         ]
     if scene == "scene2":
-        vision_mode = int(TASK2_VISION_MODE)
-        if vision_mode not in TASK2_VISION_TOPICS:
-            raise RuntimeError("TASK2_VISION_MODE only supports 0, 1, or 2")
         instance_naming_method = _task2_instance_naming_method()
         return [
             ManagedProcess(
@@ -240,8 +222,6 @@ def _start_scene_services(scene, seed=0):
                     "roslaunch",
                     "task2_vision",
                     "task2_vision_scene2.launch",
-                    "seed:={}".format(int(seed)),
-                    "vision_mode:={}".format(vision_mode),
                     "instance_naming_method:={}".format(instance_naming_method),
                 ],
             ).start()
@@ -280,20 +260,12 @@ def _apply_head_camera(scene, head_camera):
         rospy.logwarn("%s head camera pose setup failed: %s", scene, exc)
 
 
-# 动作开始前等待人工确认。
-def _wait_for_operator_start():
+# 固定位姿准备完成后等待 1 秒自动开始动作。
+def _wait_before_auto_start():
     import rospy
 
-    if int(NEED_OPERATOR_ENTER) == 0:
-        rospy.loginfo(GREEN + "准备完成,1s后自动开始动作" + RESET)
-        rospy.sleep(1.0)
-        return
-
-    rospy.loginfo(GREEN + "准备完成,按enter开始动作" + RESET)
-    try:
-        input()
-    except EOFError:
-        raise RuntimeError("stdin unavailable; cannot confirm action start")
+    rospy.loginfo(GREEN + "准备完成,1s后自动开始动作" + RESET)
+    rospy.sleep(1.0)
 
 
 # 配置动作模块只接受深度 RANSAC 顶面拟合结果。
@@ -311,18 +283,12 @@ def _configure_task1_vision_source():
 def _configure_task2_vision_source():
     import rospy
 
-    vision_mode = int(TASK2_VISION_MODE)
-    if vision_mode not in TASK2_VISION_TOPICS:
-        raise RuntimeError("TASK2_VISION_MODE only supports 0, 1, or 2")
-    topic = TASK2_VISION_TOPICS[vision_mode]
     instance_naming_method = _task2_instance_naming_method()
-    rospy.set_param("~task2_vision_mode", vision_mode)
-    rospy.set_param("~task2_vision_topic", topic)
+    rospy.set_param("~task2_vision_topic", TASK2_VISION_TOPIC)
     rospy.set_param("~task2_instance_naming_method", instance_naming_method)
     rospy.loginfo(
-        "challenge_task: task2 vision mode=%d topic=%s instance_naming=%s",
-        vision_mode,
-        topic,
+        "challenge_task: task2 production vision topic=%s instance_naming=%s",
+        TASK2_VISION_TOPIC,
         instance_naming_method,
     )
 
@@ -338,7 +304,7 @@ def _run_scene1_task1(seed):
         GREEN + "task1: fixed initial parcel poses from task1_vision: %s" + RESET,
         ", ".join(sorted(parcel_poses)),
     )
-    _wait_for_operator_start()
+    _wait_before_auto_start()
 
     ok = task1_node.run_scene1_task(
         seed,
@@ -362,16 +328,14 @@ def _run_scene2_task2(seed):
         GREEN + "task2: fixed initial object poses from task2_vision: %s" + RESET,
         ", ".join(sorted(object_poses)),
     )
-    _wait_for_operator_start()
+    _wait_before_auto_start()
     if not task2_node.run_scene2_task(seed, object_poses=object_poses):
         if rospy.is_shutdown():
             return
         raise RuntimeError("task2 action failed")
 
 
-def run_scene(
-    scene, seed, node_name=None, timeout=120, time_limit=None, timer_gui=True
-):
+def run_scene(scene, seed, node_name=None, timeout=120, timer_gui=True):
     if scene not in SCENE_CONFIGS:
         raise ValueError("unknown scene: {}".format(scene))
 
@@ -381,7 +345,7 @@ def run_scene(
     launcher = ChallengeSimLauncher(
         scene=scene,
         seed=seed,
-        match_time_limit=time_limit,
+        match_time_limit=0.0,
         timer_gui=timer_gui,
     )
     services = []
@@ -399,13 +363,12 @@ def run_scene(
         if scene == "scene1":
             _run_scene1_task1(seed)
             rospy.loginfo("task1 动作流程结束。")
-            return
 
         if scene == "scene2":
             _run_scene2_task2(seed)
             rospy.loginfo("task2 动作流程结束。")
-            return
 
+        rospy.loginfo("任务动作已完成，ROS 节点将保持运行；按 Ctrl+C 退出。")
         rospy.spin()
     finally:
         _stop_scene_services(services)
@@ -431,12 +394,6 @@ def main():
         "--timeout", type=int, default=120, help="等待仿真就绪的超时时间，单位秒"
     )
     parser.add_argument(
-        "--time-limit",
-        type=float,
-        default=None,
-        help="比赛时长，单位秒；默认读取 CHALLENGE_TIME_LIMIT，未设置则不限时",
-    )
-    parser.add_argument(
         "--no-timer-gui",
         action="store_true",
         help="不弹出计时器窗口，仅保留后台计时日志",
@@ -449,7 +406,6 @@ def main():
             seed=args.seed,
             node_name=args.node_name,
             timeout=args.timeout,
-            time_limit=args.time_limit,
             timer_gui=not args.no_timer_gui,
         )
     except KeyboardInterrupt:

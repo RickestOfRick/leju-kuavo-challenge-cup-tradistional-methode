@@ -1,26 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <launch>
-  <arg name="seed" default="0"/>
   <arg name="start_rqt" default="false"/>
-  <arg name="vision_mode" default="0"/>
   <arg name="instance_naming_method" default="relative_position"/>
-  <arg name="start_depth_xy" default="$(eval int(arg('vision_mode')) in (1, 2))"/>
   <arg name="config" default="$(find task2_vision)/config/scene2_task2_vision.yaml"/>
 
-  <node name="task2_vision" pkg="task2_vision" type="task2_vision_node.py" output="screen">
-    <rosparam command="load" file="$(arg config)"/>
-    <param name="seed" value="$(arg seed)"/>
-    <param name="vision_mode" value="$(arg vision_mode)"/>
-    <param name="instance_naming_method" value="$(arg instance_naming_method)"/>
-  </node>
-
-  <node if="$(arg start_depth_xy)"
-        name="task2_depth_xy"
+  <node name="task2_depth_xy"
         pkg="task2_vision"
         type="task2_depth_xy_node.py"
         output="screen">
     <rosparam command="load" file="$(arg config)"/>
-    <param name="vision_mode" value="$(arg vision_mode)"/>
     <param name="instance_naming_method" value="$(arg instance_naming_method)"/>
   </node>
 

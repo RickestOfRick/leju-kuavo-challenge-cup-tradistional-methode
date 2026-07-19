@@ -12,10 +12,10 @@ if PACKAGE_SRC not in sys.path:
     sys.path.insert(0, PACKAGE_SRC)
 
 from task2_vision.yolo_detection import (
-    assign_fitted_detection_names,
     build_task2_detections,
     has_complete_task2_detections,
     normalize_model_names,
+    remap_fitted_detections_by_assignment,
     task2_detection_counts,
 )
 
@@ -80,33 +80,42 @@ class Task2YoloDetectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_model_names({0: "a", 1: "b", 2: "c"})
 
-    def test_relative_position_names_are_assigned_before_aggregation(self):
+    def test_assignment_rekeys_detection_and_fit_together(self):
         detections, fits = self._complete_detection_and_fit_maps()
-        _, remapped, assigned = assign_fitted_detection_names(
-            detections, fits, "relative_position"
+        remapped_detections, remapped_fits = remap_fitted_detections_by_assignment(
+            detections,
+            fits,
+            {
+                "part_type_b_1": "part_type_b_2",
+                "part_type_b_2": "part_type_b_1",
+            },
+            "yaw_prior",
         )
-        self.assertTrue(assigned)
-        self.assertEqual(remapped["part_type_a_1"]["token"], "part_type_a_2")
-        self.assertEqual(remapped["part_type_b_1"]["token"], "part_type_b_2")
-        self.assertEqual(remapped["part_type_c_1"]["token"], "part_type_c_1")
+        self.assertEqual(
+            remapped_detections["part_type_b_1"]["detection_name"],
+            "part_type_b_2",
+        )
+        self.assertEqual(remapped_fits["part_type_b_1"]["token"], "part_type_b_2")
+        self.assertEqual(remapped_fits["part_type_b_2"]["token"], "part_type_b_1")
 
-    def test_yaw_prior_names_follow_fitted_yaw_not_box_order(self):
+    def test_failed_a_does_not_block_b_and_c_assignment(self):
         detections, fits = self._complete_detection_and_fit_maps()
-        yaw_pairs = {
-            "part_type_a": (0.82, 0.05),
-            "part_type_b": (0.72, -0.35),
-            "part_type_c": (1.5707963267948966 - 0.55, 1.5707963267948966 + 0.22),
-        }
-        for class_name, values in yaw_pairs.items():
-            fits[class_name + "_1"]["yaw"] = values[0]
-            fits[class_name + "_2"]["yaw"] = values[1]
-        _, remapped, assigned = assign_fitted_detection_names(
-            detections, fits, "yaw_prior"
+        fits["part_type_a_1"] = {"accepted": False, "token": "failed_a1"}
+        fits["part_type_a_2"] = {"accepted": False, "token": "failed_a2"}
+        _, remapped = remap_fitted_detections_by_assignment(
+            detections,
+            fits,
+            {
+                "part_type_b_1": "part_type_b_2",
+                "part_type_b_2": "part_type_b_1",
+                "part_type_c_1": "part_type_c_2",
+                "part_type_c_2": "part_type_c_1",
+            },
+            "yaw_prior",
         )
-        self.assertTrue(assigned)
-        self.assertEqual(remapped["part_type_a_1"]["token"], "part_type_a_2")
         self.assertEqual(remapped["part_type_b_1"]["token"], "part_type_b_2")
         self.assertEqual(remapped["part_type_c_1"]["token"], "part_type_c_2")
+        self.assertEqual(remapped["part_type_a_1"]["token"], "failed_a1")
 
 
 if __name__ == "__main__":

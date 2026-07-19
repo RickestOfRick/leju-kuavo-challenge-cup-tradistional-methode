@@ -25,7 +25,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     arguments = parser.parse_args(rospy.myargv()[1:])
     rospy.init_node("task2_motion")
-    raise SystemExit(0 if run_scene2_task(arguments.seed) else 1)
+    if not run_scene2_task(arguments.seed):
+        raise SystemExit(1)
+    rospy.loginfo("task2: action complete; keeping ROS node alive until shutdown")
+    rospy.spin()
 
 
 if __name__ == "__main__":

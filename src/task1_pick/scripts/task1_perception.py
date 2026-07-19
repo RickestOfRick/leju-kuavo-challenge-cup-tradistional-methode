@@ -245,30 +245,11 @@ def _build_used_payload(samples, required_names, frame_id):
                 source_objects.append(obj)
 
         selected = dict(source_objects[-1]) if source_objects else {"name": name}
-        truth_positions = []
-        for obj in source_objects:
-            try:
-                truth_position = [
-                    float(value) for value in obj.get("truth_position", [])[:3]
-                ]
-            except Exception:
-                continue
-            if len(truth_position) == 3:
-                truth_positions.append(truth_position)
-
         selected["position"] = position
         selected["used_for_task"] = True
         selected["median_sample_count"] = sum(
             1 for _, result in samples if name in result
         )
-        if truth_positions:
-            truth_position = [
-                float(statistics.median(values)) for values in zip(*truth_positions)
-            ]
-            selected["truth_position"] = truth_position
-            selected["truth_position_error"] = math.sqrt(
-                sum((position[i] - truth_position[i]) ** 2 for i in range(3))
-            )
         selected_objects.append(selected)
 
     return {
@@ -359,15 +340,10 @@ def init_from_task1_vision():
                 len(samples),
             )
             for obj in used_payload["objects"]:
-                error = obj.get("truth_position_error")
-                error_text = (
-                    "n/a" if error is None else "{:.1f} mm".format(error * 1000.0)
-                )
                 rospy.loginfo(
-                    "task1: vision median %s=%s truth error=%s",
+                    "task1: vision median %s=%s",
                     obj["name"],
                     _fmt(obj["position"]),
-                    error_text,
                 )
             rospy.loginfo(
                 "task1: vision_to_ik offset=%s", _fmt(_vision_to_ik_offset)

@@ -14,7 +14,6 @@ def create_target_session(request, base_payload, required_samples):
     return {
         "request_id": str(request["request_id"]),
         "name": str(request["name"]),
-        "ground_truth_name": str(request["ground_truth_name"]),
         "class_name": str(request["class_name"]),
         "expected_position": [
             float(value) for value in request["expected_position"]

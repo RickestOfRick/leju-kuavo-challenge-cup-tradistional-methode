@@ -3,31 +3,24 @@
 
 import math
 
-# 独立运行 task2_motion 时默认使用完整真值；统一入口会按模式覆盖该话题。
-VISION_TOPIC = "/task2_vision/objects_json"
-VISION_TRUTH_TOPIC = "/task2_vision/objects_json"
+# 独立运行 task2_motion 时默认使用 YOLO+RGB-D/CAD 输出。
+VISION_TOPIC = "/task2_depth_xy/objects_json"
 VISION_FRAME_ID = "base_link"
 VISION_FIT_COORDINATE_REFERENCE = "current_base_link"
 # 视觉等待使用 /sensors_data_raw.sensor_time：先告警，达到硬超时才中断。
 VISION_WARN_TIME = 60.0
-VISION_TIMEOUT = 180.0
+VISION_TIMEOUT = 240.0
 VISION_MIN_CONFIDENCE = 0.0
 VISION_ALLOWED_POSITION_SOURCES = [
-    "challenge_secret_layout_ground_truth",
-    "qpos_bbox_depth_table_plane_xy_fit",
-    "qpos_bbox_cad_depth_render_xy_fit",
-    "qpos_bbox_region_depth_gn_xy_fit",
-    "qpos_bbox_region_depth_xyz_yaw_fit",
     "yolo_bbox_region_depth_xyz_yaw_fit",
     "handoff_full_yaw_rgbd_cad_fit",
-    "yolo_depth_pose",
 ]
 
 # 数采脚本中的默认顺序；可通过下方开关恢复原动态优先级。
 SORTING_OBJECT_ORDER = [
     "part_type_a_1",
-    "part_type_b_1",
     "part_type_a_2",
+    "part_type_b_1",
     "part_type_b_2",
     "part_type_c_1",
     "part_type_c_2",
@@ -47,19 +40,19 @@ GRASP_OFFSETS_BASE = {
         "right": [0.0410907, -0.030345481, 0.05],
     },
     "part_type_b_1": {
-        "left": [0.013787454, 0.010857956, 0.05],
+        "left": [0.020787454, 0.010857956, 0.05],
         "right": [0.021181181, -0.012286934, 0.05],
     },
     "part_type_b_2": {
         "left": [0.012518057, 0.026593847, 0.05],
-        "right": [0.020924211, -0.003111904, 0.05],
+        "right": [0.020924211, -0.013111904, 0.05],
     },
     "part_type_c_1": {
         "left": [0.01564838, 0.044912331, 0.03],
         "right": [0.014123567, 0.017335653, 0.03],
     },
     "part_type_c_2": {
-        "left": [0.018856999, 0.035554725, 0.03],
+        "left": [0.018856999, 0.039554725, 0.03],
         "right": [0.014369873, 0.036029480, 0.03],
     },
 }
@@ -176,7 +169,7 @@ HANDOFF_RELOCALIZATION_REQUEST_TOPIC = "/task2_depth_xy/handoff_relocalize_reque
 HANDOFF_RELOCALIZATION_RESULT_TOPIC = "/task2_depth_xy/handoff_relocalize_result"
 # 交接重新视觉检测使用相同的仿真时间软告警/硬超时规则。
 HANDOFF_RELOCALIZATION_WARN_TIME = 60.0
-HANDOFF_RELOCALIZATION_TIMEOUT = 180.0
+HANDOFF_RELOCALIZATION_TIMEOUT = 240.0
 
 # 新交接配置：pre_place_position/place_position/place_pose 为给出手的绝对目标。
 # A/C 的接手 pre/grasp 偏移相对给手 place 实测 FK。
@@ -185,7 +178,7 @@ HANDOFF_RELOCALIZATION_TIMEOUT = 180.0
 # 正数=先 open 给手；0=同时切换；负数=先 close 接手，再 open 给手。
 # 调度器使用 /sensors_data_raw.sensor_time 计时，不受仿真实时率影响。
 HANDOFF_RECEIVER_CLOSE_DELAY_BY_CLASS = {
-    "part_type_a": 0.05,
+    "part_type_a": 0.045,
     "part_type_c": -0.08,
 }
 

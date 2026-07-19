@@ -1,22 +1,11 @@
-# 模式由 launch 覆盖：0=真值，1=qpos框+RGB-D/CAD，2=YOLO框+RGB-D/CAD。
-# 真值在整个场景实例中保持不变，低频重复发布便于后启动的订阅者读取。
+# Task2 固定使用 YOLO 类别框 + RGB-D/CAD 拟合 base_link XYZ/yaw。
 publish_hz: 2.0
-# 使用机器人浮动基座的 qpos，将 world 真值转换到 base_link。
-qpos_topic: /mujoco/qpos
-robot_base_qpos_addr: 0
-qpos_timeout: 20.0
-# qpos 工件碰撞几何投影到头部 RGB 图像时使用的相机信息和 TF。
+# 头部 RGB-D 相机信息和 TF。
 camera_info_topic: /cam_h/color/camera_info
 camera_frame_id: "Head Camera View"
 head_image_topic: /cam_h/color/image_raw/compressed
 tf_timeout: 0.02
-# 覆盖 mesh 边缘的抗锯齿像素，避免渲染轮廓刚好落到框外。
-bbox_padding_pixels: 2.0
-
-# qpos 框只用于生成每个物体的深度 ROI；拟合结果发布到
-# /task2_depth_xy/objects_json，不覆盖原真值话题。
-truth_objects_topic: /task2_vision/objects_json
-# 模式 2 的三类别 YOLO 推理。相对路径以 task2_vision 包根目录为准。
+# 三类别 YOLO 推理。相对路径以 task2_vision 包根目录为准。
 yolo_model_path: models/task2_parts_best.pt
 yolo_confidence_threshold: 0.25
 yolo_iou_threshold: 0.70
@@ -28,6 +17,8 @@ color_image_topic: /cam_h/color/image_raw/compressed
 depth_xy_publish_hz: 2.0
 depth_min_m: 0.15
 depth_max_m: 3.0
+# CAD 只读取 task2_vision 包内自带的工件网格定义和资产。
+cad_model_xml: package://task2_vision/models/cad/scene2_parts.xml
 
 # 所有绿色像素都视为桌面并从物体前景中严格排除。HSV 使用 OpenCV 范围：
 # H=0..179，S/V=0..255；膨胀 1 px 同时去掉绿色抗锯齿边缘。
@@ -69,7 +60,7 @@ cad_yaw_prior_window_deg: 20.0
 cad_yaw_prior_window_step_deg: 5.0
 # 交接释放后的指定物体重定位不使用类别 yaw 先验，覆盖完整 360 degree。
 handoff_full_yaw_step_deg: 10.0
-# 模式 2 交接重定位不重新运行 YOLO；固定 ROI 从旧框 2 行 3 列的下排中格
+# 交接重定位不重新运行 YOLO；固定 ROI 从旧框 2 行 3 列的下排中格
 # 向左移动半个框宽。
 # 顺序为归一化 [center_x, center_y, width, height]。
 handoff_relocalization_fixed_roi: [0.4166666667, 0.7425, 0.1666666667, 0.205]
@@ -111,7 +102,7 @@ cad_gn_minimum_iou: 0.30
 # A/B 的细小或暗色轮廓更容易被绿色边缘、反光和深度量化侵蚀；C 保持严格门限，
 # 防止只匹配手柄或杆。拒绝结果仍会发布到 RQT，但不会计入 5 帧。
 cad_gn_minimum_bidirectional_coverage_by_class:
-  part_type_a: 0.25
+  part_type_a: 0.225
   part_type_b: 0.30
   part_type_c: 0.45
 cad_gn_minimum_iou_by_class:

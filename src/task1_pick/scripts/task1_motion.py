@@ -64,8 +64,6 @@ from task1_config import (
     STRICT_IK_ORIENTATION_TOL,
     STRICT_IK_POSITION_TOL,
     STRICT_PATH_MAX_JOINT_STEP_DEG,
-    STRICT_R6_IK_POSITION_TOL,
-    STRICT_R6_PATH_INTERMEDIATE_POINTS,
     STRICT_TRAJECTORY_MOVE_TIME,
     TOPIC_TIMEOUT,
     TRACE_FILE,
@@ -73,8 +71,8 @@ from task1_config import (
     WEIGH_DEBUG_FIXED_RELEASE_ENABLED,
     WEIGH_DEBUG_FIXED_RELEASE_TIME,
     WEIGH_FINAL_DESCEND_MOVE_TIME,
-    WEIGH_REGRASP_R6_OFFSET,
-    WEIGH_REGRASP_USE_STRICT_R6_IK,
+    WEIGH_REGRASP_EEF_OFFSET,
+    WEIGH_REGRASP_PATH_INTERMEDIATE_POINTS,
     WEIGH_REGRASP_XY,
     WEIGH_RELEASE_IK,
     WEIGH_TRANSIT_Z,
@@ -638,21 +636,9 @@ def solve_ik_one_hand_strict_multi(
     side,
     pos,
     quat,
-    use_right_r6_offset=False,
-    right_r6_offset=None,
-    right_q7_lock_value=None,
     execute_temporary=None,
 ):
     """优先调用严格多参考 IK，失败时仅将求解器降级为软 IK。"""
-    if right_r6_offset is None:
-        right_r6_offset = [0.0, 0.0, 0.0]
-    if len(right_r6_offset) != 3:
-        raise ValueError("right_r6_offset must contain [x, y, z]")
-    if use_right_r6_offset and side != "right":
-        raise ValueError("right-r6 strict IK is only valid for the right arm")
-    if use_right_r6_offset and right_q7_lock_value is None:
-        raise ValueError("right-r6 strict IK requires right_q7_lock_value")
-
     fk = call_fk(cur_joints, TOPIC_TIMEOUT)
     req = twoArmHandPoseCmd()
     req.frame = 2
@@ -665,17 +651,9 @@ def solve_ik_one_hand_strict_multi(
     params.minor_feasibility_tol = 1e-3
     params.major_iterations_limit = STRICT_IK_MAJOR_ITERATIONS_LIMIT
     params.oritation_constraint_tol = STRICT_IK_ORIENTATION_TOL
-    params.pos_constraint_tol = (
-        STRICT_R6_IK_POSITION_TOL if use_right_r6_offset else STRICT_IK_POSITION_TOL
-    )
+    params.pos_constraint_tol = STRICT_IK_POSITION_TOL
     params.pos_cost_weight = 0.0
     params.constraint_mode = IK_MODE_POS_HARD_ORI_HARD
-    params.use_right_r6_offset = bool(use_right_r6_offset)
-    params.lock_right_q7 = bool(use_right_r6_offset)
-    params.right_q7_lock_value = (
-        float(right_q7_lock_value) if use_right_r6_offset else 0.0
-    )
-    params.right_r6_offset = [float(value) for value in right_r6_offset]
     req.ik_param = params
 
     req.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
@@ -687,12 +665,11 @@ def solve_ik_one_hand_strict_multi(
     req.hand_poses.right_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
     req.hand_poses.right_pose.joint_angles = list(cur_joints[7:14])
 
-    if not use_right_r6_offset:
-        target = (
-            req.hand_poses.left_pose if side == "left" else req.hand_poses.right_pose
-        )
-        target.pos_xyz = list(pos)
-        target.quat_xyzw = list(quat)
+    target = (
+        req.hand_poses.left_pose if side == "left" else req.hand_poses.right_pose
+    )
+    target.pos_xyz = list(pos)
+    target.quat_xyzw = list(quat)
 
     service_name = "/ik/two_arm_hand_pose_cmd_srv_muli_refer"
     strict_error = ""
@@ -704,29 +681,6 @@ def solve_ik_one_hand_strict_multi(
         strict_error = getattr(response, "error_reason", "") or "no 14-joint result"
     except (rospy.ROSException, rospy.ServiceException) as exc:
         strict_error = str(exc) or type(exc).__name__
-
-    if use_right_r6_offset:
-        # r6 与末端是固定连接；保持当前姿态时，两者的世界坐标平移量相同。
-        soft_pos = [
-            float(fk.right_pose.pos_xyz[index]) + float(right_r6_offset[index])
-            for index in range(3)
-        ]
-        soft_quat = list(fk.right_pose.quat_xyzw)
-        rospy.logwarn(
-            "task1: [STRICT R6 FALLBACK] hard IK failed (%s); this waypoint "
-            "uses soft EEF IK 0x06 target=%s, MPC+WBC remains enabled, "
-            "q7 is no longer guaranteed to stay locked",
-            strict_error,
-            _fmt(soft_pos),
-        )
-        return solve_ik_one_hand(
-            cur_joints,
-            "right",
-            soft_pos,
-            soft_quat,
-            constraint_mode=IK_MODE_THREE_POINT_MIXED,
-            execute_temporary=execute_temporary,
-        )
 
     rospy.logwarn(
         "task1: %s hard IK failed (%s); fallback to soft IK 0x06 for target=%s; "
@@ -745,59 +699,10 @@ def solve_ik_one_hand_strict_multi(
     )
 
 
-def solve_right_r6_offset_path(
-    start_joints, offset_xyz, locked_q7, execute_temporary=None
-):
-    """优先锁定 q7 求解 r6 路径；严格 IK 失败的路径点允许软 IK 降级。"""
-    offset_xyz = [float(value) for value in offset_xyz]
-    if len(offset_xyz) != 3:
-        raise ValueError("r6 path offset must contain [x, y, z]")
-    waypoint_count = STRICT_R6_PATH_INTERMEDIATE_POINTS + 1
-    origin_joints = list(start_joints)
-    previous = list(start_joints)
-    path = []
-
-    for index in range(waypoint_count):
-        cumulative_offset = [
-            value * (index + 1) / waypoint_count for value in offset_xyz
-        ]
-        solved = solve_ik_one_hand_strict_multi(
-            origin_joints,
-            "right",
-            None,
-            None,
-            use_right_r6_offset=True,
-            right_r6_offset=cumulative_offset,
-            right_q7_lock_value=locked_q7,
-            execute_temporary=execute_temporary,
-        )
-        max_joint_step_deg = max(
-            abs(math.degrees(solved[joint] - previous[joint])) for joint in range(14)
-        )
-        if max_joint_step_deg > STRICT_PATH_MAX_JOINT_STEP_DEG:
-            rospy.logwarn(
-                "task1: strict r6 waypoint %d/%d branch jump: %.1f deg > %.1f deg; continuing",
-                index + 1,
-                waypoint_count,
-                max_joint_step_deg,
-                STRICT_PATH_MAX_JOINT_STEP_DEG,
-            )
-        rospy.loginfo(
-            "task1: strict r6 waypoint %d/%d offset=%s max joint step=%.1f deg",
-            index + 1,
-            waypoint_count,
-            _fmt(cumulative_offset, 3),
-            max_joint_step_deg,
-        )
-        path.append(solved)
-        previous = solved
-    return path
-
-
 def solve_right_eef_offset_path_soft(
     start_joints, offset_xyz, execute_temporary=None
 ):
-    """按原累计偏移生成 EEF 软 IK 调试路径，不锁定 q7。"""
+    """按累计偏移生成当前启用的 EEF 软 IK 路径。"""
     offset_xyz = [float(value) for value in offset_xyz]
     if len(offset_xyz) != 3:
         raise ValueError("EEF path offset must contain [x, y, z]")
@@ -806,7 +711,7 @@ def solve_right_eef_offset_path_soft(
     origin_pose = call_fk(origin_joints, TOPIC_TIMEOUT).right_pose
     origin_pos = [float(value) for value in origin_pose.pos_xyz]
     target_quat = [float(value) for value in origin_pose.quat_xyzw]
-    waypoint_count = STRICT_R6_PATH_INTERMEDIATE_POINTS + 1
+    waypoint_count = WEIGH_REGRASP_PATH_INTERMEDIATE_POINTS + 1
     previous = list(origin_joints)
     path = []
 
@@ -1482,50 +1387,25 @@ def right_weigh_and_regrasp(
     if before_strict is not None:
         before_strict()
     current_q = list(release_stable_q)
-    if WEIGH_REGRASP_USE_STRICT_R6_IK:
-        locked_q7 = float(current_q[13])
-        trajectory_label = f"{parcel_name}_step6_strict_r6_regrasp"
-        fallback_executor = _make_soft_ik_temporary_executor(
-            arm_pub,
-            arm_hold,
-            "right",
-            trajectory_label,
-            move_time=STRICT_TRAJECTORY_MOVE_TIME,
-            settle=SETTLE_TIME,
-        )
-        rospy.loginfo(
-            "task1: %s strict r6 regrasp offset=%s m, lock q7=%.3f deg",
-            parcel_name,
-            _fmt(WEIGH_REGRASP_R6_OFFSET, 3),
-            math.degrees(locked_q7),
-        )
-        regrasp_path = solve_right_r6_offset_path(
-            current_q,
-            WEIGH_REGRASP_R6_OFFSET,
-            locked_q7,
-            execute_temporary=fallback_executor,
-        )
-    else:
-        trajectory_label = f"{parcel_name}_step6_soft_eef_regrasp"
-        fallback_executor = _make_soft_ik_temporary_executor(
-            arm_pub,
-            arm_hold,
-            "right",
-            trajectory_label,
-            move_time=STRICT_TRAJECTORY_MOVE_TIME,
-            settle=SETTLE_TIME,
-        )
-        rospy.logwarn(
-            "task1: %s debug regrasp uses direct soft EEF IK 0x06, "
-            "q7 unlocked, offset=%s m",
-            parcel_name,
-            _fmt(WEIGH_REGRASP_R6_OFFSET, 3),
-        )
-        regrasp_path = solve_right_eef_offset_path_soft(
-            current_q,
-            WEIGH_REGRASP_R6_OFFSET,
-            execute_temporary=fallback_executor,
-        )
+    trajectory_label = f"{parcel_name}_step6_soft_eef_regrasp"
+    fallback_executor = _make_soft_ik_temporary_executor(
+        arm_pub,
+        arm_hold,
+        "right",
+        trajectory_label,
+        move_time=STRICT_TRAJECTORY_MOVE_TIME,
+        settle=SETTLE_TIME,
+    )
+    rospy.loginfo(
+        "task1: %s regrasp uses soft EEF IK offset=%s m",
+        parcel_name,
+        _fmt(WEIGH_REGRASP_EEF_OFFSET, 3),
+    )
+    regrasp_path = solve_right_eef_offset_path_soft(
+        current_q,
+        WEIGH_REGRASP_EEF_OFFSET,
+        execute_temporary=fallback_executor,
+    )
     direct_disabled = False
     try:
         set_wbc_direct_mode(False)

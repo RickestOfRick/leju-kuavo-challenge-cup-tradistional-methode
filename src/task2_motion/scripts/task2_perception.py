@@ -23,13 +23,12 @@ from task2_config import (
     VISION_MIN_CONFIDENCE,
     VISION_TIMEOUT,
     VISION_TOPIC,
-    VISION_TRUTH_TOPIC,
     VISION_WARN_TIME,
 )
 
 
 class _SensorTimeClock:
-    """Track MuJoCo simulation time published with the raw sensor stream."""
+    """Track simulation time published with the raw sensor stream."""
 
     def __init__(self, topic="/sensors_data_raw"):
         self.topic = str(topic)
@@ -181,12 +180,9 @@ def _parse_object(item):
         orientation = _yaw_quaternion(yaw)
     if not all(math.isfinite(value) for value in position + orientation + [yaw]):
         return None
-    ground_truth_name = str(item.get("ground_truth_name", name))
-
     return {
         "name": name,
         "motion_name": name,
-        "ground_truth_name": ground_truth_name,
         "class_name": class_name,
         "position": position,
         "orientation": orientation,
@@ -200,7 +196,6 @@ def wait_for_task2_objects():
     """等待一帧带完整实例名的六工件输入并固定。"""
     motion_names = list(GRASP_OFFSETS_BASE)
     topic = rospy.get_param("~task2_vision_topic", VISION_TOPIC)
-    expected_mode = int(rospy.get_param("~task2_vision_mode", -1))
     expected_naming_method = str(
         rospy.get_param("~task2_instance_naming_method", "")
     )
@@ -233,35 +228,15 @@ def wait_for_task2_objects():
                 expected_frame,
             )
             continue
-        try:
-            payload_mode = int(payload.get("vision_mode", -1))
-        except (TypeError, ValueError):
+        coordinate_reference = str(payload.get("fit_coordinate_reference", ""))
+        if coordinate_reference != VISION_FIT_COORDINATE_REFERENCE:
             rospy.logwarn_throttle(
                 2.0,
-                "task2: ignore invalid vision mode=%s",
-                payload.get("vision_mode"),
+                "task2: ignore fit coordinate reference=%s, expected=%s",
+                coordinate_reference,
+                VISION_FIT_COORDINATE_REFERENCE,
             )
             continue
-        if expected_mode >= 0 and payload_mode != expected_mode:
-            rospy.logwarn_throttle(
-                2.0,
-                "task2: ignore vision mode=%s, expected=%d",
-                payload.get("vision_mode"),
-                expected_mode,
-            )
-            continue
-        if expected_mode in (1, 2):
-            coordinate_reference = str(
-                payload.get("fit_coordinate_reference", "")
-            )
-            if coordinate_reference != VISION_FIT_COORDINATE_REFERENCE:
-                rospy.logwarn_throttle(
-                    2.0,
-                    "task2: ignore fit coordinate reference=%s, expected=%s",
-                    coordinate_reference,
-                    VISION_FIT_COORDINATE_REFERENCE,
-                )
-                continue
         payload_naming_method = str(payload.get("instance_naming_method", ""))
         if (
             expected_naming_method
@@ -283,54 +258,12 @@ def wait_for_task2_objects():
         last_missing = [name for name in motion_names if name not in parsed]
         if not last_missing:
             rospy.loginfo("task2: fixed %d base_link object poses", len(parsed))
-            for name in motion_names:
-                observation = parsed[name]
-                rospy.loginfo(
-                    "task2: vision naming motion=%s ground_truth=%s",
-                    name,
-                    observation["ground_truth_name"],
-                )
             return parsed
 
     raise RuntimeError(
         "task2 vision timed out after {:.1f}s simulation time; missing {}".format(
             timeout, ", ".join(last_missing)
         )
-    )
-
-
-def _mode0_relocalized_object(source_observation, timeout, warning_time):
-    """Read the corresponding live truth object when the whole task uses mode 0."""
-    truth_name = str(
-        source_observation.get("ground_truth_name", source_observation["name"])
-    )
-    motion_name = str(source_observation["name"])
-    topic = str(rospy.get_param("~task2_truth_topic", VISION_TRUTH_TOPIC))
-    deadline = _SimulationDeadline(
-        timeout,
-        warning_time=warning_time,
-        label="task2 mode-0 handoff relocalization",
-    )
-    while not rospy.is_shutdown() and not deadline.expired():
-        try:
-            message = rospy.wait_for_message(topic, String, timeout=1.0)
-            payload = json.loads(message.data)
-        except Exception:
-            continue
-        if deadline.expired():
-            break
-        for item in payload.get("objects", []):
-            if str(item.get("ground_truth_name", item.get("name", ""))) != truth_name:
-                continue
-            renamed = dict(item)
-            renamed["name"] = motion_name
-            renamed["ground_truth_name"] = truth_name
-            observation = _parse_object(renamed)
-            if observation is not None:
-                return observation
-    raise RuntimeError(
-        "task2 mode-0 handoff relocalization timed out after {:.1f}s simulation "
-        "time for {}".format(timeout, motion_name)
     )
 
 
@@ -348,16 +281,6 @@ def relocalize_handoff_object(source_observation, expected_position):
             HANDOFF_RELOCALIZATION_WARN_TIME,
         )
     )
-    expected_mode = int(rospy.get_param("~task2_vision_mode", -1))
-    if expected_mode == 0:
-        return _mode0_relocalized_object(
-            source_observation, timeout, warning_time
-        )
-    if expected_mode not in (1, 2):
-        raise RuntimeError(
-            "task2 handoff relocalization requires vision mode 0, 1, or 2"
-        )
-
     expected = [float(value) for value in expected_position]
     if len(expected) != 3 or not all(math.isfinite(value) for value in expected):
         raise ValueError("handoff relocalization expected position must contain xyz")
@@ -379,14 +302,8 @@ def relocalize_handoff_object(source_observation, expected_position):
     request = {
         "request_id": request_id,
         "name": str(source_observation["name"]),
-        "ground_truth_name": str(
-            source_observation.get(
-                "ground_truth_name", source_observation["name"]
-            )
-        ),
         "class_name": str(source_observation["class_name"]),
         "expected_position": expected,
-        "vision_mode": expected_mode,
     }
     publisher = rospy.Publisher(request_topic, String, queue_size=1, latch=True)
     connection_deadline = time.monotonic() + min(3.0, timeout)

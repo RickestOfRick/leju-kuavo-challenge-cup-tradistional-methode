@@ -3,7 +3,7 @@
          type="task2_vision.rqt_task2_vision.Task2VisionPlugin"
          base_class_type="rqt_gui_py::Plugin">
     <description>
-      Displays task 2 qpos-projected category boxes on the head RGB image.
+      Displays task 2 YOLO category boxes and RGB-D/CAD poses.
     </description>
     <qtgui>
       <group>
@@ -11,7 +11,7 @@
       </group>
       <label>Task 2 Vision</label>
       <icon type="theme">camera-photo</icon>
-      <statustip>Displays task 2 qpos category boxes.</statustip>
+      <statustip>Displays task 2 RGB-D/CAD pose fitting.</statustip>
     </qtgui>
   </class>
 </library>

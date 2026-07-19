@@ -6,9 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   sensor_msgs
-  geometry_msgs
   tf2_ros
-  vision_msgs
 )
 
 catkin_python_setup()
@@ -19,13 +17,10 @@ catkin_package(
     rospy
     std_msgs
     sensor_msgs
-    geometry_msgs
     tf2_ros
-    vision_msgs
 )
 
 catkin_install_python(PROGRAMS
-  scripts/task2_vision_node.py
   scripts/task2_depth_xy_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

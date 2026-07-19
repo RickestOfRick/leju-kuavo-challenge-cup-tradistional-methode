@@ -69,77 +69,36 @@ source devel/setup.zsh
 ## 新增依赖
 
 ```bash
-sudo apt install ros-noetic-vision-msgs ros-noetic-tf2-sensor-msgs ros-noetic-compressed-depth-image-transport ros-noetic-compressed-image-transport ros-noetic-cv-bridge ros-noetic-depth-image-proc ros-noetic-image-geometry ros-noetic-image-transport ros-noetic-message-filters ros-noetic-pcl-conversions ros-noetic-pcl-ros ros-noetic-tf2-geometry-msgs ros-noetic-tf2-ros ros-noetic-tf2-eigen libeigen3-dev libceres-dev
+sudo apt install ros-noetic-vision-msgs ros-noetic-tf2-sensor-msgs ros-noetic-compressed-depth-image-transport ros-noetic-compressed-image-transport ros-noetic-cv-bridge ros-noetic-depth-image-proc ros-noetic-image-geometry ros-noetic-image-transport ros-noetic-message-filters ros-noetic-pcl-conversions ros-noetic-pcl-ros ros-noetic-tf2-geometry-msgs ros-noetic-tf2-ros ros-noetic-tf2-eigen libeigen3-dev libceres-dev -y
 
 pip install Ultralytics==8.4.95
 ```
 
 ## 注意
 
-### challenge_cup_simulator
-
-- `utils/challenge_sim_launcher.py` 当前启动流程不再调用源码完整性校验 `_verify_integrity()` 和反作弊监控 `_start_cheat_monitor()`；场景生成、随机物体初始化和计时器逻辑仍保留。
-
-### kuavo_msgs
-
-`msg/ikSolveParam.msg` 新增右臂 r6 严格 IK 参数：
-
-```text
-bool use_right_r6_offset
-bool lock_right_q7
-float64 right_q7_lock_value
-float64[3] right_r6_offset
-```
-
-这些字段用于指定 `zarm_r6_link` 的世界坐标增量，并在求解期间锁定 `zarm_r7_joint`。
-
-### motion_capture_ik
-
-`src/arms_ik_node.cpp` 新增右臂 r6 + q7 锁定求解分支：
-
-- 使用 Drake `InverseKinematics` 和 SNOPT 对 `zarm_r6_link` 添加严格位置、姿态约束；
-- 对 `zarm_r7_joint` 添加固定关节角约束；
-- 使用多组参考关节角分别求解，并按关节变化量、参考距离和末端误差选择结果；
-- 通过 `/ik/two_arm_hand_pose_cmd_srv_muli_refer` 返回 14 维双臂关节解和求解误差信息。
-
-### task1_vision
-
-拟合结果调取见 [task1_vision/README.md](src/task1_vision/README.md)。
-
 ### task2_vision
 
-支持模式 1 的 qpos 假框和模式 2 的三类别 YOLO 框，两者共用 RGB-D/CAD
-XYZ/yaw 拟合与 5 帧中位数锁定。RGB/depth 会检查时间差，相机 TF 按当前
+生产链路固定使用三类别 YOLO+RGB-D/CAD，使用 5 个完整帧锁定；交接后的
+重定位仍使用固定 ROI 与完整 360 度 RGB-D/CAD。RGB/depth 会检查时间差，相机 TF 按当前
 depth 帧时间戳查询；相机点通过 `base_link <- camera` TF 直接拟合并输出到当前
-`base_link`，不读取 MPC 或真值基座姿态做二次坐标转换。
+`base_link`。生产节点不订阅仿真真值接口。
 
-### data.py
+### task2_motion
 
-任务一, 二的yolo需要的bbox和类别数据自动采集脚本, 容器中直接python3运行即可, 需要主脚本部分函数, 需要task1/2_vision包
-
-### task2_motion问题
-
-目前的问题为: A类的交接为空接, 稳定性没有完全验证; C类的交接为放置后交接, 稳定性没有完全验证
 动作偏置参数都在task2_config.py中
 
 ## 运行
 
 ### 任务二
 
-seed  
-仅 A 交接：72、73、74  
-仅 C 交接：32、33、34  
-A 和 C 都交接：80、81、82
-
 ```bash
-catkin build kuavo_msgs task2_vision task2_motion challenge_cup_task_template
+catkin build kuavo_msgs challenge_cup_task_template
 source devel/setup.zsh
 rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 4
 
 source devel/setup.zsh
-rostopic echo /task2_vision/objects_json
+rostopic echo /task2_depth_xy/objects_json
 
-# 显示头部 RGB、YOLO A/B/C 框和 RGB-D/CAD 拟合结果
 rosrun rqt_gui rqt_gui --standalone task2_vision/Task2Vision
 ```
 
@@ -150,18 +109,8 @@ catkin build kuavo_msgs challenge_cup_task_template
 source devel/setup.zsh
 rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 14
 
-# 按 test.py 中 TASK_QUEUE 依次批量测试任务一、任务二
-source devel/setup.zsh
-python3 src/challenge_cup_task_template/scripts/test.py
-
 source devel/setup.zsh
 rosrun rqt_gui rqt_gui --standalone task1_vision/Task1Vision --args -h
-
-# task1/task2 自动数据采集；先在 data.py 顶部设置 DATA_TASK
-# task1 输出到 data/scene1_parcel_yolo
-# task2 输出到 data/scene2_parts_yolo，类别 A/B/C 对应 0/1/2
-source devel/setup.zsh
-python3 src/challenge_cup_task_template/scripts/data.py
 
 # 在 yolo/config.py 顶部设置 YOLO_TASK="task1" 或 "task2"
 python yolo/train.py
@@ -183,18 +132,12 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene2 --seed 3
 rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 ```
 
-设置比赛限时：
-
-```bash
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --time-limit 120
-```
-
-`--time-limit` 的单位是秒。设置后，到时会自动结束当前任务节点；不设置时长时只显示用时，不自动结束。
+任务入口默认只显示用时，不会因计时超时结束动作或 ROS 节点。
 
 不弹出计时器窗口：
 
 ```bash
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --time-limit 120 --no-timer-gui
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --no-timer-gui
 ```
 
 计时器窗口中的 `Stop Timer` 只冻结计时显示，便于裁判在任务完成后查看用时，不会杀死任务。
@@ -365,8 +308,8 @@ src/challenge_cup_simulator/models/biped_s52/xml/_scene_<scene>_active.xml
 计时器使用 `/sensors_data_raw.sensor_time`，即仿真时间，不受电脑性能、仿真卡顿或实时率变化影响。
 
 ```bash
-# 通过任务入口自动启动，120 秒到时结束任务
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --time-limit 120
+# 通过任务入口自动启动，只显示计时、不终止任务
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3
 
 # 已经启动仿真时，单独查看计时器
 rosrun challenge_cup_simulator sim_timer.py --time-limit 120

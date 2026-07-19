@@ -2,7 +2,7 @@
 <launch>
   <arg name="start_rqt" default="false"/>
   <arg name="rqt_camera" default="-h"/>
-  <arg name="vision_mode" default="0"/>
+  <arg name="vision_mode" default="1"/>
   <arg name="config" default="$(find task1_vision)/config/scene1_task1_vision.yaml"/>
 
   <node name="task1_vision" pkg="task1_vision" type="task1_vision_node.py" output="screen">

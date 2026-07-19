@@ -1,15 +1,13 @@
-# 任务一视觉模式由 launch 的 vision_mode 覆盖：0=qpos 假框，1=YOLO 部署框。
-vision_mode: 0
+# 任务一生产视觉固定使用 Mode 1：YOLO RGB 框 + RGB-D 顶面拟合。
+vision_mode: 1
 scene: scene1
 frame_id: base_link
-truth_frame_id: world
 output_frame_id: base_link
 base_frame_id: base_link
-qpos_topic: /mujoco/qpos
 publish_rate: 10.0
-# 使用 /sensors_data_raw.sensor_time；60s 只告警，180s 才结束视觉节点。
+# 使用 /sensors_data_raw.sensor_time；60s 只告警，240s 才结束视觉节点。
 startup_warn_time: 60.0
-startup_wait_timeout: 180.0
+startup_wait_timeout: 240.0
 
 # 头部 RGB-D 输入与坐标变换。
 head_image_topic: /cam_h/color/image_raw/compressed
@@ -33,12 +31,6 @@ yolo_half: false
 yolo_freeze_after_used_objects: true
 used_objects_topic: /task1_vision/used_objects_json
 
-# 模式 0 使用 qpos 生成假框；模式 1 中 qpos 只用于仿真误差显示。
-model_xml: ""
-robot_base_qpos_addr: 0
-mujoco_head_camera_pos: [0.121, 0.0, 0.0345]
-mujoco_head_camera_quat_wxyz: [0.612372, 0.353553, -0.353553, -0.612372]
-
 # 头部相机初始姿态。
 head_control:
   enabled: true
@@ -56,7 +48,7 @@ head_control:
   actual_pitch_index: -1
   actual_wait_timeout: 1.0
 
-# qpos 二维框内的深度点云与 RGB 颜色过滤。
+# YOLO 二维框内的深度点云与 RGB 颜色过滤。
 depth_min_m: 0.05
 depth_max_m: 4.0
 depth_roi_expand: 1.05
@@ -103,31 +95,23 @@ objects:
   - name: parcel_1
     class_id: 0
     class_name: parcel
-    qpos_joint: parcel_1
-    center_offset: [0.0, 0.0, 0.0]
     size: [0.045, 0.120, 0.100]
     color_rgba: [0.88, 0.84, 0.73, 0.55]
 
   - name: parcel_2
     class_id: 0
     class_name: parcel
-    qpos_joint: parcel_2
-    center_offset: [0.0, 0.0, 0.0]
     size: [0.045, 0.120, 0.100]
     color_rgba: [0.92, 0.78, 0.38, 0.55]
 
   - name: parcel_3
     class_id: 0
     class_name: parcel
-    qpos_joint: parcel_3
-    center_offset: [0.0, 0.0, 0.0]
     size: [0.045, 0.120, 0.100]
     color_rgba: [0.90, 0.55, 0.28, 0.55]
 
   - name: parcel_4
     class_id: 0
     class_name: parcel
-    qpos_joint: parcel_4
-    center_offset: [0.0, 0.0, 0.0]
     size: [0.045, 0.120, 0.100]
     color_rgba: [0.78, 0.84, 0.92, 0.55]

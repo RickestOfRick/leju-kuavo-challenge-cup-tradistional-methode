@@ -197,7 +197,7 @@ class GripperHold:
 
 
 class SimTimeTracker:
-    """跟踪 MuJoCo sensor_time，用墙钟超时仅防止仿真停止时永久阻塞。"""
+    """跟踪仿真 sensor_time，用墙钟超时仅防止仿真停止时永久阻塞。"""
 
     def __init__(self, topic="/sensors_data_raw"):
         from kuavo_msgs.msg import sensorsData

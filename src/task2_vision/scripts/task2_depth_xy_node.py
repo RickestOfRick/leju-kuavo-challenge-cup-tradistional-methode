@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Fit task 2 object XYZ/yaw from qpos or YOLO ROIs and RGB-D/CAD."""
+"""Fit task 2 object XYZ/yaw from YOLO ROIs and RGB-D/CAD."""
 
 import copy
 import json
 import math
 import os
-import struct
 import threading
 import time
 
@@ -18,12 +17,15 @@ import tf2_ros
 
 from task2_vision.cad_depth_alignment import CadDepthAligner
 from task2_vision.color_segmentation import green_table_mask
+from task2_vision.depth_image import (
+    DEFAULT_DEPTH_IMAGE_TOPIC,
+    decode_compressed_depth_m,
+)
 from task2_vision.layout import (
     CLASS_NAMES,
     INSTANCE_NAMING_RELATIVE_POSITION,
     INSTANCE_NAMING_YAW_PRIOR,
     OBJECT_NAMES,
-    assign_motion_names,
     joint_yaw_window_assignment,
     normalize_instance_naming_method,
     yaw_prior_candidates,
@@ -52,55 +54,16 @@ from task2_vision.target_relocalization import (
 )
 from task2_vision.yolo_detection import (
     Task2YoloDetector,
-    assign_fitted_detection_names,
     has_complete_task2_detections,
+    remap_fitted_detections_by_assignment,
     task2_detection_counts,
 )
 
 
 FRAME_ID = "base_link"
-POSE_SOURCE = "qpos_bbox_region_depth_xyz_yaw_fit"
 YOLO_POSE_SOURCE = "yolo_bbox_region_depth_xyz_yaw_fit"
 Z_POSITION_SOURCE = "table_plane_class_rest_pose"
 FIT_COORDINATE_REFERENCE = "current_base_link"
-DIAGNOSTIC_TRUTH_REFERENCE = "current_qpos_base_link_diagnostic"
-
-
-def _decode_compressed_depth(message):
-    raw = np.frombuffer(message.data, dtype=np.uint8)
-    if raw.size == 0:
-        raise ValueError("empty compressed depth message")
-    offsets = [12, 16, 0] if "compressedDepth" in message.format else [0, 12, 16]
-    image = None
-    for offset in offsets:
-        if raw.size <= offset:
-            continue
-        image = cv2.imdecode(raw[offset:], cv2.IMREAD_UNCHANGED)
-        if image is not None:
-            break
-    if image is None:
-        raise ValueError("compressed depth PNG decode failed")
-    if image.ndim == 3:
-        image = image[:, :, 0]
-
-    if "32FC1" in message.format and image.dtype == np.uint16:
-        if len(message.data) < 12:
-            raise ValueError("32FC1 compressedDepth header is incomplete")
-        depth_quant_a, depth_quant_b = struct.unpack("<ff", message.data[4:12])
-        raw_depth = image.astype(np.float32)
-        depth = np.zeros(raw_depth.shape, dtype=np.float32)
-        valid = raw_depth > 0.0
-        denominator = raw_depth[valid] - float(depth_quant_b)
-        denominator_valid = np.abs(denominator) > 1e-6
-        values = np.zeros_like(denominator, dtype=np.float32)
-        values[denominator_valid] = float(depth_quant_a) / denominator[
-            denominator_valid
-        ]
-        depth[valid] = values
-        return depth
-    if image.dtype == np.uint16:
-        return image.astype(np.float32) * 0.001
-    return image.astype(np.float32)
 
 
 def _decode_compressed_color(message):
@@ -244,24 +207,12 @@ def _fit_horizontal_plane_ransac(
 
 class Task2DepthXYNode:
     def __init__(self):
-        self.vision_mode = int(rospy.get_param("~vision_mode", 1))
-        if self.vision_mode not in (1, 2):
-            raise RuntimeError("task2_depth_xy only runs in task2 vision mode 1 or 2")
-        self.pose_source = POSE_SOURCE if self.vision_mode == 1 else YOLO_POSE_SOURCE
-        self.vision_mode_name = (
-            "rgbd_cad_pose"
-            if self.vision_mode == 1
-            else "yolo_bbox_rgbd_cad_pose"
-        )
         self.instance_naming_method = normalize_instance_naming_method(
             rospy.get_param("~instance_naming_method", "relative_position")
         )
-        self.truth_topic = str(
-            rospy.get_param("~truth_objects_topic", "/task2_vision/objects_json")
-        )
         self.depth_topic = str(
             rospy.get_param(
-                "~depth_image_topic", "/cam_h/depth/image_raw/compressedDepth"
+                "~depth_image_topic", DEFAULT_DEPTH_IMAGE_TOPIC
             )
         )
         self.camera_info_topic = str(
@@ -544,11 +495,14 @@ class Task2DepthXYNode:
         )
         self.random_seed = int(rospy.get_param("~depth_fit_random_seed", 42))
 
-        model_path = os.path.abspath(
-            str(rospy.get_param("legged_robot_scene_param", ""))
+        model_path = self._resolve_package_file(
+            rospy.get_param(
+                "~cad_model_xml",
+                "package://task2_vision/models/cad/scene2_parts.xml",
+            )
         )
         if not model_path or not os.path.isfile(model_path):
-            raise RuntimeError("MuJoCo scene XML is unavailable for CAD pose fitting")
+            raise RuntimeError("static CAD model XML is unavailable for pose fitting")
         self.model_vertices = load_body_visual_vertices(model_path, OBJECT_NAMES)
         self.model_triangles = load_body_visual_triangles(model_path, OBJECT_NAMES)
         self.model_triangles_by_geom = load_body_visual_triangles_by_geom(
@@ -661,7 +615,6 @@ class Task2DepthXYNode:
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-        self.latest_truth = None
         self.latest_depth = None
         self.latest_depth_frame = ""
         self.latest_depth_stamp = None
@@ -671,7 +624,6 @@ class Task2DepthXYNode:
         self.depth_sequence = 0
         self.processed_depth_sequence = -1
         self.camera_info = None
-        self.current_seed = None
         self.valid_samples = []
         self.locked_payload = None
         self.relocalization_lock = threading.Lock()
@@ -690,19 +642,15 @@ class Task2DepthXYNode:
         self.yolo_half = bool(rospy.get_param("~yolo_half", False))
         self.yolo_cached_color_sequence = -1
         self.yolo_cached_detections = []
-        if self.vision_mode == 2:
-            self.yolo_model_path = self._resolve_yolo_model_path()
-            if not os.path.isfile(self.yolo_model_path):
-                raise RuntimeError(
-                    "task2 vision mode 2 YOLO weights not found: {}".format(
-                        self.yolo_model_path
-                    )
+        self.yolo_model_path = self._resolve_yolo_model_path()
+        if not os.path.isfile(self.yolo_model_path):
+            raise RuntimeError(
+                "task2 vision YOLO weights not found: {}".format(
+                    self.yolo_model_path
                 )
-            self._ensure_yolo_detector()
+            )
+        self._ensure_yolo_detector()
 
-        self.truth_sub = rospy.Subscriber(
-            self.truth_topic, String, self._truth_callback, queue_size=1
-        )
         self.depth_sub = rospy.Subscriber(
             self.depth_topic, CompressedImage, self._depth_callback, queue_size=1
         )
@@ -723,11 +671,9 @@ class Task2DepthXYNode:
             queue_size=1,
         )
         rospy.loginfo(
-            "task2_depth_xy: truth=%s depth=%s color=%s "
-            "output=%s CAD samples=%d "
+            "task2_depth_xy: depth=%s color=%s output=%s CAD samples=%d "
             "region+depth GN iterations=%d green_hsv=%s..%s instance_naming=%s "
-            "vision_mode=%d yolo=%s",
-            self.truth_topic,
+            "yolo=%s",
             self.depth_topic,
             self.color_topic,
             rospy.resolve_name("~objects_json"),
@@ -736,9 +682,37 @@ class Task2DepthXYNode:
             self.green_hsv_lower,
             self.green_hsv_upper,
             self.instance_naming_method,
-            self.vision_mode,
             self.yolo_model_path or "disabled",
         )
+
+    @staticmethod
+    def _resolve_package_file(configured):
+        configured = os.path.expandvars(os.path.expanduser(str(configured).strip()))
+        if not configured:
+            raise RuntimeError("task2 vision package file path is empty")
+        if configured.startswith("package://"):
+            package_and_path = configured[len("package://") :].split("/", 1)
+            if len(package_and_path) != 2:
+                raise RuntimeError("invalid package path: {}".format(configured))
+            import rospkg
+
+            return os.path.abspath(
+                os.path.join(
+                    rospkg.RosPack().get_path(package_and_path[0]),
+                    package_and_path[1],
+                )
+            )
+        if os.path.isabs(configured):
+            return configured
+        try:
+            import rospkg
+
+            package_root = rospkg.RosPack().get_path("task2_vision")
+        except Exception:
+            package_root = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+            )
+        return os.path.abspath(os.path.join(package_root, configured))
 
     def _resolve_yolo_model_path(self):
         configured = str(
@@ -773,7 +747,7 @@ class Task2DepthXYNode:
         return os.path.abspath(os.path.join(package_root, configured))
 
     def _ensure_yolo_detector(self):
-        if self.vision_mode != 2 or self.yolo_detector is not None:
+        if self.yolo_detector is not None:
             return
         if not self.yolo_model_path or not os.path.isfile(self.yolo_model_path):
             raise RuntimeError(
@@ -808,7 +782,6 @@ class Task2DepthXYNode:
         )
         return {
             "name": pending["name"],
-            "ground_truth_name": pending["ground_truth_name"],
             "class_name": pending["class_name"],
             "bbox_center": [center_x * width, center_y * height],
             "bbox_size": [roi_width * width, roi_height * height],
@@ -834,26 +807,14 @@ class Task2DepthXYNode:
             payload = json.loads(message.data)
             request_id = str(payload["request_id"])
             name = str(payload["name"])
-            ground_truth_name = str(payload.get("ground_truth_name", name))
             class_name = str(payload["class_name"])
-            request_vision_mode = int(payload.get("vision_mode", self.vision_mode))
             expected_position = [
                 float(value) for value in payload["expected_position"]
             ]
             if name not in OBJECT_NAMES:
                 raise ValueError("unsupported object {}".format(name))
-            if ground_truth_name not in OBJECT_NAMES:
-                raise ValueError(
-                    "unsupported ground-truth object {}".format(ground_truth_name)
-                )
             if class_name not in CLASS_NAMES or not name.startswith(class_name + "_"):
                 raise ValueError("object/class mismatch")
-            if request_vision_mode != self.vision_mode:
-                raise ValueError(
-                    "request vision mode {} does not match node mode {}".format(
-                        request_vision_mode, self.vision_mode
-                    )
-                )
             if len(expected_position) != 3 or not all(
                 math.isfinite(value) for value in expected_position
             ):
@@ -868,7 +829,6 @@ class Task2DepthXYNode:
             {
                 "request_id": request_id,
                 "name": name,
-                "ground_truth_name": ground_truth_name,
                 "class_name": class_name,
                 "expected_position": expected_position,
             },
@@ -882,43 +842,25 @@ class Task2DepthXYNode:
             self.pending_relocalization = pending
             # Do not process the stale RGB-D frame retained from the initial lock.
             self.processed_relocalization_depth_sequence = self.depth_sequence
-        preview_fit = None
-        if self.vision_mode == 2:
-            preview_fit = self._handoff_roi_preview_fit(
-                self._handoff_fixed_roi_candidate(pending)
-            )
+        preview_fit = self._handoff_roi_preview_fit(
+            self._handoff_fixed_roi_candidate(pending)
+        )
         self._publish_handoff_relocalization_view(
             pending, preview_fit, "waiting", locked=False
         )
         rospy.loginfo(
             "task2_depth_xy: accepted handoff full-angle request id=%s "
-            "motion=%s truth=%s expected=%s",
+            "object=%s expected=%s",
             request_id,
             name,
-            ground_truth_name,
             [round(value, 4) for value in expected_position],
         )
-
-    def _truth_callback(self, message):
-        try:
-            payload = json.loads(message.data)
-        except Exception as exc:
-            rospy.logwarn_throttle(2.0, "task2_depth_xy: invalid truth JSON: %s", exc)
-            return
-        seed = payload.get("seed")
-        if self.current_seed is not None and seed != self.current_seed:
-            self.valid_samples = []
-            self.locked_payload = None
-            self.yolo_cached_color_sequence = -1
-            self.yolo_cached_detections = []
-        self.current_seed = seed
-        self.latest_truth = payload
 
     def _depth_callback(self, message):
         if self.locked_payload is not None and not self._has_pending_relocalization():
             return
         try:
-            self.latest_depth = _decode_compressed_depth(message)
+            self.latest_depth = decode_compressed_depth_m(message)
             self.latest_depth_frame = str(message.header.frame_id)
             self.latest_depth_stamp = message.header.stamp
             self.depth_sequence += 1
@@ -963,19 +905,6 @@ class Task2DepthXYNode:
             )
             return None
 
-    def _truth_objects(self, truth_payload=None):
-        payload = self.latest_truth if truth_payload is None else truth_payload
-        if payload is None:
-            return None
-        objects = {}
-        for item in payload.get("objects", []):
-            name = str(item.get("name", ""))
-            if name in OBJECT_NAMES and item.get("bbox_projected", False):
-                objects[name] = item
-        if any(name not in objects for name in OBJECT_NAMES):
-            return None
-        return objects
-
     def _raw_yolo_detections(self):
         if self.yolo_detector is None or self.latest_color is None:
             return None
@@ -1006,7 +935,7 @@ class Task2DepthXYNode:
             counts = task2_detection_counts(detections)
             rospy.logwarn_throttle(
                 1.0,
-                "task2_depth_xy: mode 2 requires two YOLO boxes per class, got %s",
+                "task2_depth_xy: requires two YOLO boxes per class, got %s",
                 counts,
             )
             return None
@@ -1014,24 +943,6 @@ class Task2DepthXYNode:
         if any(name not in by_name for name in OBJECT_NAMES):
             return None
         return by_name
-
-    def _detection_objects(self, truth_payload):
-        if self.vision_mode == 1:
-            return self._truth_objects(truth_payload)
-        return self._yolo_objects()
-
-    @staticmethod
-    def _diagnostic_truth_objects(truth_payload):
-        if truth_payload is None:
-            return None
-        objects = {
-            str(item.get("name", "")): item
-            for item in truth_payload.get("objects", [])
-            if len(item.get("position", [])) >= 3
-        }
-        if any(name not in objects for name in OBJECT_NAMES):
-            return None
-        return objects
 
     @staticmethod
     def _fit_in_current_base(fit):
@@ -1051,7 +962,7 @@ class Task2DepthXYNode:
             )
         return result
 
-    def _fit_table_plane(self, depth, truth_objects, intrinsics, transform):
+    def _fit_table_plane(self, depth, detection_objects, intrinsics, transform):
         height, width = depth.shape[:2]
         stride = self.table_stride
         pixels_v, pixels_u = np.mgrid[0:height:stride, 0:width:stride]
@@ -1070,7 +981,7 @@ class Task2DepthXYNode:
         )
         scale_x = float(width) / image_width
         scale_y = float(height) / image_height
-        for item in truth_objects.values():
+        for item in detection_objects.values():
             center = item["bbox_center"]
             size = item["bbox_size"]
             half_width = 0.5 * float(size[0]) * scale_x * self.table_roi_exclusion_scale
@@ -1288,7 +1199,7 @@ class Task2DepthXYNode:
         )
         return result
 
-    def _fit_xy_yaw_without_truth(
+    def _fit_xy_yaw(
         self,
         context,
         observed_points,
@@ -1456,52 +1367,50 @@ class Task2DepthXYNode:
         return final
 
     def _assign_output_motion_names(self, output_objects):
-        if self.vision_mode == 2:
-            for item in output_objects:
-                item["instance_naming_method"] = self.instance_naming_method
-            return output_objects, self.instance_naming_method
-        if self.instance_naming_method == INSTANCE_NAMING_RELATIVE_POSITION:
-            for item in output_objects:
-                item["instance_naming_method"] = INSTANCE_NAMING_RELATIVE_POSITION
-            return output_objects, INSTANCE_NAMING_RELATIVE_POSITION
+        for item in output_objects:
+            item["instance_naming_method"] = self.instance_naming_method
+        return output_objects, self.instance_naming_method
 
-        if not all("fit_yaw" in item for item in output_objects):
-            for item in output_objects:
-                item["instance_naming_method"] = (
-                    "relative_position_pending_yaw_prior"
+    def _assign_frame_names(
+        self, detection_objects, current_fits, frame_joint_assignments
+    ):
+        """Apply each class assignment independently before frame aggregation."""
+        source_to_motion_name = {}
+        for class_name in CLASS_NAMES:
+            class_objects = [
+                name
+                for name in OBJECT_NAMES
+                if detection_objects[name].get("class_name") == class_name
+            ]
+            decision = frame_joint_assignments.get(class_name, {})
+            if not decision.get("assignment"):
+                continue
+            if self.instance_naming_method == INSTANCE_NAMING_YAW_PRIOR:
+                source_to_motion_name.update(decision["assignment"])
+                continue
+            if self.instance_naming_method != INSTANCE_NAMING_RELATIVE_POSITION:
+                raise ValueError(
+                    "unsupported instance naming method {}".format(
+                        self.instance_naming_method
+                    )
                 )
-            return output_objects, "relative_position_pending_yaw_prior"
-
-        return (
-            assign_motion_names(output_objects, INSTANCE_NAMING_YAW_PRIOR),
-            INSTANCE_NAMING_YAW_PRIOR,
-        )
-
-    def _assign_mode2_frame_names(self, detection_objects, current_fits):
-        """Name every YOLO frame from its fitted pose before median collection."""
-        if self.vision_mode != 2:
-            return detection_objects, current_fits
-        remapped_detections, remapped_fits, assigned = (
-            assign_fitted_detection_names(
-                detection_objects, current_fits, self.instance_naming_method
+            ordered = sorted(
+                class_objects,
+                key=lambda name: float(current_fits[name]["xy"][1]),
+                reverse=class_name == "part_type_c",
             )
+            source_to_motion_name.update(
+                {
+                    source_name: "{}_{}".format(class_name, index)
+                    for index, source_name in enumerate(ordered, start=1)
+                }
+            )
+        return remap_fitted_detections_by_assignment(
+            detection_objects,
+            current_fits,
+            source_to_motion_name,
+            self.instance_naming_method,
         )
-        if not assigned:
-            return detection_objects, current_fits
-        return remapped_detections, remapped_fits
-
-    @staticmethod
-    def _mode2_diagnostic_item(detection, current_truth_item):
-        """Attach truth only after fitting, for RQT/test diagnostics."""
-        output = copy.deepcopy(current_truth_item)
-        output["detection_name"] = str(detection.get("detection_name", ""))
-        output["detection_confidence"] = float(detection.get("confidence", 0.0))
-        output["bbox_center"] = list(detection["bbox_center"])
-        output["bbox_size"] = list(detection["bbox_size"])
-        output["bbox_projected"] = True
-        output["bbox_source"] = "yolo_rgb"
-        output["detection_source"] = "yolo_rgb"
-        return output
 
     def _c_handle_mask(self, color_roi, foreground_mask):
         if color_roi is None or self.c_handle_aligner is None:
@@ -1622,11 +1531,7 @@ class Task2DepthXYNode:
         selected_local_u = local_u[valid][selected]
         selected_local_v = local_v[valid][selected]
         observed_depth[selected_local_v, selected_local_u] = depths[selected]
-        # Mode 2 CAD selection follows the truth-independent motion/detection
-        # name. ground_truth_name is retained only for RQT/test diagnostics.
         model_name = str(item["name"])
-        if self.vision_mode != 2:
-            model_name = str(item.get("ground_truth_name", model_name))
         minimum_overlap = self.cad_minimum_overlap_by_class.get(
             class_name, self.cad_minimum_overlap_ratio
         )
@@ -1658,7 +1563,7 @@ class Task2DepthXYNode:
             "handle_depth": handle_depth,
             "yaw_prior_frame_offset": float(yaw_prior_frame_offset),
         }
-        pose_fit = self._fit_xy_yaw_without_truth(
+        pose_fit = self._fit_xy_yaw(
             context,
             selected_points,
             observed_center,
@@ -1668,7 +1573,7 @@ class Task2DepthXYNode:
         if pose_fit is None:
             return {
                 "accepted": False,
-                "rejection_reason": "truth_independent_xy_yaw_fit_failed",
+                "rejection_reason": "xy_yaw_fit_failed",
             }
         alignment = pose_fit["alignment"]
         fitted_yaw = float(pose_fit["yaw"])
@@ -1946,31 +1851,18 @@ class Task2DepthXYNode:
         )
         return result
 
-    def _make_output_object(
-        self, truth_item, reference_item, fit, locked, fit_status
-    ):
-        output = copy.deepcopy(truth_item)
-        output["current_truth_position"] = [
-            float(value) for value in truth_item["position"]
-        ]
-        output["current_truth_yaw"] = float(truth_item.get("yaw", 0.0))
-        output["truth_position"] = [
-            float(value) for value in reference_item["position"]
-        ]
-        output["truth_yaw"] = float(reference_item.get("yaw", 0.0))
-        output["truth_yaw_deg"] = math.degrees(output["truth_yaw"])
-        output["truth_orientation"] = copy.deepcopy(
-            reference_item.get("orientation", [])
-        )
+    def _make_output_object(self, source_item, fit, locked, fit_status):
+        output = copy.deepcopy(source_item)
+        name = str(source_item["name"])
+        output["motion_name"] = name
         output["position"] = []
         output["orientation"] = []
-        output["truth_reference"] = DIAGNOSTIC_TRUTH_REFERENCE
         output["fit_coordinate_reference"] = FIT_COORDINATE_REFERENCE
-        output["position_source"] = self.pose_source
-        output["xy_position_source"] = self.pose_source
+        output["position_source"] = YOLO_POSE_SOURCE
+        output["xy_position_source"] = YOLO_POSE_SOURCE
         output["z_position_source"] = Z_POSITION_SOURCE
-        output["yaw_source"] = self.pose_source
-        output["orientation_source"] = self.pose_source
+        output["yaw_source"] = YOLO_POSE_SOURCE
+        output["orientation_source"] = YOLO_POSE_SOURCE
         output["fit_method"] = "pca_cad_region_depth_xy_yaw_fit"
         output["fit_valid"] = False
         output["confidence"] = 0.0
@@ -1991,7 +1883,7 @@ class Task2DepthXYNode:
 
         median_xy = np.asarray(fit["xy"], dtype=np.float64)
         accepted_xy = np.asarray(
-            [sample[truth_item["name"]]["xy"] for sample in self.valid_samples],
+            [sample[name]["xy"] for sample in self.valid_samples],
             dtype=np.float64,
         )
         deviations = (
@@ -2005,11 +1897,6 @@ class Task2DepthXYNode:
             float(fit["z"]),
         ]
         fit_yaw = float(fit["yaw"])
-        position_error = [
-            fit_position[index] - float(reference_item["position"][index])
-            for index in range(3)
-        ]
-        yaw_error = angle_difference(fit_yaw, output["truth_yaw"])
         output["fit_position"] = fit_position
         output["fit_yaw"] = fit_yaw
         output["fit_yaw_deg"] = math.degrees(fit_yaw)
@@ -2023,11 +1910,6 @@ class Task2DepthXYNode:
         output["confidence"] = 1.0 if locked else 0.0
         output["fit_xy_mad_m"] = float(np.median(deviations))
         output["fit_z"] = float(fit["z"])
-        output["x_error_m"] = float(position_error[0])
-        output["y_error_m"] = float(position_error[1])
-        output["z_error_m"] = float(position_error[2])
-        output["yaw_error_rad"] = float(yaw_error)
-        output["yaw_error_deg"] = math.degrees(yaw_error)
         output["fit_pixel_center"] = fit.get("fit_pixel_center", [])
         output["foreground_pixel_center"] = fit.get(
             "foreground_pixel_center", []
@@ -2129,16 +2011,6 @@ class Task2DepthXYNode:
         )
         return output
 
-    def _handoff_target_truth_item(self, pending):
-        payload = self.latest_truth or {}
-        for item in payload.get("objects", []):
-            ground_truth_name = str(
-                item.get("ground_truth_name", item.get("name", ""))
-            )
-            if ground_truth_name == pending["ground_truth_name"]:
-                return copy.deepcopy(item)
-        return None
-
     @staticmethod
     def _base_handoff_target_object(pending):
         for item in pending["base_payload"].get("objects", []):
@@ -2152,44 +2024,11 @@ class Task2DepthXYNode:
     def _handoff_target_update(self, pending, fit, locked):
         output = self._base_handoff_target_object(pending)
         for key in list(output):
-            if key.startswith("fit_") or key in (
-                "x_error_m",
-                "y_error_m",
-                "z_error_m",
-                "yaw_error_rad",
-                "yaw_error_deg",
-            ):
-                output.pop(key, None)
-        truth_item = self._handoff_target_truth_item(pending)
-        if truth_item is not None and len(truth_item.get("position", [])) >= 3:
-            truth_position = [
-                float(value) for value in truth_item["position"][:3]
-            ]
-            truth_yaw = float(truth_item.get("yaw", 0.0))
-            output["current_truth_position"] = list(truth_position)
-            output["current_truth_yaw"] = truth_yaw
-            output["truth_position"] = list(truth_position)
-            output["truth_yaw"] = truth_yaw
-            output["truth_yaw_deg"] = math.degrees(truth_yaw)
-            output["truth_orientation"] = copy.deepcopy(
-                truth_item.get("orientation", [])
-            )
-        else:
-            truth_position = []
-            truth_yaw = 0.0
-            for key in (
-                "current_truth_position",
-                "current_truth_yaw",
-                "truth_position",
-                "truth_yaw",
-                "truth_yaw_deg",
-                "truth_orientation",
-            ):
+            if key.startswith("fit_"):
                 output.pop(key, None)
 
         output["name"] = pending["name"]
         output["motion_name"] = pending["name"]
-        output["ground_truth_name"] = pending["ground_truth_name"]
         output["class_name"] = pending["class_name"]
         output["position"] = []
         output["orientation"] = []
@@ -2198,7 +2037,6 @@ class Task2DepthXYNode:
         output["xy_position_source"] = "handoff_full_yaw_rgbd_cad_fit"
         output["yaw_source"] = "handoff_full_yaw_rgbd_cad_fit"
         output["orientation_source"] = "handoff_full_yaw_rgbd_cad_fit"
-        output["truth_reference"] = DIAGNOSTIC_TRUTH_REFERENCE
         output["fit_coordinate_reference"] = FIT_COORDINATE_REFERENCE
         output["fit_method"] = "target_full_360_cad_region_depth_xy_yaw_fit"
         output["fit_alignment_accepted"] = bool(
@@ -2242,13 +2080,6 @@ class Task2DepthXYNode:
             output["position"] = list(fit_position)
             output["orientation"] = list(fit_orientation)
             output["confidence"] = 1.0
-        if len(truth_position) >= 3:
-            output["x_error_m"] = fit_position[0] - truth_position[0]
-            output["y_error_m"] = fit_position[1] - truth_position[1]
-            output["z_error_m"] = fit_position[2] - truth_position[2]
-            yaw_error = angle_difference(fit_yaw, truth_yaw)
-            output["yaw_error_rad"] = yaw_error
-            output["yaw_error_deg"] = math.degrees(yaw_error)
 
         field_map = {
             "points": "fit_points",
@@ -2304,7 +2135,7 @@ class Task2DepthXYNode:
         self.relocalization_result_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=True, sort_keys=True))
         )
-        if self.vision_mode == 2 and self.yolo_detector is not None:
+        if self.yolo_detector is not None:
             self.yolo_detector.release()
             self.yolo_detector = None
             rospy.loginfo(
@@ -2343,7 +2174,6 @@ class Task2DepthXYNode:
             result_object = {
                 "name": pending["name"],
                 "motion_name": pending["name"],
-                "ground_truth_name": pending["ground_truth_name"],
                 "class_name": pending["class_name"],
                 "position": position,
                 "orientation": orientation_xyzw_from_yaw(
@@ -2369,7 +2199,6 @@ class Task2DepthXYNode:
                 "request_id": request_id,
                 "success": True,
                 "reason": "",
-                "vision_mode": self.vision_mode,
                 "object": result_object,
             }
             if self._finish_handoff_relocalization(request_id, payload):
@@ -2398,7 +2227,6 @@ class Task2DepthXYNode:
             self.latest_depth is None
             or (self.green_filter_enabled and self.latest_color is None)
             or self.camera_info is None
-            or self.latest_truth is None
             or self.depth_sequence == self.processed_relocalization_depth_sequence
         ):
             return
@@ -2418,34 +2246,12 @@ class Task2DepthXYNode:
         transform = self._camera_to_base_transform(depth_stamp, depth_frame)
         if transform is None:
             return
-        truth_payload = copy.deepcopy(self.latest_truth)
         target_candidates = []
         plane_detections = {}
-        if self.vision_mode == 1:
-            for item in truth_payload.get("objects", []):
-                name = str(item.get("name", ""))
-                if name in OBJECT_NAMES and item.get("bbox_projected", False):
-                    plane_detections[name] = item
-            source = next(
-                (
-                    item
-                    for item in plane_detections.values()
-                    if str(item.get("ground_truth_name", item.get("name", "")))
-                    == pending["ground_truth_name"]
-                ),
-                None,
-            )
-            if source is not None:
-                candidate = copy.deepcopy(source)
-                candidate["name"] = pending["name"]
-                candidate["ground_truth_name"] = pending["ground_truth_name"]
-                candidate["class_name"] = pending["class_name"]
-                target_candidates.append(candidate)
-        else:
-            candidate = self._handoff_fixed_roi_candidate(pending)
-            if candidate is not None:
-                plane_detections["handoff_fixed_roi"] = candidate
-                target_candidates.append(candidate)
+        candidate = self._handoff_fixed_roi_candidate(pending)
+        if candidate is not None:
+            plane_detections["handoff_fixed_roi"] = candidate
+            target_candidates.append(candidate)
 
         color_bgr = color
         if color_bgr is not None and color_bgr.shape[:2] != depth.shape[:2]:
@@ -2564,14 +2370,11 @@ class Task2DepthXYNode:
             self.latest_depth is None
             or (self.green_filter_enabled and self.latest_color is None)
             or self.camera_info is None
-            or self.latest_truth is None
             or self.depth_sequence == self.processed_depth_sequence
         ):
             return
-        truth_payload = copy.deepcopy(self.latest_truth)
-        detection_objects = self._detection_objects(truth_payload)
-        current_truth_objects = self._diagnostic_truth_objects(truth_payload)
-        if detection_objects is None or current_truth_objects is None:
+        detection_objects = self._yolo_objects()
+        if detection_objects is None:
             return
         depth = self.latest_depth
         depth_stamp = self.latest_depth_stamp
@@ -2690,8 +2493,8 @@ class Task2DepthXYNode:
             name: self._fit_in_current_base(raw_fits[name])
             for name in OBJECT_NAMES
         }
-        detection_objects, current_fits = self._assign_mode2_frame_names(
-            detection_objects, current_fits
+        detection_objects, current_fits = self._assign_frame_names(
+            detection_objects, current_fits, frame_joint_assignments
         )
 
         complete = all(
@@ -2699,6 +2502,17 @@ class Task2DepthXYNode:
             and bool(current_fits[name].get("accepted", False))
             for name in OBJECT_NAMES
         )
+        if complete and self.instance_naming_method == INSTANCE_NAMING_YAW_PRIOR:
+            complete = all(
+                str(current_fits[name].get("yaw_prior_selected_name", "")) == name
+                for name in OBJECT_NAMES
+            )
+            if not complete:
+                rospy.logerr_throttle(
+                    1.0,
+                    "task2_depth_xy: rejecting frame because motion names do not "
+                    "match selected yaw-prior names",
+                )
         accepted = False
         if complete:
             self.valid_samples.append(copy.deepcopy(current_fits))
@@ -2720,14 +2534,9 @@ class Task2DepthXYNode:
                 self._aggregate_fit(name) if locked else current_fits.get(name)
             )
             source_item = detection_objects[name]
-            if self.vision_mode == 2:
-                source_item = self._mode2_diagnostic_item(
-                    source_item, current_truth_objects[name]
-                )
             output_objects.append(
                 self._make_output_object(
                     source_item,
-                    current_truth_objects[name],
                     displayed_fit,
                     locked,
                     fit_status,
@@ -2747,22 +2556,13 @@ class Task2DepthXYNode:
             "frame_id": FRAME_ID,
             "camera_frame_id": self.latest_depth_frame,
             "scene": "scene2",
-            "seed": truth_payload.get("seed"),
-            "vision_mode": self.vision_mode,
-            "vision_mode_name": self.vision_mode_name,
             "frozen": locked,
             "locked": locked,
-            "position_source": self.pose_source,
+            "position_source": YOLO_POSE_SOURCE,
             "z_position_source": Z_POSITION_SOURCE,
-            "yaw_source": self.pose_source,
-            "detection_mode": (
-                "qpos_category_bbox" if self.vision_mode == 1 else "yolo_category_bbox"
-            ),
-            "bbox_source": (
-                "mujoco_qpos_projected_visual_mesh"
-                if self.vision_mode == 1
-                else "yolo_rgb"
-            ),
+            "yaw_source": YOLO_POSE_SOURCE,
+            "detection_mode": "yolo_category_bbox",
+            "bbox_source": "yolo_rgb",
             "ready_for_motion": locked,
             "selection_method": (
                 "xyz_median_circular_yaw_and_{}_instance_matching".format(
@@ -2774,12 +2574,7 @@ class Task2DepthXYNode:
             "yaw_joint_assignments": frame_joint_assignments,
             "selection_sample_count": len(self.valid_samples),
             "required_valid_frames": self.median_frames,
-            "motion_to_ground_truth": {
-                item["name"]: item.get("ground_truth_name", item["name"])
-                for item in output_objects
-            },
             "motion_object_order": list(OBJECT_NAMES),
-            "truth_reference": DIAGNOSTIC_TRUTH_REFERENCE,
             "fit_coordinate_reference": FIT_COORDINATE_REFERENCE,
             "fit_method": "pca_cad_region_depth_xy_yaw_fit",
             "green_table_filter": self.green_filter_enabled,
@@ -2804,22 +2599,12 @@ class Task2DepthXYNode:
             )
             for item in output_objects:
                 rospy.loginfo(
-                    "task2_depth_xy: locked motion=%s ground_truth=%s "
-                    "fit=%s yaw=%.2f deg "
-                    "truth=%s yaw=%.2f deg error_xyz=%+.2f/%+.2f/%+.2f mm "
-                    "yaw_error=%+.2f deg "
+                    "task2_depth_xy: locked object=%s fit=%s yaw=%.2f deg "
                     "render_depth=%.2f mm coverage=%.3f/%.3f iou=%.3f "
                     "GN=%d depth_inliers=%d score=%.3f",
                     item["name"],
-                    item.get("ground_truth_name", ""),
                     [round(value, 6) for value in item["fit_position"]],
                     float(item["fit_yaw_deg"]),
-                    [round(value, 6) for value in item["truth_position"][:3]],
-                    float(item["truth_yaw_deg"]),
-                    1000.0 * float(item["x_error_m"]),
-                    1000.0 * float(item["y_error_m"]),
-                    1000.0 * float(item["z_error_m"]),
-                    float(item["yaw_error_deg"]),
                     1000.0 * float(item["fit_render_depth_error_m"]),
                     float(item["fit_render_coverage"]),
                     float(item["fit_render_observed_coverage"]),
@@ -2828,43 +2613,12 @@ class Task2DepthXYNode:
                     int(item["fit_alignment_depth_inliers"]),
                     float(item["fit_render_score"]),
                 )
-        x_error_values = [
-            1000.0 * abs(float(item["x_error_m"]))
-            for item in output_objects
-            if len(item.get("fit_position", [])) >= 3
-        ]
-        y_error_values = [
-            1000.0 * abs(float(item["y_error_m"]))
-            for item in output_objects
-            if len(item.get("fit_position", [])) >= 3
-        ]
-        z_error_values = [
-            1000.0 * abs(float(item["z_error_m"]))
-            for item in output_objects
-            if len(item.get("fit_position", [])) >= 3
-        ]
-        yaw_error_values = [
-            abs(float(item["yaw_error_deg"]))
-            for item in output_objects
-            if len(item.get("fit_position", [])) >= 3
-        ]
-        error_text = (
-                "abs_x/y/z={:.2f}/{:.2f}/{:.2f} mm yaw={:.2f} deg".format(
-                float(np.mean(x_error_values)),
-                float(np.mean(y_error_values)),
-                float(np.mean(z_error_values)),
-                float(np.mean(yaw_error_values)),
-            )
-            if x_error_values and y_error_values and z_error_values and yaw_error_values
-            else "warming up"
-        )
         rospy.loginfo_throttle(
             2.0,
-            "task2_depth_xy: valid_frames=%d/%d locked=%s mean_error=%s plane_rmse=%.2f mm",
+            "task2_depth_xy: valid_frames=%d/%d locked=%s plane_rmse=%.2f mm",
             len(self.valid_samples),
             self.median_frames,
             locked,
-            error_text,
             1000.0 * float(plane["rmse"]),
         )
 

@@ -7,13 +7,12 @@ import math
 import os
 import struct
 import time
-import xml.etree.ElementTree as ET
 
 import rospy
 from geometry_msgs.msg import Point, Quaternion, Vector3
 from kuavo_msgs.msg import sensorsData
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import String
 import tf2_ros
 from vision_msgs.msg import (
     BoundingBox2D,
@@ -25,16 +24,6 @@ from vision_msgs.msg import (
     ObjectHypothesisWithPose,
 )
 from visualization_msgs.msg import Marker, MarkerArray
-
-try:
-    import mujoco as mj
-
-    _MUJOCO_AVAILABLE = True
-    _MUJOCO_IMPORT_ERROR = None
-except Exception as exc:
-    mj = None
-    _MUJOCO_AVAILABLE = False
-    _MUJOCO_IMPORT_ERROR = exc
 
 try:
     import cv2
@@ -73,46 +62,6 @@ def _quat_from_yaw(yaw):
     return [0.0, 0.0, math.sin(half), math.cos(half)]
 
 
-def _quat_from_axis_angle(axis, angle):
-    norm = math.sqrt(sum(v * v for v in axis))
-    if norm <= 1e-12:
-        return [0.0, 0.0, 0.0, 1.0]
-    half = 0.5 * angle
-    scale = math.sin(half) / norm
-    return [axis[0] * scale, axis[1] * scale, axis[2] * scale, math.cos(half)]
-
-
-def _quat_multiply(a, b):
-    ax, ay, az, aw = a
-    bx, by, bz, bw = b
-    return [
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    ]
-
-
-def _quat_inverse(q):
-    x, y, z, w = q
-    norm2 = x * x + y * y + z * z + w * w
-    if norm2 <= 1e-12:
-        return [0.0, 0.0, 0.0, 1.0]
-    return [-x / norm2, -y / norm2, -z / norm2, w / norm2]
-
-
-def _yaw_from_quat_xyzw(q):
-    x, y, z, w = q
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
-def _quat_wxyz_to_xyzw(q):
-    qw, qx, qy, qz = q
-    return [qx, qy, qz, qw]
-
-
 def _rotate_vector_by_quat_xyzw(vec, quat):
     x, y, z = vec
     qx, qy, qz, qw = quat
@@ -128,14 +77,6 @@ def _rotate_vector_by_quat_xyzw(vec, quat):
     ]
 
 
-def _compose_pose(parent_pos, parent_quat, local_pos, local_quat):
-    rotated = _rotate_vector_by_quat_xyzw(local_pos, parent_quat)
-    return (
-        [parent_pos[i] + rotated[i] for i in range(3)],
-        _quat_multiply(parent_quat, local_quat),
-    )
-
-
 def _transform_point(transform, point):
     quat = [
         transform.rotation.x,
@@ -149,12 +90,6 @@ def _transform_point(transform, point):
         rotated[1] + transform.translation.y,
         rotated[2] + transform.translation.z,
     ]
-
-
-def _distance(a, b):
-    if a is None or b is None or len(a) < 3 or len(b) < 3:
-        return None
-    return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))
 
 
 def _assign_parcel_names_by_relative_xy(items):
@@ -196,18 +131,6 @@ def _quat_to_rotation_matrix(quat):
         ],
         dtype=np.float64,
     )
-
-
-def _project_camera_point(camera_info, point):
-    x, y, z = point
-    if z <= 0.03:
-        return None
-    k = camera_info.K
-    if not k or len(k) < 6:
-        return None
-    u = k[0] * x / z + k[2]
-    v = k[4] * y / z + k[5]
-    return [u, v]
 
 
 def _make_point(values):
@@ -331,73 +254,16 @@ def _decode_compressed_depth_image(msg):
     return depth, None
 
 
-class MujocoJointIndex:
-    """按照 MuJoCo XML 关节顺序建立 qpos 索引。"""
-
-    def __init__(self, xml_path):
-        self.xml_path = xml_path
-        self.qpos_by_joint = {}
-        self.nq = 0
-
-    def load(self):
-        self.qpos_by_joint = {}
-        self.nq = 0
-        self._visit_xml(self.xml_path, os.path.dirname(self.xml_path))
-        rospy.loginfo("task1_vision: indexed %d qpos values from %s", self.nq, self.xml_path)
-
-    def _visit_xml(self, xml_path, base_dir):
-        if not xml_path or not os.path.exists(xml_path):
-            rospy.logwarn("task1_vision: MuJoCo XML not found: %s", xml_path)
-            return
-        root = ET.parse(xml_path).getroot()
-        current_dir = os.path.dirname(xml_path)
-        for child in list(root):
-            if child.tag == "include":
-                include_file = child.get("file")
-                if include_file:
-                    include_path = include_file
-                    if not os.path.isabs(include_path):
-                        include_path = os.path.normpath(os.path.join(current_dir, include_path))
-                    self._visit_xml(include_path, os.path.dirname(include_path))
-            elif child.tag == "worldbody":
-                self._visit_worldbody(child)
-
-    def _visit_worldbody(self, worldbody):
-        for elem in worldbody.iter():
-            if elem.tag == "freejoint":
-                self._register_joint(elem.get("name"), 7)
-            elif elem.tag == "joint":
-                joint_type = elem.get("type", "hinge")
-                if joint_type == "free":
-                    width = 7
-                elif joint_type == "ball":
-                    width = 4
-                else:
-                    width = 1
-                self._register_joint(elem.get("name"), width)
-
-    def _register_joint(self, name, width):
-        if name:
-            self.qpos_by_joint[name] = self.nq
-        self.nq += width
-
-
 class Task1VisionNode:
     def __init__(self):
         self.scene = rospy.get_param("~scene", "scene1")
-        self.vision_mode = int(rospy.get_param("~vision_mode", 0))
-        if self.vision_mode not in (0, 1):
-            raise RuntimeError("task1_vision vision_mode only supports 0 or 1")
-        self.detection_mode = (
-            "qpos_bbox_depth_top_plane_fit"
-            if self.vision_mode == 0
-            else "yolo_bbox_depth_top_plane_fit"
-        )
+        self.vision_mode = int(rospy.get_param("~vision_mode", 1))
+        if self.vision_mode != 1:
+            raise RuntimeError("task1_vision production node only supports mode 1")
+        self.detection_mode = "yolo_bbox_depth_top_plane_fit"
         self.frame_id = rospy.get_param("~frame_id", "world")
-        self.truth_frame_id = rospy.get_param("~truth_frame_id", self.frame_id)
         self.output_frame_id = rospy.get_param("~output_frame_id", self.frame_id)
         self.base_frame_id = rospy.get_param("~base_frame_id", "base_link")
-        self.qpos_topic = rospy.get_param("~qpos_topic", "/mujoco/qpos")
         self.objects = rospy.get_param("~objects", [])
         self.require_camera_tf = bool(rospy.get_param("~require_camera_tf", True))
         self.head_image_topic = rospy.get_param("~head_image_topic", "/cam_h/color/image_raw/compressed")
@@ -407,7 +273,7 @@ class Task1VisionNode:
         self.depth_image_type = rospy.get_param("~depth_image_type", "auto")
         self.startup_warn_time = float(rospy.get_param("~startup_warn_time", 60.0))
         self.startup_wait_timeout = float(
-            rospy.get_param("~startup_wait_timeout", 180.0)
+            rospy.get_param("~startup_wait_timeout", 240.0)
         )
         self.sensor_time_topic = str(
             rospy.get_param("~sensor_time_topic", "/sensors_data_raw")
@@ -435,14 +301,6 @@ class Task1VisionNode:
         self.used_objects_sub = None
         self._plane_fit_last_log = {}
 
-        self.latest_qpos = None
-
-        self.model_xml_path = self._resolve_model_xml()
-        self.joint_index = MujocoJointIndex(self.model_xml_path)
-        self.joint_index.load()
-        self.mj_model = None
-        self.mj_data = None
-        self.mj_model_path = None
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
@@ -451,12 +309,6 @@ class Task1VisionNode:
         self.pub_markers = rospy.Publisher("~markers", MarkerArray, queue_size=1)
         self.pub_json = rospy.Publisher("~objects_json", String, queue_size=1)
 
-        self.qpos_sub = rospy.Subscriber(
-            self.qpos_topic,
-            Float64MultiArray,
-            self._qpos_callback,
-            queue_size=1,
-        )
         self.sensor_time_sub = rospy.Subscriber(
             self.sensor_time_topic,
             sensorsData,
@@ -489,77 +341,39 @@ class Task1VisionNode:
                 self._raw_depth_callback,
                 queue_size=1,
             )
-        if self.vision_mode == 1 or bool(self._param("depth_color_filter_enabled", True)):
-            if self._color_topic_is_compressed():
-                self.color_sub = rospy.Subscriber(
-                    self.head_image_topic,
-                    CompressedImage,
-                    self._compressed_color_callback,
-                    queue_size=1,
-                )
-            else:
-                self.color_sub = rospy.Subscriber(
-                    self.head_image_topic,
-                    Image,
-                    self._raw_color_callback,
-                    queue_size=1,
-                )
+        if self._color_topic_is_compressed():
+            self.color_sub = rospy.Subscriber(
+                self.head_image_topic,
+                CompressedImage,
+                self._compressed_color_callback,
+                queue_size=1,
+            )
+        else:
+            self.color_sub = rospy.Subscriber(
+                self.head_image_topic,
+                Image,
+                self._raw_color_callback,
+                queue_size=1,
+            )
 
-        if self.vision_mode == 1:
-            self._load_yolo_model()
-            if bool(self._param("yolo_freeze_after_used_objects", True)):
-                used_topic = str(
-                    self._param(
-                        "used_objects_topic", "/task1_vision/used_objects_json"
-                    )
+        self._load_yolo_model()
+        if bool(self._param("yolo_freeze_after_used_objects", True)):
+            used_topic = str(
+                self._param(
+                    "used_objects_topic", "/task1_vision/used_objects_json"
                 )
-                self.used_objects_sub = rospy.Subscriber(
-                    used_topic,
-                    String,
-                    self._used_objects_callback,
-                    queue_size=1,
-                )
-                rospy.loginfo(
-                    "task1_vision: YOLO will stop after task coordinates arrive on %s",
-                    used_topic,
-                )
+            )
+            self.used_objects_sub = rospy.Subscriber(
+                used_topic,
+                String,
+                self._used_objects_callback,
+                queue_size=1,
+            )
+            rospy.loginfo(
+                "task1_vision: YOLO will stop after task coordinates arrive on %s",
+                used_topic,
+            )
         rospy.loginfo("task1_vision: detection mode=%s", self.detection_mode)
-
-    def _resolve_model_xml(self):
-        configured = rospy.get_param("~model_xml", "")
-        if configured:
-            return configured
-        try:
-            import rospkg
-
-            sim_path = rospkg.RosPack().get_path("challenge_cup_simulator")
-            active = os.path.join(
-                sim_path,
-                "models",
-                "biped_s52",
-                "xml",
-                "_scene_{}_active.xml".format(self.scene),
-            )
-            if os.path.exists(active):
-                return active
-            return os.path.join(sim_path, "models", "biped_s52", "xml", "{}.xml".format(self.scene))
-        except Exception:
-            here = os.path.dirname(os.path.abspath(__file__))
-            return os.path.normpath(
-                os.path.join(
-                    here,
-                    "..",
-                    "..",
-                    "challenge_cup_simulator",
-                    "models",
-                    "biped_s52",
-                    "xml",
-                    "{}.xml".format(self.scene),
-                )
-            )
-
-    def _qpos_callback(self, msg):
-        self.latest_qpos = list(msg.data)
 
     def _sensor_time_callback(self, msg):
         seconds = float(msg.sensor_time.to_sec())
@@ -627,7 +441,7 @@ class Task1VisionNode:
         return rospy.get_param("~" + name, default)
 
     def _used_objects_callback(self, msg):
-        if self.vision_mode != 1 or self._deployment_frozen:
+        if self._deployment_frozen:
             return
         try:
             payload = json.loads(msg.data)
@@ -788,41 +602,6 @@ class Task1VisionNode:
         self._yolo_cached_candidates = [dict(item) for item in candidates]
         return candidates
 
-    def _deployment_truth_reference(self, spec, camera_position):
-        empty = {
-            "truth_position": [],
-            "truth_position_source": "",
-            "truth_camera_position": [],
-            "truth_camera_reference_error": None,
-            "reference_camera_position": [],
-            "camera_reference_error": None,
-        }
-        truth = self._truth_pose(spec)
-        if truth is None:
-            return empty
-        truth_position, truth_yaw = truth
-        measurement = self._vision_measurement_from_truth(
-            truth_position, _quat_from_yaw(truth_yaw)
-        )
-        if measurement is None:
-            return empty
-        output_position, _, truth_camera_position, source, truth_camera_reference = measurement
-        camera_reference = self._mujoco_camera_reference(
-            truth_position, camera_position if len(camera_position) >= 3 else None
-        )
-        return {
-            "truth_position": output_position,
-            "truth_position_source": source,
-            "truth_camera_position": truth_camera_position or [],
-            "truth_camera_reference_error": truth_camera_reference.get(
-                "camera_reference_error"
-            ),
-            "reference_camera_position": camera_reference.get(
-                "reference_camera_position", []
-            ),
-            "camera_reference_error": camera_reference.get("camera_reference_error"),
-        }
-
     def _make_deployment_detection(self, name, item):
         specs_by_name = {
             str(spec.get("name", "")): spec for spec in self.objects
@@ -835,9 +614,6 @@ class Task1VisionNode:
         size = _parse_vec(spec.get("size"), 3, [0.05, 0.05, 0.05])
         position = fit["position"]
         camera_position = fit.get("camera_position") or []
-        truth = self._deployment_truth_reference(spec, camera_position)
-        truth_position = truth["truth_position"]
-        truth_error = _distance(position, truth_position)
         yaw = float(fit.get("yaw", 0.0))
         item["name"] = name
         item["fit_succeeded"] = True
@@ -849,15 +625,7 @@ class Task1VisionNode:
             "position": position,
             "camera_position": camera_position,
             "position_source": "depth_roi_top_plane_fit",
-            "truth_position": truth_position,
-            "truth_position_source": truth["truth_position_source"],
-            "truth_position_error": truth_error,
-            "truth_camera_position": truth["truth_camera_position"],
-            "truth_camera_reference_error": truth["truth_camera_reference_error"],
             "depth_fit_position": position,
-            "depth_fit_truth_error": truth_error,
-            "reference_camera_position": truth["reference_camera_position"],
-            "camera_reference_error": truth["camera_reference_error"],
             "fit_method": fit.get("method", ""),
             "fit_points": int(fit.get("points", 0)),
             "fit_cluster_points": int(fit.get("cluster_points", 0)),
@@ -925,97 +693,6 @@ class Task1VisionNode:
         ]
         detections.sort(key=lambda item: item["name"])
         return detections, candidates
-
-    def _detect_object(self, spec):
-        truth = self._truth_pose(spec)
-        if truth is None:
-            return None
-
-        true_size = _parse_vec(spec.get("size"), 3, [0.05, 0.05, 0.05])
-        truth_position, truth_yaw = truth
-        orientation = _quat_from_yaw(truth_yaw)
-
-        truth_measurement = self._vision_measurement_from_truth(
-            truth_position, orientation
-        )
-        if truth_measurement is None:
-            self._warn_projection_once(
-                "measurement_" + str(spec.get("name", "")),
-                "task1_vision: no output-frame truth reference for %s; detection skipped",
-                str(spec.get("name", "")),
-            )
-            return None
-        truth_output_position, truth_output_orientation, truth_camera_position, truth_source, truth_camera_reference = truth_measurement
-
-        projected_bbox = self._project_bbox(
-            truth_output_position, truth_output_orientation, true_size
-        )
-        if projected_bbox is None:
-            self._warn_projection_once(
-                "bbox_projection_" + str(spec.get("name", "")),
-                "task1_vision: qpos bbox projection failed for %s; detection skipped",
-                str(spec.get("name", "")),
-            )
-            return None
-        bbox_center, bbox_size = projected_bbox
-
-        fit = self._fit_position_from_depth_bbox(
-            bbox_center, bbox_size, true_size, spec
-        )
-        if fit is None:
-            self._warn_projection_once(
-                "depth_fit_failed_" + str(spec.get("name", "")),
-                "task1_vision: depth top-plane fit failed for %s; detection skipped",
-                str(spec.get("name", "")),
-            )
-            return None
-
-        output_position = fit["position"]
-        camera_position = fit.get("camera_position") or None
-        reported_yaw = float(fit.get("yaw", truth_yaw))
-        output_orientation = _quat_from_yaw(reported_yaw)
-        reference = self._mujoco_camera_reference(truth_position, camera_position)
-        truth_error = _distance(output_position, truth_output_position)
-
-        return {
-            "name": str(spec.get("name", "")),
-            "class_id": int(spec.get("class_id", 0)),
-            "class_name": str(spec.get("class_name", spec.get("name", "object"))),
-            "confidence": _clip(float(self._param("confidence", 1.0)), 0.0, 1.0),
-            "position": output_position,
-            "camera_position": camera_position if camera_position is not None else [],
-            "position_source": "depth_roi_top_plane_fit",
-            "truth_position": truth_output_position,
-            "truth_position_source": truth_source,
-            "truth_position_error": truth_error,
-            "truth_camera_position": truth_camera_position if truth_camera_position is not None else [],
-            "truth_camera_reference_error": truth_camera_reference.get("camera_reference_error"),
-            "depth_fit_position": output_position,
-            "depth_fit_truth_error": truth_error,
-            "reference_camera_position": reference.get("reference_camera_position", []),
-            "camera_reference_error": reference.get("camera_reference_error"),
-            "fit_method": fit.get("method", ""),
-            "fit_points": int(fit.get("points", 0)),
-            "fit_cluster_points": int(fit.get("cluster_points", 0)),
-            "fit_error": fit.get("error"),
-            "fit_extent": fit.get("fit_extent", []),
-            "fit_outside_rmse": fit.get("fit_outside_rmse"),
-            "fit_plane_normal": fit.get("plane_normal", []),
-            "fit_plane_tilt_deg": fit.get("plane_tilt_deg"),
-            "fit_plane_inliers": fit.get("plane_inliers"),
-            "fit_plane_inlier_ratio": fit.get("plane_inlier_ratio"),
-            "fit_plane_rmse": fit.get("plane_rmse"),
-            "fit_plane_top_z": fit.get("plane_top_z"),
-            "size": true_size,
-            "yaw": reported_yaw,
-            "yaw_valid": True,
-            "orientation": output_orientation,
-            "bbox_center": bbox_center,
-            "bbox_size": bbox_size,
-            "bbox_projected": True,
-            "bbox_source": "qpos_projected_3d_corners",
-            "color_rgba": _parse_vec(spec.get("color_rgba"), 4, [0.1, 0.8, 0.2, 0.5]),
-        }
 
     def _camera_frame_id(self):
         if self.camera_info is not None and self.camera_info.header.frame_id:
@@ -1599,287 +1276,6 @@ class Task1VisionNode:
                 normalized.append(value)
         return normalized or [0.0]
 
-    def _vision_measurement_from_truth(self, truth_position, output_orientation):
-        """构造 qpos 二维框投影和误差计算使用的真值参考。"""
-        camera_frame = self._camera_frame_id()
-        output_frame = self.output_frame_id
-
-        qpos_base_measurement = self._output_from_qpos_base(truth_position, output_orientation)
-        if qpos_base_measurement is None:
-            self._warn_projection_once(
-                "vision_output_base_unavailable",
-                "task1_vision: qpos-derived %s output unavailable; detection cannot produce base-relative position",
-                self.base_frame_id,
-            )
-            return None
-
-        output_position, output_quat = qpos_base_measurement
-        camera_position = None
-        source = "qpos_base"
-
-        base_to_camera = self._lookup_transform(camera_frame, output_frame, "base_to_camera")
-        if base_to_camera is not None:
-            camera_position = self._apply_transform_point(base_to_camera, output_position)
-            camera_to_output = self._lookup_transform(output_frame, camera_frame, "camera_to_output")
-            if camera_to_output is None and self.require_camera_tf:
-                self._warn_projection_once(
-                    "vision_camera_to_output_missing",
-                    "task1_vision: required TF %s <- %s unavailable; detection skipped",
-                    output_frame,
-                    camera_frame,
-                )
-                return None
-            if camera_to_output is not None:
-                source = "qpos_base_tf_camera_checked"
-            else:
-                self._warn_projection_once(
-                    "vision_camera_to_output_missing",
-                    "task1_vision: TF %s <- %s unavailable; output keeps qpos-derived %s position",
-                    output_frame,
-                    camera_frame,
-                    self.base_frame_id,
-                )
-                source = "qpos_base_tf_camera_no_output_tf"
-        else:
-            if self.require_camera_tf:
-                self._warn_projection_once(
-                    "vision_base_to_camera_missing",
-                    "task1_vision: required TF %s <- %s unavailable; detection skipped",
-                    camera_frame,
-                    output_frame,
-                )
-                return None
-            self._warn_projection_once(
-                "vision_base_to_camera_missing",
-                "task1_vision: TF %s <- %s unavailable; camera_position omitted, output keeps qpos-derived %s position",
-                camera_frame,
-                output_frame,
-                self.base_frame_id,
-            )
-            source = "qpos_base_no_camera_tf"
-
-        reference = self._mujoco_camera_reference(truth_position, camera_position)
-        return output_position, output_quat, camera_position, source, reference
-
-    def _project_bbox(self, position, orientation, size):
-        return self._project_bbox_from_tf(position, orientation, size)
-
-    def _project_bbox_from_tf(self, position, orientation, size, source_frame=None):
-        if self.camera_info is None:
-            return None
-        target_frame = self.camera_info.header.frame_id
-        if not target_frame:
-            return None
-        source_frame = source_frame or self.output_frame_id
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
-                rospy.Time(0),
-                rospy.Duration(0.01),
-            ).transform
-        except Exception as exc:
-            self._warn_projection_once("tf", "task1_vision: TF projection unavailable: %s", exc)
-            return None
-
-        half = [max(0.001, s) * 0.5 for s in size]
-        pixels = []
-        for sx in (-1.0, 1.0):
-            for sy in (-1.0, 1.0):
-                for sz in (-1.0, 1.0):
-                    local = [sx * half[0], sy * half[1], sz * half[2]]
-                    source_delta = _rotate_vector_by_quat_xyzw(local, orientation)
-                    source_point = [position[i] + source_delta[i] for i in range(3)]
-                    camera_point = _transform_point(transform, source_point)
-                    pixel = _project_camera_point(self.camera_info, camera_point)
-                    if pixel is not None:
-                        pixels.append(pixel)
-        if not pixels:
-            return None
-
-        min_x = min(p[0] for p in pixels)
-        max_x = max(p[0] for p in pixels)
-        min_y = min(p[1] for p in pixels)
-        max_y = max(p[1] for p in pixels)
-        width = float(self.camera_info.width or 1280)
-        height = float(self.camera_info.height or 720)
-        if max_x < 0.0 or min_x >= width or max_y < 0.0 or min_y >= height:
-            return None
-
-        min_x = _clip(min_x, 0.0, width - 1.0)
-        max_x = _clip(max_x, 0.0, width - 1.0)
-        min_y = _clip(min_y, 0.0, height - 1.0)
-        max_y = _clip(max_y, 0.0, height - 1.0)
-        return [
-            [(min_x + max_x) * 0.5, (min_y + max_y) * 0.5],
-            [max(2.0, max_x - min_x), max(2.0, max_y - min_y)],
-        ]
-
-    # 加载与当前仿真一致的 MuJoCo 模型, 用 mj_forward 得到 body 真值位姿。
-    def _mujoco_model_and_data(self):
-        if not _MUJOCO_AVAILABLE:
-            self._warn_projection_once(
-                "mujoco_import",
-                "task1_vision: mujoco unavailable, fallback to raw qpos truth: %s",
-                _MUJOCO_IMPORT_ERROR,
-            )
-            return None
-        model_path = rospy.get_param("legged_robot_scene_param", self.model_xml_path)
-        if not model_path:
-            return None
-        model_path = os.path.abspath(str(model_path))
-        if not os.path.isfile(model_path):
-            self._warn_projection_once(
-                "mujoco_model_missing",
-                "task1_vision: MuJoCo model XML not found, fallback to raw qpos truth: %s",
-                model_path,
-            )
-            return None
-        if self.mj_model is None or self.mj_model_path != model_path:
-            try:
-                self.mj_model = mj.MjModel.from_xml_path(model_path)
-                self.mj_data = mj.MjData(self.mj_model)
-                self.mj_model_path = model_path
-                rospy.loginfo("task1_vision: using MuJoCo body truth from %s", model_path)
-            except Exception as exc:
-                self._warn_projection_once(
-                    "mujoco_model_load",
-                    "task1_vision: failed to load MuJoCo model, fallback to raw qpos truth: %s",
-                    exc,
-                )
-                return None
-        return self.mj_model, self.mj_data
-
-    # 用当前 /mujoco/qpos 前向计算指定 body 的世界位姿。
-    def _body_pose_from_mujoco(self, body_name):
-        if self.latest_qpos is None:
-            return None
-        model_data = self._mujoco_model_and_data()
-        if model_data is None:
-            return None
-        model, data = model_data
-        if len(self.latest_qpos) < model.nq:
-            self._warn_projection_once(
-                "mujoco_qpos_len",
-                "task1_vision: qpos len %d < MuJoCo model nq %d, fallback to raw qpos truth",
-                len(self.latest_qpos),
-                model.nq,
-            )
-            return None
-        try:
-            data.qpos[: model.nq] = self.latest_qpos[: model.nq]
-            mj.mj_forward(model, data)
-            body = data.body(str(body_name))
-            position = [float(v) for v in body.xpos]
-            quat_xyzw = _quat_wxyz_to_xyzw([float(v) for v in body.xquat])
-            return position, quat_xyzw
-        except Exception as exc:
-            self._warn_projection_once(
-                "mujoco_body_" + str(body_name),
-                "task1_vision: MuJoCo body %s unavailable, fallback to raw qpos truth: %s",
-                str(body_name),
-                exc,
-            )
-            return None
-
-    # 从 /mujoco/qpos 读取机器人 base 在仿真世界中的位姿。
-    def _base_pose_from_qpos(self):
-        body_pose = self._body_pose_from_mujoco(self.base_frame_id)
-        if body_pose is not None:
-            return body_pose
-
-        q = self.latest_qpos
-        if q is None or len(q) < 7:
-            return None
-
-        base_addr = int(self._param("robot_base_qpos_addr", 0))
-        if base_addr < 0 or base_addr + 6 >= len(q):
-            self._warn_projection_once(
-                "base_qpos",
-                "task1_vision: robot base qpos addr %d outside qpos length %d",
-                base_addr,
-                len(q),
-            )
-            return None
-
-        base_pos = [q[base_addr], q[base_addr + 1], q[base_addr + 2]]
-        quat_base = _quat_wxyz_to_xyzw(q[base_addr + 3 : base_addr + 7])
-        return base_pos, quat_base
-
-    # 在没有 world TF 时, 用 qpos 把真值世界坐标转换成 base_link 相对坐标。
-    def _output_from_qpos_base(self, truth_position, output_orientation):
-        if self.output_frame_id != self.base_frame_id:
-            return None
-        base_pose = self._base_pose_from_qpos()
-        if base_pose is None:
-            return None
-
-        base_pos, base_quat = base_pose
-        inv_base = _quat_inverse(base_quat)
-        delta = [truth_position[i] - base_pos[i] for i in range(3)]
-        output_position = _rotate_vector_by_quat_xyzw(delta, inv_base)
-        output_quat = _quat_multiply(inv_base, output_orientation)
-        return output_position, output_quat
-
-    # 只把 MuJoCo world->camera 真值作为参考对比, 不参与 task1_vision 输出。
-    def _mujoco_camera_reference(self, truth_position, camera_position):
-        result = {
-            "reference_camera_position": [],
-            "camera_reference_error": None,
-        }
-        camera_pose = self._head_camera_pose_from_qpos()
-        if camera_pose is None:
-            return result
-
-        reference = self._world_point_to_ros_camera_point(truth_position, camera_pose)
-        result["reference_camera_position"] = reference
-        if camera_position is not None:
-            result["camera_reference_error"] = math.sqrt(
-                sum((camera_position[i] - reference[i]) ** 2 for i in range(3))
-            )
-        return result
-
-    def _head_camera_pose_from_qpos(self):
-        base_pose = self._base_pose_from_qpos()
-        if base_pose is None:
-            return None
-
-        base_pos, quat_base = base_pose
-
-        waist = self._joint_qpos_value("waist_yaw_joint", 0.0)
-        head_yaw = self._joint_qpos_value("zhead_1_joint", 0.0)
-        head_pitch = self._joint_qpos_value("zhead_2_joint", 0.0)
-
-        pos, quat = base_pos, quat_base
-        pos, quat = _compose_pose(pos, quat, [0.0, 0.0, 0.1114], _quat_from_axis_angle([0.0, 0.0, 1.0], waist))
-        pos, quat = _compose_pose(pos, quat, [-0.003, 0.0, 0.49535], _quat_from_axis_angle([0.0, 0.0, 1.0], head_yaw))
-        pos, quat = _compose_pose(pos, quat, [0.0, 0.0, 0.0], _quat_from_axis_angle([0.0, 1.0, 0.0], head_pitch))
-
-        camera_pos = _parse_vec(self._param("mujoco_head_camera_pos", [0.121, 0.0, 0.0345]), 3)
-        camera_quat = _quat_wxyz_to_xyzw(
-            _parse_vec(self._param("mujoco_head_camera_quat_wxyz", [0.612372, 0.353553, -0.353553, -0.612372]), 4)
-        )
-        pos, quat = _compose_pose(pos, quat, camera_pos, camera_quat)
-        return pos, quat
-
-    def _joint_qpos_value(self, joint_name, default):
-        addr = self.joint_index.qpos_by_joint.get(joint_name)
-        if addr is None or addr >= len(self.latest_qpos):
-            self._warn_projection_once(
-                "joint_" + joint_name,
-                "task1_vision: joint %s not found in qpos map; using %.3f",
-                joint_name,
-                default,
-            )
-            return default
-        return self.latest_qpos[addr]
-
-    def _world_point_to_ros_camera_point(self, world_point, camera_pose):
-        camera_pos, camera_quat = camera_pose
-        delta = [world_point[i] - camera_pos[i] for i in range(3)]
-        camera_local = _rotate_vector_by_quat_xyzw(delta, _quat_inverse(camera_quat))
-        return [camera_local[0], -camera_local[1], -camera_local[2]]
-
     def _warn_projection_once(self, key, fmt, *args):
         if key in self._projection_warned:
             return
@@ -1890,16 +1286,11 @@ class Task1VisionNode:
         missing = []
         if self.latest_sensor_time is None:
             missing.append(self.sensor_time_topic + ".sensor_time")
-        if self.vision_mode == 0 and self.latest_qpos is None:
-            missing.append(self.qpos_topic)
         if self.camera_info is None:
             missing.append(self.camera_info_topic)
         if self.latest_depth is None:
             missing.append(self.depth_image_topic)
-        if (
-            self.vision_mode == 1
-            or bool(self._param("depth_color_filter_enabled", True))
-        ) and self.latest_color is None:
+        if self.latest_color is None:
             missing.append(self.head_image_topic)
 
         camera_frame = self._camera_frame_id()
@@ -1924,7 +1315,7 @@ class Task1VisionNode:
                 missing.append("TF {} <- {}".format(self.output_frame_id, self.latest_depth_frame_id or camera_frame))
         return missing
 
-    # 启动阶段等待当前模式需要的图像、qpos 和关键 TF 齐全。
+    # 启动阶段等待 RGB-D、仿真时钟和关键 TF 齐全。
     def _wait_until_ready(self):
         if self.startup_wait_timeout <= 0.0:
             return True
@@ -1983,36 +1374,6 @@ class Task1VisionNode:
             rate.sleep()
         return False
 
-    def _truth_pose(self, spec):
-        name = str(spec.get("name", ""))
-        qpos_joint = str(spec.get("qpos_joint", name))
-        position = None
-        quat_xyzw = None
-
-        if self.latest_qpos is None:
-            return None
-        body_pose = self._body_pose_from_mujoco(qpos_joint)
-        if body_pose is not None:
-            position, quat_xyzw = body_pose
-        qpos_addr = self.joint_index.qpos_by_joint.get(qpos_joint)
-        if position is None and qpos_addr is not None and qpos_addr + 6 < len(self.latest_qpos):
-            q = self.latest_qpos
-            position = [q[qpos_addr], q[qpos_addr + 1], q[qpos_addr + 2]]
-            quat_xyzw = _quat_wxyz_to_xyzw(q[qpos_addr + 3 : qpos_addr + 7])
-
-        if position is None or quat_xyzw is None:
-            self._warn_projection_once(
-                "missing_pose_" + name,
-                "task1_vision: no pose available for %s; detection skipped",
-                name,
-            )
-            return None
-
-        offset = _parse_vec(spec.get("center_offset"), 3, [0.0, 0.0, 0.0])
-        rotated_offset = _rotate_vector_by_quat_xyzw(offset, quat_xyzw)
-        center = [position[i] + rotated_offset[i] for i in range(3)]
-        return center, _yaw_from_quat_xyzw(quat_xyzw)
-
     def spin(self):
         if not self._wait_until_ready():
             rospy.signal_shutdown("task1_vision startup inputs unavailable")
@@ -2024,14 +1385,7 @@ class Task1VisionNode:
 
     def publish_once(self):
         stamp = rospy.Time.now()
-        bbox_candidates = []
-        if self.vision_mode == 0:
-            detections = []
-            for spec in self.objects:
-                detection = self._detect_object(spec)
-                if detection is not None:
-                    detections.append(detection)
-        elif self._deployment_frozen:
+        if self._deployment_frozen:
             self._release_yolo_model()
             detections = copy.deepcopy(self._deployment_frozen_detections)
             bbox_candidates = copy.deepcopy(
@@ -2057,7 +1411,6 @@ class Task1VisionNode:
                         {
                             "stamp": stamp.to_sec(),
                             "frame_id": self.output_frame_id,
-                            "truth_frame_id": self.truth_frame_id,
                             "base_frame_id": self.base_frame_id,
                             "camera_frame_id": self._camera_frame_id(),
                             "color_stamp": (

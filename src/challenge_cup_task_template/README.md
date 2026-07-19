@@ -56,18 +56,12 @@ rosrun challenge_cup_task_template challenge_task.py --scene scene3 --seed 3
 
 ## 比赛计时
 
-默认不限制时长，只显示计时，便于调试。
-
-设置 `--time-limit` 后，到达时限会自动结束当前任务节点。单位是秒：
-
-```bash
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --time-limit 120
-```
+主任务只显示计时，不会因计时超时自动结束动作或 ROS 节点。
 
 如不需要弹出计时窗口，可加：
 
 ```bash
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --time-limit 120 --no-timer-gui
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 3 --no-timer-gui
 ```
 
 计时窗口中的 `Stop Timer` 用于任务完成后停止计时显示，便于裁判查看用时。
