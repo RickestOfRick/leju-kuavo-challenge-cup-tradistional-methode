@@ -47,6 +47,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CLOUD_FILE = os.path.join(HERE, "last_cloud.npy")
 FRAME_FILE = os.path.join(HERE, "last_points_frame.txt")
 OBJECTS_FILE = os.path.join(HERE, "objects.npy")
+DET_FILE = os.path.join(HERE, "detections.json")
+WEIGH_FILE = os.path.join(HERE, "weigh.json")
 UV_FILE = os.path.join(HERE, "last_uv.npy")
 K_FILE = os.path.join(HERE, "last_K.npy")
 M_FILE = os.path.join(HERE, "last_M.npy")
@@ -60,6 +62,8 @@ RANSAC_DIST = 0.008       # inlier distance to plane (m)
 PLANES = 2                # remove this many dominant planes (floor + table)
 CLUSTER_TOL = 0.02        # cluster distance (m)
 MIN_CLUSTER = 30          # min points for a cluster
+GREEN_LO = (62, 180, 110)  # HSV lower bound for the bright green weigh marker
+GREEN_HI = (78, 255, 255)
 # ──────────────────────────────────────────────────────────────────
 
 
@@ -329,20 +333,113 @@ def step_cluster(args):
     n_clusters = labels.max() + 1 if len(labels) else 0
     log("clusters    : %d" % n_clusters)
 
-    detections = []           # (label, points, center, yaw, top_z)
+    detections = []
     for k in range(n_clusters):
         c = pts[labels == k]
         if len(c) < args.min_cluster:
             continue
-        center = c.mean(axis=0)
-        yaw = _pca_yaw(c)
-        detections.append((k, c, center, yaw, c[:, 2].max()))
-        log("  #%d  n=%4d  center=(%.3f, %.3f, %.3f)  yaw=%.1f deg  top_z=%.3f"
-            % (k, len(c), center[0], center[1], center[2],
-               np.degrees(yaw), c[:, 2].max()))
+        center_xy, yaw, ext = _pca_pose(c)
+        top_z = float(c[:, 2].max())
+        bot_z = float(c[:, 2].min())
+        det = {
+            "label": int(k),
+            "n": int(len(c)),
+            "x": float(center_xy[0]), "y": float(center_xy[1]),
+            "z_top": top_z, "z_bot": bot_z, "z": float(c[:, 2].mean()),
+            "yaw_deg": float(np.degrees(yaw)),
+            "length": float(ext[0]), "width": float(ext[1]),
+            "height": float(top_z - bot_z),
+        }
+        detections.append((det, c))
+        log("  #%d  n=%4d  center=(%.3f, %.3f, %.3f)  yaw=%.1f deg  "
+            "size=(%.3f x %.3f x %.3f)  top_z=%.3f"
+            % (k, det["n"], det["x"], det["y"], det["z"], det["yaw_deg"],
+               det["length"], det["width"], det["height"], det["z_top"]))
+
+    if detections:
+        import json
+        with open(DET_FILE, "w") as f:
+            json.dump([d for d, _ in detections], f, indent=2)
+        log("saved %s (%d detection(s))" % (DET_FILE, len(detections)))
 
     if args.show:
         _show_contours(args, pts, labels, detections)
+
+
+def step_weigh(args):
+    """Find the green weighing marker by colour, return its base-frame pose."""
+    info = rospy.wait_for_message(INFO_TOPIC, CameraInfo, timeout=args.timeout)
+    color = rospy.wait_for_message(COLOR_TOPIC, CompressedImage, timeout=args.timeout)
+    depth = rospy.wait_for_message(DEPTH_TOPIC, CompressedImage, timeout=args.timeout)
+    img = decode_color(color)
+    if img is None:
+        log("FAILED to decode color image")
+        return
+    K = list(info.K)
+    fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(args.green_lo, np.uint8),
+                       np.array(args.green_hi, np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        log("no green region found — adjust --green-lo/--green-hi")
+        return
+    cnt = max(cnts, key=cv2.contourArea)
+    area_px = cv2.contourArea(cnt)
+    x0, y0, w0, h0 = cv2.boundingRect(cnt)
+    M = cv2.moments(cnt)
+    cu = M["m10"] / M["m00"]
+    cv_ = M["m01"] / M["m00"]
+    inside = hsv[mask > 0]
+    if inside.size:
+        log("mask HSV   : H=%.0f S=%.0f V=%.0f (median)"
+            % tuple(np.median(inside, axis=0)))
+    log("green marker: area=%d px  bbox=(%d,%d %dx%d)  centroid=(%.0f, %.0f)"
+        % (area_px, x0, y0, w0, h0, cu, cv_))
+
+    d = to_metres(decode_depth(depth))
+    y0i, y1i = max(0, y0), min(d.shape[0], y0 + h0)
+    x0i, x1i = max(0, x0), min(d.shape[1], x0 + w0)
+    region = d[y0i:y1i, x0i:x1i]
+    valid = region[np.isfinite(region) & (region > 0)]
+    if valid.size == 0:
+        log("no valid depth on the marker region")
+        return
+    Z = float(np.median(valid))
+    p_cam = np.array([(cu - cx) * Z / fx, (cv_ - cy) * Z / fy, Z])
+
+    tf = Tf()
+    rospy.sleep(0.3)
+    p_base = p_cam
+    frame = color.header.frame_id or info.header.frame_id
+    M = tf.lookup(TARGET_FRAME, frame) if frame else None
+    if M is not None:
+        p_base = transform_points(M, p_cam.reshape(1, 3))[0]
+    else:
+        log("  !! no TF to %s (keeping camera frame)" % TARGET_FRAME)
+
+    width_m = (x1i - x0i) * Z / fx
+    height_m = (y1i - y0i) * Z / fy
+    log("  depth Z=%.3f m  size≈%.3f x %.3f m" % (Z, width_m, height_m))
+    log("  center (%s) = (%.3f, %.3f, %.3f)"
+        % (TARGET_FRAME if M is not None else frame,
+           p_base[0], p_base[1], p_base[2]))
+
+    import json
+    with open(WEIGH_FILE, "w") as f:
+        json.dump({"x": float(p_base[0]), "y": float(p_base[1]),
+                   "z": float(p_base[2]), "width": float(width_m),
+                   "height": float(height_m), "frame": frame}, f, indent=2)
+    log("saved %s" % WEIGH_FILE)
+
+    if args.show:
+        vis = img.copy()
+        cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 2)
+        cv2.circle(vis, (int(cu), int(cv_)), 4, (0, 0, 255), -1)
+        cv2.putText(vis, "weigh (%.2f, %.2f, %.2f)" % tuple(p_base), (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        _show_window("perception: weigh", vis, getattr(args, "live", False))
 
 
 def _show_contours(args, pts, labels, detections):
@@ -366,8 +463,8 @@ def _show_contours(args, pts, labels, detections):
     Minv = np.linalg.inv(M)
     colors = [(0, 255, 0), (0, 165, 255), (255, 0, 0), (0, 0, 255),
               (255, 0, 255), (255, 255, 0), (128, 0, 255), (0, 255, 255)]
-    for i, (k, c, center, yaw, top_z) in enumerate(detections):
-        sel = labels == k
+    for i, (det, c) in enumerate(detections):
+        sel = labels == det["label"]
         p_cam = (Minv[:3, :3] @ pts[sel].T).T + Minv[:3, 3]
         uv, ok = project(p_cam, K)
         uv = uv[ok]
@@ -378,7 +475,7 @@ def _show_contours(args, pts, labels, detections):
         col = colors[i % len(colors)]
         cv2.drawContours(color, [hull], -1, col, 2)
         cu, cv_ = hull.reshape(-1, 2).mean(axis=0).astype(int)
-        cv2.putText(color, "#%d %.2f,%.2f" % (k, center[0], center[1]),
+        cv2.putText(color, "#%d %.2f,%.2f" % (det["label"], det["x"], det["y"]),
                     (cu, max(20, cv_)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
 
     if not detections:
@@ -421,20 +518,29 @@ def _cluster(pts, tol):
     return labels
 
 
-def _pca_yaw(pts):
+def _pca_pose(pts):
+    """PCA of a cluster's XY footprint -> (center_xy, yaw_rad, extents).
+
+    extents = (along-major-axis, along-minor-axis)."""
     xy = pts[:, :2]
+    center = xy.mean(axis=0)
+    d = xy - center
     if len(xy) < 3:
-        return 0.0
-    xy = xy - xy.mean(axis=0)
-    cov = np.cov(xy.T)
+        return center, 0.0, np.zeros(2)
+    cov = np.cov(d.T)
     w, v = np.linalg.eigh(cov)
-    axis = v[:, np.argmax(w)]
-    return np.arctan2(axis[1], axis[0])
+    axis = v[:, int(np.argmax(w))]
+    yaw = float(np.arctan2(axis[1], axis[0]))
+    c, s = np.cos(yaw), np.sin(yaw)
+    p = d @ np.array([[c, s], [-s, c]]).T
+    ext = p.max(axis=0) - p.min(axis=0)
+    return center, yaw, ext
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", choices=["cloud", "ransac", "cluster"], required=True)
+    ap.add_argument("--step", choices=["cloud", "ransac", "cluster", "weigh"],
+                    required=True)
     ap.add_argument("--stride", type=int, default=DEPTH_STRIDE)
     ap.add_argument("--min-dist", type=float, default=DEPTH_MIN)
     ap.add_argument("--max-dist", type=float, default=DEPTH_MAX)
@@ -444,6 +550,10 @@ def main():
     ap.add_argument("--tol", type=float, default=CLUSTER_TOL)
     ap.add_argument("--min-cluster", type=int, default=MIN_CLUSTER)
     ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--green-lo", type=int, nargs=3, default=list(GREEN_LO),
+                    metavar=("H", "S", "V"))
+    ap.add_argument("--green-hi", type=int, nargs=3, default=list(GREEN_HI),
+                    metavar=("H", "S", "V"))
     ap.add_argument("--show", action="store_true",
                     help="open a window with an overlay (contours on the camera)")
     args = ap.parse_args()
@@ -453,6 +563,8 @@ def main():
         step_cloud(args)
     elif args.step == "ransac":
         step_ransac(args)
+    elif args.step == "weigh":
+        step_weigh(args)
     else:
         step_cluster(args)
 

@@ -11,6 +11,7 @@ At the `task>` prompt type:
     cloud                capture RGB-D -> point cloud  (step 1)
     ransac               fit + remove the table plane  (step 2)
     cluster              cluster + PCA per object      (step 3)
+    weigh                find the green weighing marker (colour)
     all                  run cloud -> ransac -> cluster
     live [SEC]           repeat cloud->ransac->cluster every SEC s (default 1.0)
     show [on|off]        toggle the overlay window for the next step
@@ -41,7 +42,7 @@ def perception_args(a):
         stride=a.stride, min_dist=a.min_dist, max_dist=a.max_dist,
         iters=a.iters, dist=a.dist, planes=a.planes, tol=a.tol,
         min_cluster=a.min_cluster, timeout=a.timeout, show=a.show,
-        live=False,
+        green_lo=a.green_lo, green_hi=a.green_hi, live=False,
     )
 
 
@@ -99,6 +100,9 @@ class TaskSequence(object):
     def do_cluster(self):
         P.step_cluster(self.pa)
 
+    def do_weigh(self):
+        P.step_weigh(self.pa)
+
     def do_live(self, period):
         self.pa.live = True
         log("live every %.1fs — Ctrl-C to stop" % period)
@@ -141,6 +145,8 @@ class TaskSequence(object):
                     self.do_ransac()
                 elif cmd == "cluster":
                     self.do_cluster()
+                elif cmd == "weigh":
+                    self.do_weigh()
                 elif cmd == "all":
                     self.do_cloud()
                     self.do_ransac()
@@ -193,6 +199,8 @@ def main():
     ap.add_argument("--planes", type=int, default=P.PLANES)
     ap.add_argument("--tol", type=float, default=P.CLUSTER_TOL)
     ap.add_argument("--min-cluster", type=int, default=P.MIN_CLUSTER)
+    ap.add_argument("--green-lo", type=int, nargs=3, default=list(P.GREEN_LO))
+    ap.add_argument("--green-hi", type=int, nargs=3, default=list(P.GREEN_HI))
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
