@@ -14,7 +14,9 @@ saves it. It also tries to transform it to base_link (prints whether TF works).
 removes it and saves the remaining object points.
 `cluster` clusters those points and prints (x, y, z, yaw) per object.
 `--show` (optional, off by default) opens a window: valid-depth pixels for
-`cloud`, object contours for `cluster`. Without it everything is headless.
+`cloud`, removed-plane (red) vs kept (green) points for `ransac`, object
+contours for `cluster`, the green marker for `weigh`. Without it everything is
+headless.
 
 Saved files live next to this script: last_cloud.npy, last_points_frame.txt,
 objects.npy, last_uv.npy, last_K.npy, last_M.npy, last_kept.npy.
@@ -320,6 +322,22 @@ def step_ransac(args):
                objs[:, 2].min(), objs[:, 2].max()))
     np.save(OBJECTS_FILE, objs)
     log("saved %s" % OBJECTS_FILE)
+
+    if args.show and os.path.exists(UV_FILE):
+        uv_all = np.load(UV_FILE)
+        color = decode_color(rospy.wait_for_message(COLOR_TOPIC, CompressedImage,
+                                                    timeout=args.timeout))
+        kept_mask = np.zeros(len(uv_all), dtype=bool)
+        kept_mask[kept] = True
+        for u, v in uv_all[~kept_mask][::4]:
+            if u >= 0:
+                cv2.circle(color, (int(u), int(v)), 1, (0, 0, 255), -1)   # removed (plane)
+        for u, v in uv_all[kept_mask][::4]:
+            if u >= 0:
+                cv2.circle(color, (int(u), int(v)), 1, (0, 255, 0), -1)   # kept (objects)
+        cv2.putText(color, "RANSAC: red=removed plane  green=objects", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        _show_window("perception: ransac", color, getattr(args, "live", False))
 
 
 def step_cluster(args):

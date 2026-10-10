@@ -18,6 +18,7 @@ Then type commands at the `arm>` prompt:
 
   ---- ABSOLUTE position (metres, in the frame FK reports) ----
     pos X Y Z                       move the hand to X Y Z, KEEP the current orientation
+    pos                             (no args) print BOTH hands' pos + rot + gripper
     x V | y V | z V                 set ONE coordinate absolutely, keep the other two
                                     and the orientation  (e.g. `z 0.45` -> height 0.45 m)
     dx V | dy V | dz V              nudge one coordinate by V (relative)
@@ -384,6 +385,27 @@ class ArmTestControl(object):
             return False
         return self._verify(tgt_pos, tgt_quat)
 
+    def move_joints(self, degrees, duration=None):
+        """Move BOTH arms to a joint-space preset (14 joint angles, degrees).
+        This is how the ACT deploy pipeline reaches its ready pose: joint-space
+        playback instead of Cartesian IK, so the two arms land symmetrically."""
+        dur = float(duration if duration is not None else self.move_time)
+        if len(degrees) != 14:
+            log("  move_joints needs 14 values, got %d" % len(degrees))
+            return False
+        with self.lock:
+            q_cur = list(self.joint_q)
+        start_deg = [math.degrees(v) for v in q_cur]
+        target_deg = [float(v) for v in degrees]
+        log("  JOINTS -> [%s]" % ", ".join("%.1f" % v for v in target_deg))
+        tmsg = armTargetPoses()
+        tmsg.times = [dur]
+        tmsg.values = list(target_deg)
+        self.target_pub.publish(tmsg)
+        self._interpolate(start_deg, target_deg, dur)
+        rospy.sleep(self.settle or SETTLE_SECONDS)
+        return self._upright()
+
     def _interpolate(self, start_deg, target_deg, duration):
         steps = max(1, int(round(duration * STREAM_HZ)))
         rate = rospy.Rate(STREAM_HZ)
@@ -504,6 +526,24 @@ class ArmTestControl(object):
                quat[0], quat[1], quat[2], quat[3]))
         log("  gripper %.1f%%" % (self.claw_pct[side] if self.claw_pct[side] is not None else -1.0))
 
+    def print_all(self):
+        """Print both hands' position + orientation, copy-paste friendly."""
+        fk = self.fk()
+        for name in ("left", "right"):
+            pose = getattr(fk, name + "_pose")
+            pos = np.array(pose.pos_xyz, dtype=float)
+            quat = list(pose.quat_xyzw)
+            r, p, y = euler_from_quaternion(quat)
+            rd, pd, yd = math.degrees(r), math.degrees(p), math.degrees(y)
+            grip = self.claw_pct[CLAW_SIDE[name]]
+            log("  %-5s pos=(%7.3f, %7.3f, %7.3f)  rpy=(%6.1f, %6.1f, %6.1f) deg"
+                % (name, pos[0], pos[1], pos[2], rd, pd, yd))
+            log("        quat=(%.3f, %.3f, %.3f, %.3f)  gripper=%s"
+                % (quat[0], quat[1], quat[2], quat[3],
+                   "?" if grip is None else "%.1f%%" % grip))
+            log("        copy: %s pos=(%.4f, %.4f, %.4f)  rpy=(%.1f, %.1f, %.1f)"
+                % (name, pos[0], pos[1], pos[2], rd, pd, yd))
+
     # ───────────────────────────── REPL
     def repl(self):
         log("")
@@ -527,7 +567,10 @@ class ArmTestControl(object):
                 elif cmd == "p":
                     self.print_pose()
                 elif cmd == "pos":
-                    self.move_to(pos=[float(v) for v in a[:3]])
+                    if len(a) >= 3:
+                        self.move_to(pos=[float(v) for v in a[:3]])
+                    else:
+                        self.print_all()
                 elif cmd in ("x", "y", "z"):
                     pos, _ = self.current_pose()
                     pos[{"x": 0, "y": 1, "z": 2}[cmd]] = float(a[0])

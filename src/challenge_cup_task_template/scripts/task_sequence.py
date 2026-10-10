@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
-"""task_sequence.py — Task 1 sequence / state machine.
+"""task_sequence.py — Task 1: camera detection + head, and go-bag arm trajectory.
 
-Default is INTERACTIVE so you can test one step at a time:
+Interactive (default):
 
     python3 task_sequence.py
 
-At the `task>` prompt type:
+At the `task>` prompt:
 
-    head                 tilt the head (uses the current pitch/yaw)
-    cloud                capture RGB-D -> point cloud  (step 1)
-    ransac               fit + remove the table plane  (step 2)
-    cluster              cluster + PCA per object      (step 3)
-    weigh                find the green weighing marker (colour)
-    all                  run cloud -> ransac -> cluster
-    live [SEC]           repeat cloud->ransac->cluster every SEC s (default 1.0)
-    show [on|off]        toggle the overlay window for the next step
+    head                 tilt the head down
+    cloud                capture RGB-D -> point cloud        (detection step 1)
+    ransac               remove floor + table planes         (detection step 2)
+    cluster              cluster + PCA -> object (x,y,z,yaw) (detection step 3)
+    weigh                find the green weighing marker      (detection step 4)
+    all                  cloud -> ransac -> cluster
+    live [SEC]           repeat detection every SEC s (default 1.0)
+    show [on|off]        toggle the overlay window
     pitch V | yaw V      head angles in degrees (pitch>0 looks down)
-    h                    help
-    q                    quit
 
-The overlay works for `cloud` (valid-depth pixels) and `cluster` (object
-contours), same as `perception.py --show`.
+    gobag [BAG]          replay a bag's arm trajectory to the ready pose
+    h / q                help / quit
 
-Non-interactive (runs TILT_HEAD -> ... -> DONE once):
+Non-interactive:
 
     python3 task_sequence.py --auto
-    python3 task_sequence.py --auto --show
+    python3 task_sequence.py --auto --ready-bag /root/kuavo_ws/go.bag
+
+`--auto` runs: TILT_HEAD -> ARM_READY (go-bag replay) -> CLOUD -> RANSAC
+-> CLUSTER -> DONE.
 """
 
 import argparse
+import os
 import time
 
 import rospy
 
 import perception as P
+
+DEFAULT_READY_BAG = "/root/kuavo_ws/go.bag"
 
 
 def perception_args(a):
@@ -57,37 +61,65 @@ class TaskSequence(object):
         self.head_pitch = args.head_pitch
         self.head_yaw = args.head_yaw
         self.state = "TILT_HEAD"
+        self.arm = None
 
-    # ── non-interactive run ─────────────────────────────────────────
-    def run_auto(self):
-        log("=== task_sequence (auto) ===")
-        while not rospy.is_shutdown() and self.state != "DONE":
-            handler = getattr(self, "st_" + self.state.lower(), None)
-            if handler is None:
-                log("no handler for state %s" % self.state)
+    # ── arm (lazy) ──────────────────────────────────────────────────
+    def ensure_arm(self):
+        if self.arm is None:
+            import arm_test_control as AC
+            log("initialising arm control (mode 2, 100 Hz stream) ...")
+            a = AC.ArmTestControl()
+            a.setup()
+            self.arm = a
+        return self.arm
+
+    def do_gobag(self, path=None):
+        """Replay a bag's whole arm trajectory (ACT `go` style) to reach ready."""
+        path = path or self.args.ready_bag or DEFAULT_READY_BAG
+        if not path or not os.path.exists(path):
+            log("  no go bag at %s — pass a path: gobag /path/to/go.bag" % path)
+            return False
+        from bag_to_ready import load_arm_traj
+        frames = load_arm_traj(path)
+        if not frames:
+            log("  no arm trajectory found in %s" % path)
+            return False
+        a = self.ensure_arm()
+        t0 = frames[0][0]
+        duration = frames[-1][0] - t0
+        log("  go bag: %d frames, %.1f s — moving to the first frame, then replaying"
+            % (len(frames), duration))
+
+        # 1) ease from the current joints to the bag's first frame
+        a.move_joints(frames[0][1])
+
+        # 2) follow the recorded trajectory in real time, resampled at the stream rate
+        hz = getattr(getattr(a, "stream", None), "_hz", 100.0)
+        steps = max(1, int(round(duration * hz)))
+        j = 0
+        rate = rospy.Rate(hz)
+        for i in range(steps + 1):
+            if rospy.is_shutdown():
                 break
-            nxt = handler()
-            log("[state] %s -> %s" % (self.state, nxt))
-            self.state = nxt
-        log("=== done ===")
+            t = t0 + duration * (float(i) / steps)
+            while j + 1 < len(frames) and frames[j + 1][0] < t:
+                j += 1
+            if j + 1 < len(frames):
+                ta, da = frames[j]
+                tb, db = frames[j + 1]
+                span = (tb - ta) or 1e-6
+                alpha = min(1.0, max(0.0, (t - ta) / span))
+                deg = [da[k] + (db[k] - da[k]) * alpha for k in range(14)]
+            else:
+                deg = frames[-1][1]
+            a.stream.set(deg)
+            rate.sleep()
+        a.stream.set(frames[-1][1])
+        rospy.sleep(a.settle or 0.4)
+        a.print_pose()
+        return True
 
-    def st_tilt_head(self):
-        self.do_head()
-        return "PERCEIVE_CLOUD"
-
-    def st_perceive_cloud(self):
-        P.step_cloud(self.pa)
-        return "PERCEIVE_RANSAC"
-
-    def st_perceive_ransac(self):
-        P.step_ransac(self.pa)
-        return "PERCEIVE_CLUSTER"
-
-    def st_perceive_cluster(self):
-        P.step_cluster(self.pa)
-        return "DONE"
-
-    # ── steps ───────────────────────────────────────────────────────
+    # ── detection steps ─────────────────────────────────────────────
     def do_head(self):
         P.set_head(self.head_yaw, self.head_pitch)
 
@@ -118,6 +150,41 @@ class TaskSequence(object):
         finally:
             self.pa.live = False
             P.destroy_windows()
+
+    # ── non-interactive run ─────────────────────────────────────────
+    def run_auto(self):
+        log("=== task_sequence (auto) ===")
+        while not rospy.is_shutdown() and self.state != "DONE":
+            handler = getattr(self, "st_" + self.state.lower(), None)
+            if handler is None:
+                log("no handler for state %s" % self.state)
+                break
+            nxt = handler()
+            log("[state] %s -> %s" % (self.state, nxt))
+            self.state = nxt
+        log("=== done ===")
+
+    # TILT_HEAD -> ARM_READY -> PERCEIVE_CLOUD -> PERCEIVE_RANSAC
+    #           -> PERCEIVE_CLUSTER -> DONE
+    def st_tilt_head(self):
+        self.do_head()
+        return "ARM_READY"
+
+    def st_arm_ready(self):
+        self.do_gobag(self.args.ready_bag)
+        return "PERCEIVE_CLOUD"
+
+    def st_perceive_cloud(self):
+        P.step_cloud(self.pa)
+        return "PERCEIVE_RANSAC"
+
+    def st_perceive_ransac(self):
+        P.step_ransac(self.pa)
+        return "PERCEIVE_CLUSTER"
+
+    def st_perceive_cluster(self):
+        P.step_cluster(self.pa)
+        return "DONE"
 
     # ── interactive ─────────────────────────────────────────────────
     def repl(self):
@@ -151,6 +218,8 @@ class TaskSequence(object):
                     self.do_cloud()
                     self.do_ransac()
                     self.do_cluster()
+                elif cmd == "live":
+                    self.do_live(float(a[0]) if a else 1.0)
                 elif cmd == "show":
                     if a and a[0].lower() in ("on", "off"):
                         self.pa.show = (a[0].lower() == "on")
@@ -163,8 +232,8 @@ class TaskSequence(object):
                 elif cmd == "yaw":
                     self.head_yaw = float(a[0])
                     log("head yaw = %.1f" % self.head_yaw)
-                elif cmd == "live":
-                    self.do_live(float(a[0]) if a else 1.0)
+                elif cmd == "gobag":
+                    self.do_gobag(a[0] if a else None)
                 else:
                     log("unknown command: %s (h = help)" % cmd)
             except (ValueError, IndexError):
@@ -183,14 +252,17 @@ class TaskSequence(object):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Task 1 sequence / state machine")
+    ap = argparse.ArgumentParser(description="Task 1: detection + go-bag arm trajectory")
     ap.add_argument("--auto", action="store_true",
                     help="run the whole sequence once instead of interactive")
     ap.add_argument("--live", type=float, default=0.0,
-                    help="tilt head then repeat perception every N seconds")
+                    help="tilt head then repeat detection every N seconds")
     ap.add_argument("--head-pitch", type=float, default=P.HEAD_PITCH,
                     help="head pitch in degrees (positive = look down)")
     ap.add_argument("--head-yaw", type=float, default=P.HEAD_YAW)
+    ap.add_argument("--ready-bag", default=None,
+                    help="bag whose arm trajectory is replayed (default %s)"
+                         % DEFAULT_READY_BAG)
     ap.add_argument("--stride", type=int, default=P.DEPTH_STRIDE)
     ap.add_argument("--min-dist", type=float, default=P.DEPTH_MIN)
     ap.add_argument("--max-dist", type=float, default=P.DEPTH_MAX)
