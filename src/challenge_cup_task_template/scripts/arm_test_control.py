@@ -572,6 +572,69 @@ class ArmTestControl(object):
             return False
         return self._verify(tgt_pos, tgt_quat)
 
+    def move_linear(self, pos, quat, n_points=5, seg_time=0.4):
+        """Move the ACTIVE hand along a Cartesian STRAIGHT line to `pos`.
+
+        The line is sampled into `n_points` waypoints, each solved with single-hand
+        IK (the other arm holds its pose), and the joint waypoints are streamed
+        continuously. Keeping every waypoint on the line stops the hand from
+        dipping mid-path (unlike a single joint-space interpolation)."""
+        quat = list(quat)
+        cur_pos, _ = self.current_pose()
+        start = np.array(cur_pos, dtype=float)
+        end = np.array(pos, dtype=float)
+        with self.lock:
+            warm = list(self.joint_q)
+        joint_wps = [[math.degrees(v) for v in warm]]
+        for k in range(1, int(n_points) + 1):
+            a = float(k) / float(n_points)
+            pt = start + (end - start) * a
+            fk = self.fk(warm)
+            l_pos = np.array(fk.left_pose.pos_xyz, dtype=float)
+            r_pos = np.array(fk.right_pose.pos_xyz, dtype=float)
+            l_quat = list(fk.left_pose.quat_xyzw)
+            r_quat = list(fk.right_pose.quat_xyzw)
+            if self.active == "right":
+                r_pos, r_quat = pt, quat
+            else:
+                l_pos, l_quat = pt, quat
+            q_cmd, res = self._solve_ik(warm, l_pos, l_quat, r_pos, r_quat, self.ik_mode)
+            if q_cmd is None:
+                q_cmd, res = self._solve_ik(warm, l_pos, l_quat, r_pos, r_quat,
+                                            IK_MODE_THREE_POINT_MIXED)
+            if q_cmd is None:
+                log("  LINEAR IK failed at segment %d/%d" % (k, int(n_points)))
+                return False
+            warm = q_cmd
+            joint_wps.append([math.degrees(v) for v in q_cmd])
+        self._publish_joint_wps(joint_wps, seg_time)
+        rospy.sleep(self.settle or SETTLE_SECONDS)
+        log("  LINEAR %-5s -> pos (%7.3f, %7.3f, %7.3f)  (%d segments)"
+            % (self.active, end[0], end[1], end[2], int(n_points)))
+        return True
+
+    def _publish_joint_wps(self, joint_wps, seg_time):
+        """Stream a list of 14-joint waypoints (degrees) back-to-back, linear."""
+        n = len(joint_wps)
+        if n == 0:
+            return
+        if n == 1:
+            self.stream.set(joint_wps[0])
+            return
+        total = max(1, int(round((n - 1) * float(seg_time) * STREAM_HZ)))
+        rate = rospy.Rate(STREAM_HZ)
+        for step in range(total + 1):
+            if rospy.is_shutdown():
+                return
+            fpos = (float(step) / float(total)) * (n - 1)
+            seg = min(int(fpos), n - 2)
+            s = fpos - seg
+            p1, p2 = joint_wps[seg], joint_wps[seg + 1]
+            self.stream.set([p1[j] + (p2[j] - p1[j]) * s for j in range(len(p1))])
+            if step < total:
+                rate.sleep()
+        self.stream.set(joint_wps[-1])
+
     def move_joints(self, degrees, duration=None):
         """Move BOTH arms to a joint-space preset (14 joint angles, degrees).
         This is how the ACT deploy pipeline reaches its ready pose: joint-space
