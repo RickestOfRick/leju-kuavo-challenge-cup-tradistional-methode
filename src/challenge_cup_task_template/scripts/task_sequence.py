@@ -24,7 +24,7 @@ At the `task>` prompt:
     hover [N] [HEIGHT]   move right hand HEIGHT m above parcel N (default 0/0.10)
     pos X Y Z            move the hand to an absolute position (m), keep orientation
     freeze [on|off]      freeze the wrist JOINTS (angles locked) — not a target
-    target [eef|wrist]   what hover aims at: the eef point (default) or the WRIST
+    target [eef|wrist]   what hover aims at: the WRIST (default) or the eef point
     offset [X Y Z]       add a fixed offset (m) to every hover target
     back [V]             pull the target back toward the robot (x -= V, default 0.05)
     face [x|-x|y|-y|z|-z|down]  lock the claw to point along an axis
@@ -39,7 +39,7 @@ At the `task>` prompt:
     wrist [Y P R]        set the 3 wrist joints (hand yaw/pitch/roll, deg); no
                          args prints them. Shoulder + elbow stay put.
     wristdown            after a wrist hover, rotate the claw down in place
-    look [N|off]         claw stays HORIZONTAL, facing parcel N (sideways grasp)
+    look [on|off]        hover faces the hovered parcel horizontally (default ON)
     elbow [X Y Z|off]    preferred elbow position (base frame) to avoid weird poses
     h / q                help / quit
 
@@ -104,7 +104,8 @@ class TaskSequence(object):
         self.armed = False                       # claw-down + ik3 set up yet?
         self.use_topdown = False                 # opt-in; off = keep orientation
         self.elbow = list(args.elbow) if args.elbow else None   # optional elbow preference
-        self.look_idx = None                     # claw faces this parcel in XY only
+        self.look_enabled = not args.no_look         # hover always faces the parcel
+        self.wrist_target = True                     # hover targets the WRIST by default
 
     # ── arm (lazy) ──────────────────────────────────────────────────
     def ensure_arm(self):
@@ -271,21 +272,40 @@ class TaskSequence(object):
         ar.print_pose()
         return ok
 
-    def apply_look(self, ar, pos):
-        """Point the claw HORIZONTALLY toward the look parcel (z = 0, no tilt)."""
-        if self.look_idx is None or not (0 <= self.look_idx < len(self.parcels)):
-            return
-        p = self.parcels[self.look_idx]
+    def apply_look(self, ar, pos, idx):
+        """Align the claw horizontally toward parcel `idx`. Returns the target
+        direction (or None)."""
+        if not (0 <= idx < len(self.parcels)):
+            return None
+        p = self.parcels[idx]
         dx = p["x"] - pos[0]
         dy = p["y"] - pos[1]
         n = math.hypot(dx, dy)
         if n < 1e-6:
-            return
+            return None
         d = [dx / n, dy / n, 0.0]           # horizontal direction toward the parcel
         ar.align_claw(d)
         ar.ik_mode = 3
         log("  look -> claw horizontal toward parcel[%d], dir=(%.2f, %.2f, 0.00)"
-            % (self.look_idx, d[0], d[1]))
+            % (idx, d[0], d[1]))
+        return d
+
+    def look_correct(self, ar, pos, d, tries=2, tol_deg=4.0):
+        """After a move, measure the real claw axis (TF) and re-align if it
+        drifted off the horizontal target direction."""
+        for k in range(tries):
+            res = ar._tf_claw_axis()
+            if res is None:
+                return
+            ax = res[0]
+            dot = max(-1.0, min(1.0, ax[0] * d[0] + ax[1] * d[1] + ax[2] * d[2]))
+            ang = math.degrees(math.acos(dot))
+            if ang <= tol_deg:
+                return
+            log("  look correct %d/%d: claw off by %.1f deg -> re-align" % (k + 1, tries, ang))
+            ar.align_claw(d)
+            ar.ik_mode = 3
+            ar.move_to(pos=pos)
 
     def do_hover(self, idx=0, height=0.10, side="right"):
         """Move the hand to a point `height` metres ABOVE parcel `idx`."""
@@ -298,6 +318,7 @@ class TaskSequence(object):
         pos = [p["x"] + ox, p["y"] + oy, p["z_top"] + height + oz]
         a = self.ensure_arm()
         a.active = side
+        a.wrist_target = self.wrist_target
         if self.elbow:
             e = list(self.elbow)
             if side == "left":
@@ -308,11 +329,13 @@ class TaskSequence(object):
             a.align_claw((0.0, 0.0, -1.0))
             a.ik_mode = 3
             self.armed = True
-        self.apply_look(a, pos)
+        d = self.apply_look(a, pos, idx) if self.look_enabled else None
         log("  hover %s above parcel[%d] (%.3f, %.3f, %.3f)  +%.2f m  offset=(%.3f, %.3f, %.3f)  target=%s"
             % (side, idx, pos[0], pos[1], pos[2], height, ox, oy, oz,
                "wrist" if a.wrist_target else "eef"))
         ok = a.move_to(pos=pos)
+        if d is not None:
+            self.look_correct(a, pos, d)
         a.print_pose()
         return ok
 
@@ -443,9 +466,7 @@ class TaskSequence(object):
                 elif cmd == "pos":
                     ar = self.ensure_arm()
                     if len(a) >= 3:
-                        pos = [float(v) for v in a[:3]]
-                        self.apply_look(ar, pos)
-                        ar.move_to(pos=pos)
+                        ar.move_to(pos=[float(v) for v in a[:3]])
                         ar.print_pose()
                     else:
                         log("  usage: pos X Y Z")
@@ -502,13 +523,12 @@ class TaskSequence(object):
                 elif cmd == "wristdown":
                     self.do_wristdown()
                 elif cmd == "look":
-                    if a and a[0].lower() == "off":
-                        self.look_idx = None
-                        log("  look OFF")
+                    if a and a[0].lower() in ("on", "off"):
+                        self.look_enabled = (a[0].lower() == "on")
                     else:
-                        self.look_idx = int(a[0]) if a else 0
-                        log("  look: claw stays HORIZONTAL, facing parcel[%d]"
-                            % self.look_idx)
+                        self.look_enabled = not self.look_enabled
+                    log("  look = %s (hover will face the hovered parcel horizontally)"
+                        % self.look_enabled)
                 elif cmd == "freeze":
                     ar = self.ensure_arm()
                     if a and a[0].lower() in ("on", "off"):
@@ -519,10 +539,11 @@ class TaskSequence(object):
                 elif cmd == "target":
                     ar = self.ensure_arm()
                     if a and a[0].lower() in ("eef", "wrist"):
-                        ar.wrist_target = (a[0].lower() == "wrist")
+                        self.wrist_target = (a[0].lower() == "wrist")
                     else:
-                        ar.wrist_target = not ar.wrist_target
-                    log("  IK target = %s" % ("wrist" if ar.wrist_target else "eef"))
+                        self.wrist_target = not self.wrist_target
+                    ar.wrist_target = self.wrist_target
+                    log("  IK target = %s" % ("wrist" if self.wrist_target else "eef"))
                 elif cmd == "offset":
                     if len(a) >= 3:
                         self.target_offset = [float(v) for v in a[:3]]
@@ -598,9 +619,11 @@ def main():
     ap.add_argument("--min-cluster", type=int, default=P.MIN_CLUSTER)
     ap.add_argument("--green-lo", type=int, nargs=3, default=list(P.GREEN_LO))
     ap.add_argument("--green-hi", type=int, nargs=3, default=list(P.GREEN_HI))
-    ap.add_argument("--offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+    ap.add_argument("--offset", type=float, nargs=3, default=[-0.3, 0.0, 0.0],
                     metavar=("X", "Y", "Z"),
                     help="offset added to every hover target (m)")
+    ap.add_argument("--no-look", action="store_true",
+                    help="disable the automatic horizontal claw aim in hover")
     ap.add_argument("--elbow", type=float, nargs=3, default=[0.15, -0.25, 0.10],
                     metavar=("X", "Y", "Z"),
                     help="preferred elbow position for hover (base frame, m); "
