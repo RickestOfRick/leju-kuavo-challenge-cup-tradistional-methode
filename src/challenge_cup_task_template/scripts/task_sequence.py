@@ -18,6 +18,29 @@ At the `task>` prompt:
     pitch V | yaw V      head angles in degrees (pitch>0 looks down)
 
     gobag [BAG]          replay a bag's arm trajectory to the ready pose
+    dets                 list detected objects (from detections.json)
+    classify             split detections into box + parcels (by size)
+    parcels              list classified parcels
+    hover [N] [HEIGHT]   move right hand HEIGHT m above parcel N (default 0/0.10)
+    pos X Y Z            move the hand to an absolute position (m), keep orientation
+    freeze [on|off]      freeze the wrist JOINTS (angles locked) — not a target
+    target [eef|wrist]   what hover aims at: the eef point (default) or the WRIST
+    offset [X Y Z]       add a fixed offset (m) to every hover target
+    back [V]             pull the target back toward the robot (x -= V, default 0.05)
+    face [x|-x|y|-y|z|-z|down]  lock the claw to point along an axis
+    orient [R P Y|off]   lock the claw orientation (degrees), or unlock
+    ik MODE              IK constraint mode: 6 = mixed (default), 3 = pos+ori hard,
+                         2 = pos hard (use 3 so `face/orient` is actually enforced)
+    pose | p             print the current hand pose (xyz + rpy)
+    check                FK vs TF pose + the TRUE claw axis (wrist->eef from TF)
+    down                 lock the orientation so the SIM claw points straight DOWN
+    topdown [on|off]     on = claw-down + ik 3 for hover (default OFF); off = revert
+    align X Y Z          lock the orientation so the claw points along (X,Y,Z)
+    wrist [Y P R]        set the 3 wrist joints (hand yaw/pitch/roll, deg); no
+                         args prints them. Shoulder + elbow stay put.
+    wristdown            after a wrist hover, rotate the claw down in place
+    look [N|off]         claw stays HORIZONTAL, facing parcel N (sideways grasp)
+    elbow [X Y Z|off]    preferred elbow position (base frame) to avoid weird poses
     h / q                help / quit
 
 Non-interactive:
@@ -30,6 +53,8 @@ Non-interactive:
 """
 
 import argparse
+import json
+import math
 import os
 import time
 
@@ -38,6 +63,17 @@ import rospy
 import perception as P
 
 DEFAULT_READY_BAG = "/root/kuavo_ws/go.bag"
+DET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detections.json")
+
+# Size thresholds (metres) for scene 1, from the scene file:
+#   parcel : 0.045 x 0.12 x 0.10   (footprint ~0.12 x 0.045, height ~0.10)
+#   box    : ~0.45 x 0.35 x 0.30   (footprint ~0.5 x 0.43,  height ~0.29)
+BOX_MIN_LENGTH = 0.30
+PARCEL_L_MIN, PARCEL_L_MAX = 0.07, 0.20
+PARCEL_W_MAX = 0.10
+PARCEL_H_MAX = 0.20
+MAX_PARCELS = 4          # scene 1 has exactly 4 parcels
+PARCEL_MERGE_DIST = 0.06  # merge parcel detections closer than this (same object)
 
 
 def perception_args(a):
@@ -62,6 +98,13 @@ class TaskSequence(object):
         self.head_yaw = args.head_yaw
         self.state = "TILT_HEAD"
         self.arm = None
+        self.box = None        # single box detection (dict)
+        self.parcels = []      # list of parcel detections (dicts)
+        self.target_offset = list(args.offset)   # add to every hover target (m)
+        self.armed = False                       # claw-down + ik3 set up yet?
+        self.use_topdown = False                 # opt-in; off = keep orientation
+        self.elbow = list(args.elbow) if args.elbow else None   # optional elbow preference
+        self.look_idx = None                     # claw faces this parcel in XY only
 
     # ── arm (lazy) ──────────────────────────────────────────────────
     def ensure_arm(self):
@@ -119,9 +162,162 @@ class TaskSequence(object):
         a.print_pose()
         return True
 
+    # ── detections / arm positioning ────────────────────────────────
+    def load_dets(self):
+        if not os.path.exists(DET_FILE):
+            log("  no detections.json — run `cluster` first")
+            return []
+        try:
+            with open(DET_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            log("  could not read %s: %s" % (DET_FILE, e))
+            return []
+
+    def do_dets(self):
+        dets = self.load_dets()
+        if not dets:
+            return
+        for i, d in enumerate(dets):
+            log("  [%d] x=%.3f y=%.3f z_top=%.3f yaw=%.1f  size=(%.3f x %.3f x %.3f)"
+                % (i, d["x"], d["y"], d["z_top"], d["yaw_deg"],
+                   d["length"], d["width"], d["height"]))
+        log("  use: hover <parcel-index> [height]   (run `classify` first)")
+
+    def do_classify(self):
+        """Split detections into self.box (one) and self.parcels (list), by size."""
+        dets = self.load_dets()
+        self.box = None
+        self.parcels = []
+        others = 0
+        for d in dets:
+            L, W, H = d["length"], d["width"], d["height"]
+            if L >= BOX_MIN_LENGTH:
+                if self.box is None:
+                    self.box = d
+                else:
+                    others += 1
+            elif PARCEL_L_MIN <= L <= PARCEL_L_MAX and W <= PARCEL_W_MAX and H <= PARCEL_H_MAX:
+                self.parcels.append(d)
+            else:
+                others += 1
+        log("  classified: %d parcel(s), box=%s, %d ignored"
+            % (len(self.parcels), "yes" if self.box else "no", others))
+
+        # dedup: merge parcels whose centres are close (one parcel split in two)
+        if len(self.parcels) > 1:
+            ranked = sorted(self.parcels, key=lambda d: -d.get("n", 0))
+            merged = []
+            for p in ranked:
+                if all(math.hypot(p["x"] - m["x"], p["y"] - m["y"]) > PARCEL_MERGE_DIST
+                       for m in merged):
+                    merged.append(p)
+            if len(merged) != len(self.parcels):
+                log("  merged %d -> %d (close clusters)"
+                    % (len(self.parcels), len(merged)))
+            self.parcels = merged
+
+        # cap: keep the largest MAX_PARCELS (scene 1 has exactly 4)
+        if len(self.parcels) > MAX_PARCELS:
+            self.parcels = sorted(self.parcels, key=lambda d: -d.get("n", 0))[:MAX_PARCELS]
+            log("  kept the %d largest parcels" % MAX_PARCELS)
+
+        # stable, spatial order so indices mean the same thing every run
+        self.parcels.sort(key=lambda d: (round(d["x"], 2), round(d["y"], 2)))
+
+        if self.box:
+            log("    box      x=%.3f y=%.3f z_top=%.3f  size=(%.3f x %.3f x %.3f)"
+                % (self.box["x"], self.box["y"], self.box["z_top"],
+                   self.box["length"], self.box["width"], self.box["height"]))
+        for i, p in enumerate(self.parcels):
+            log("    parcel[%d] x=%.3f y=%.3f z_top=%.3f yaw=%.1f  size=(%.3f x %.3f x %.3f)"
+                % (i, p["x"], p["y"], p["z_top"], p["yaw_deg"],
+                   p["length"], p["width"], p["height"]))
+        return self.parcels
+
+    def ensure_classified(self):
+        if not self.parcels and self.box is None:
+            self.do_classify()
+
+    def do_parcels(self):
+        self.ensure_classified()
+        for i, p in enumerate(self.parcels):
+            log("  parcel[%d] x=%.3f y=%.3f z_top=%.3f yaw=%.1f"
+                % (i, p["x"], p["y"], p["z_top"], p["yaw_deg"]))
+        if not self.parcels:
+            log("  (no parcels — run `cluster` then `classify`)")
+
+    def do_pose(self):
+        a = self.ensure_arm()
+        a.print_pose()
+
+    def do_wristdown(self):
+        """After a `hover` (with `target wrist`), rotate the claw to point down
+        while keeping the wrist where it is."""
+        ar = self.ensure_arm()
+        if not ar.wrist_target:
+            log("  enable 'target wrist' first (so the wrist position is what's held)")
+            return False
+        res = ar._tf_claw_axis()
+        if res is None:
+            log("  cannot read the claw axis (no TF)")
+            return False
+        _, wrist_pos, _ = res
+        ar.align_claw((0.0, 0.0, -1.0))
+        ar.ik_mode = 3
+        log("  rotating claw down, keeping wrist at (%.3f, %.3f, %.3f)"
+            % (wrist_pos[0], wrist_pos[1], wrist_pos[2]))
+        ok = ar.move_to(pos=list(wrist_pos))
+        ar.print_pose()
+        return ok
+
+    def apply_look(self, ar, pos):
+        """Point the claw HORIZONTALLY toward the look parcel (z = 0, no tilt)."""
+        if self.look_idx is None or not (0 <= self.look_idx < len(self.parcels)):
+            return
+        p = self.parcels[self.look_idx]
+        dx = p["x"] - pos[0]
+        dy = p["y"] - pos[1]
+        n = math.hypot(dx, dy)
+        if n < 1e-6:
+            return
+        d = [dx / n, dy / n, 0.0]           # horizontal direction toward the parcel
+        ar.align_claw(d)
+        ar.ik_mode = 3
+        log("  look -> claw horizontal toward parcel[%d], dir=(%.2f, %.2f, 0.00)"
+            % (self.look_idx, d[0], d[1]))
+
+    def do_hover(self, idx=0, height=0.10, side="right"):
+        """Move the hand to a point `height` metres ABOVE parcel `idx`."""
+        self.ensure_classified()
+        if idx < 0 or idx >= len(self.parcels):
+            log("  parcel index %d out of range (0..%d)" % (idx, len(self.parcels) - 1))
+            return False
+        p = self.parcels[idx]
+        ox, oy, oz = self.target_offset
+        pos = [p["x"] + ox, p["y"] + oy, p["z_top"] + height + oz]
+        a = self.ensure_arm()
+        a.active = side
+        if self.elbow:
+            e = list(self.elbow)
+            if side == "left":
+                e[1] = -e[1]         # mirror y for the left arm
+            a.elbow_pos = e
+        if self.use_topdown and not self.armed:
+            log("  (arming: claw-down orientation + ik 3)")
+            a.align_claw((0.0, 0.0, -1.0))
+            a.ik_mode = 3
+            self.armed = True
+        self.apply_look(a, pos)
+        log("  hover %s above parcel[%d] (%.3f, %.3f, %.3f)  +%.2f m  offset=(%.3f, %.3f, %.3f)  target=%s"
+            % (side, idx, pos[0], pos[1], pos[2], height, ox, oy, oz,
+               "wrist" if a.wrist_target else "eef"))
+        ok = a.move_to(pos=pos)
+        a.print_pose()
+        return ok
+
     # ── detection steps ─────────────────────────────────────────────
-    def do_head(self):
-        P.set_head(self.head_yaw, self.head_pitch)
+    def do_head(self):        P.set_head(self.head_yaw, self.head_pitch)
 
     def do_cloud(self):
         P.step_cloud(self.pa)
@@ -234,6 +430,135 @@ class TaskSequence(object):
                     log("head yaw = %.1f" % self.head_yaw)
                 elif cmd == "gobag":
                     self.do_gobag(a[0] if a else None)
+                elif cmd in ("dets", "det"):
+                    self.do_dets()
+                elif cmd == "classify":
+                    self.do_classify()
+                elif cmd in ("parcels", "parcel"):
+                    self.do_parcels()
+                elif cmd == "hover":
+                    idx = int(a[0]) if a else 0
+                    h = float(a[1]) if len(a) > 1 else 0.10
+                    self.do_hover(idx, h)
+                elif cmd == "pos":
+                    ar = self.ensure_arm()
+                    if len(a) >= 3:
+                        pos = [float(v) for v in a[:3]]
+                        self.apply_look(ar, pos)
+                        ar.move_to(pos=pos)
+                        ar.print_pose()
+                    else:
+                        log("  usage: pos X Y Z")
+                elif cmd in ("pose", "p"):
+                    self.do_pose()
+                elif cmd == "check":
+                    self.ensure_arm().check()
+                elif cmd == "down":
+                    self.ensure_arm().align_claw((0.0, 0.0, -1.0))
+                elif cmd == "topdown":
+                    ar = self.ensure_arm()
+                    if a and a[0].lower() in ("on", "off"):
+                        self.use_topdown = (a[0].lower() == "on")
+                    else:
+                        self.use_topdown = True
+                    if self.use_topdown:
+                        ar.align_claw((0.0, 0.0, -1.0))
+                        ar.ik_mode = 3
+                        self.armed = True
+                        log("  topdown ON  (claw down + ik 3)")
+                    else:
+                        import arm_test_control as AC
+                        ar.fixed_rpy = None
+                        ar.ik_mode = AC.DEFAULT_IK_MODE
+                        self.armed = False
+                        log("  topdown OFF (keep current orientation)")
+                elif cmd == "align":
+                    ar = self.ensure_arm()
+                    if len(a) >= 3:
+                        ar.align_claw([float(v) for v in a[:3]])
+                    else:
+                        log("  usage: align X Y Z")
+                elif cmd == "wrist":
+                    ar = self.ensure_arm()
+                    if len(a) >= 3:
+                        ar.set_wrist([float(v) for v in a[:3]])
+                    else:
+                        w = ar.current_wrist_deg()
+                        log("  wrist deg (yaw, pitch, roll) = (%.1f, %.1f, %.1f)"
+                            % (w[0], w[1], w[2]))
+                elif cmd == "elbow":
+                    ar = self.ensure_arm()
+                    if a and a[0].lower() == "off":
+                        self.elbow = None
+                        ar.elbow_pos = None
+                        log("  elbow preference OFF")
+                    elif len(a) >= 3:
+                        self.elbow = [float(v) for v in a[:3]]
+                        ar.elbow_pos = list(self.elbow)
+                        log("  elbow preference = (%.3f, %.3f, %.3f)"
+                            % tuple(self.elbow))
+                    else:
+                        log("  elbow preference = %s" % self.elbow)
+                elif cmd == "wristdown":
+                    self.do_wristdown()
+                elif cmd == "look":
+                    if a and a[0].lower() == "off":
+                        self.look_idx = None
+                        log("  look OFF")
+                    else:
+                        self.look_idx = int(a[0]) if a else 0
+                        log("  look: claw stays HORIZONTAL, facing parcel[%d]"
+                            % self.look_idx)
+                elif cmd == "freeze":
+                    ar = self.ensure_arm()
+                    if a and a[0].lower() in ("on", "off"):
+                        ar.freeze_wrist = (a[0].lower() == "on")
+                    else:
+                        ar.freeze_wrist = not ar.freeze_wrist
+                    log("  freeze wrist joints = %s" % ar.freeze_wrist)
+                elif cmd == "target":
+                    ar = self.ensure_arm()
+                    if a and a[0].lower() in ("eef", "wrist"):
+                        ar.wrist_target = (a[0].lower() == "wrist")
+                    else:
+                        ar.wrist_target = not ar.wrist_target
+                    log("  IK target = %s" % ("wrist" if ar.wrist_target else "eef"))
+                elif cmd == "offset":
+                    if len(a) >= 3:
+                        self.target_offset = [float(v) for v in a[:3]]
+                    log("  target offset = (%.3f, %.3f, %.3f)"
+                        % tuple(self.target_offset))
+                elif cmd == "back":
+                    v = float(a[0]) if a else 0.05
+                    self.target_offset[0] -= v
+                    log("  target offset = (%.3f, %.3f, %.3f)"
+                        % tuple(self.target_offset))
+                elif cmd == "face":
+                    ar = self.ensure_arm()
+                    which = a[0].lower() if a else "x"
+                    ar.fixed_rpy = {
+                        "x": [0.0, 90.0, 0.0], "+x": [0.0, 90.0, 0.0],
+                        "-x": [0.0, -90.0, 0.0],
+                        "y": [0.0, 90.0, 90.0], "+y": [0.0, 90.0, 90.0],
+                        "-y": [0.0, 90.0, -90.0],
+                        "z": [0.0, 0.0, 0.0], "+z": [0.0, 0.0, 0.0],
+                        "-z": [0.0, 180.0, 0.0], "down": [0.0, 180.0, 0.0],
+                        "up": [0.0, 0.0, 0.0],
+                    }.get(which)
+                    log("  claw faces %s -> orientation %s" % (which, ar.fixed_rpy))
+                elif cmd == "orient":
+                    ar = self.ensure_arm()
+                    if a and a[0].lower() == "off":
+                        ar.fixed_rpy = None
+                        log("  orientation lock OFF")
+                    else:
+                        ar.fixed_rpy = [float(v) for v in a[:3]]
+                        log("  orientation locked to (%.1f, %.1f, %.1f) deg"
+                            % tuple(ar.fixed_rpy))
+                elif cmd == "ik":
+                    ar = self.ensure_arm()
+                    ar.ik_mode = int(a[0], 0)
+                    log("  IK constraint mode = 0x%02x" % ar.ik_mode)
                 else:
                     log("unknown command: %s (h = help)" % cmd)
             except (ValueError, IndexError):
@@ -273,6 +598,13 @@ def main():
     ap.add_argument("--min-cluster", type=int, default=P.MIN_CLUSTER)
     ap.add_argument("--green-lo", type=int, nargs=3, default=list(P.GREEN_LO))
     ap.add_argument("--green-hi", type=int, nargs=3, default=list(P.GREEN_HI))
+    ap.add_argument("--offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                    metavar=("X", "Y", "Z"),
+                    help="offset added to every hover target (m)")
+    ap.add_argument("--elbow", type=float, nargs=3, default=[0.15, -0.25, 0.10],
+                    metavar=("X", "Y", "Z"),
+                    help="preferred elbow position for hover (base frame, m); "
+                         "use `elbow off` / `--elbow` to change")
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()

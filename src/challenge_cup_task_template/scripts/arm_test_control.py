@@ -45,6 +45,10 @@ Then type commands at the `arm>` prompt:
                                     3 = pos+ori-hard, 6 = three-point mixed
                                     (default 6 — most permissive; auto-retries
                                     with 6 if a stricter mode fails)
+    target eef|wrist                what move_to(pos) means: the eef frame
+                                    (default) or the WRIST (link7) position
+    freeze on|off                   freeze the 3 wrist joints (angles locked)
+    wrist [Y P R]                   set the 3 wrist joints (hand yaw/pitch/roll, deg); no args prints them
     save [NAME]                     save the current pose (default name 'home')
     goto NAME                       move back to a saved pose
     list                            list saved poses
@@ -71,7 +75,9 @@ import rospy
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
-from tf.transformations import (euler_from_quaternion, quaternion_from_euler)
+from tf.transformations import (euler_from_quaternion, quaternion_about_axis,
+                                quaternion_from_euler, quaternion_matrix,
+                                quaternion_multiply)
 
 from kuavo_msgs.msg import (armTargetPoses, ikSolveParam, lejuClawState,
                             sensorsData, twoArmHandPoseCmd)
@@ -185,6 +191,11 @@ class ArmTestControl(object):
         self.move_time = MOVE_SECONDS
         self.settle = SETTLE_SECONDS
         self.ik_mode = DEFAULT_IK_MODE
+        self.freeze_wrist = False      # keep the 3 wrist joints where they are
+        self.wrist_target = False      # treat move_to(pos) as the WRIST target
+        self.fixed_rpy = None          # lock orientation (degrees) for pos-only moves
+        self.elbow_pos = None          # preferred elbow position (base frame)
+        self.tf_buffer = None
         self.lock = threading.Lock()
         self.joint_q = None
         self.roll = self.pitch = 0.0
@@ -246,6 +257,13 @@ class ArmTestControl(object):
         self.ik_srv = rospy.ServiceProxy(IK_SRV, twoArmHandPoseCmdSrv)
         self.claw_srv = rospy.ServiceProxy(CLAW_SRV, controlLejuClaw)
 
+        try:
+            import tf2_ros
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        except Exception as e:
+            log("  (tf2 not available: %s)" % e)
+
         mode_req = changeArmCtrlModeRequest()
         mode_req.control_mode = ARM_MODE
         rospy.ServiceProxy(ARM_MODE_SRV, changeArmCtrlMode)(mode_req)
@@ -305,8 +323,15 @@ class ArmTestControl(object):
         cmd.ik_param = self._ik_param(mode)
         cmd.hand_poses.left_pose.joint_angles = q_cur[:7]
         cmd.hand_poses.right_pose.joint_angles = q_cur[7:]
-        cmd.hand_poses.left_pose.elbow_pos_xyz = np.zeros(3)
-        cmd.hand_poses.right_pose.elbow_pos_xyz = np.zeros(3)
+        l_elbow = np.zeros(3)
+        r_elbow = np.zeros(3)
+        if self.elbow_pos is not None:
+            if self.active == "right":
+                r_elbow = np.array(self.elbow_pos, dtype=float)
+            else:
+                l_elbow = np.array(self.elbow_pos, dtype=float)
+        cmd.hand_poses.left_pose.elbow_pos_xyz = l_elbow
+        cmd.hand_poses.right_pose.elbow_pos_xyz = r_elbow
         cmd.hand_poses.left_pose.pos_xyz = l_pos
         cmd.hand_poses.left_pose.quat_xyzw = l_quat
         cmd.hand_poses.right_pose.pos_xyz = r_pos
@@ -322,12 +347,165 @@ class ArmTestControl(object):
         return q_cmd, res
 
     # ───────────────────────────── motion
+    def _wrist_offset(self):
+        """Base-frame vector from the wrist (link7) to the eef frame, current pose."""
+        if self.tf_buffer is None:
+            return None
+        side = "r" if self.active == "right" else "l"
+        try:
+            w = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s7_link" % side, rospy.Time(0), rospy.Duration(1.0))
+            e = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s7_end_effector" % side, rospy.Time(0),
+                rospy.Duration(1.0))
+        except Exception as ex:
+            log("  wrist offset TF failed: %s" % ex)
+            return None
+        pw = np.array([w.transform.translation.x, w.transform.translation.y,
+                       w.transform.translation.z])
+        pe = np.array([e.transform.translation.x, e.transform.translation.y,
+                       e.transform.translation.z])
+        return pe - pw
+
+    def check(self):
+        """Print FK pose vs TF pose and the TRUE claw axis (wrist -> eef from TF)."""
+        side = "r" if self.active == "right" else "l"
+        pos, quat = self.current_pose()
+        r, p, y = euler_from_quaternion(quat)
+        log("  FK  eef pos=(%.3f, %.3f, %.3f)  rpy=(%.1f, %.1f, %.1f)"
+            % (pos[0], pos[1], pos[2], math.degrees(r), math.degrees(p), math.degrees(y)))
+        if self.tf_buffer is None:
+            log("  (no TF available)")
+            return
+        try:
+            w = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s7_link" % side, rospy.Time(0), rospy.Duration(1.0))
+            e = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s7_end_effector" % side, rospy.Time(0),
+                rospy.Duration(1.0))
+        except Exception as ex:
+            log("  TF failed: %s" % ex)
+            return
+        pw = np.array([w.transform.translation.x, w.transform.translation.y,
+                       w.transform.translation.z])
+        pe = np.array([e.transform.translation.x, e.transform.translation.y,
+                       e.transform.translation.z])
+        d = pe - pw
+        n = np.linalg.norm(d)
+        axis = d / n if n > 1e-9 else d
+        log("  TF  wrist=(%.3f, %.3f, %.3f)  eef=(%.3f, %.3f, %.3f)  |wrist->eef|=%.3f m"
+            % (pw[0], pw[1], pw[2], pe[0], pe[1], pe[2], n))
+        log("  TF claw axis (wrist->eef) = (%.2f, %.2f, %.2f)  [base frame]%s"
+            % (axis[0], axis[1], axis[2], "  -> DOWN" if axis[2] < -0.9 else ""))
+        log("  FK vs TF eef delta = %.1f mm" % (np.linalg.norm(pos - pe) * 1000.0))
+        try:
+            el = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s4_link" % side, rospy.Time(0), rospy.Duration(1.0))
+            e = el.transform.translation
+            log("  TF elbow (zarm_%s4_link) = (%.3f, %.3f, %.3f)  pref=%s"
+                % (side, e.x, e.y, e.z,
+                   "none" if self.elbow_pos is None else
+                   "(%.3f, %.3f, %.3f)" % tuple(self.elbow_pos)))
+        except Exception:
+            log("  (no elbow TF frame zarm_%s4_link)" % side)
+
+    def _tf_claw_axis(self):
+        """(axis, wrist_pos, eef_pos) of the TRUE claw direction from TF, or None."""
+        if self.tf_buffer is None:
+            return None
+        side = "r" if self.active == "right" else "l"
+        try:
+            w = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s7_link" % side, rospy.Time(0), rospy.Duration(1.0))
+            e = self.tf_buffer.lookup_transform(
+                "base_link", "zarm_%s7_end_effector" % side, rospy.Time(0),
+                rospy.Duration(1.0))
+        except Exception as ex:
+            log("  TF failed: %s" % ex)
+            return None
+        pw = np.array([w.transform.translation.x, w.transform.translation.y,
+                       w.transform.translation.z])
+        pe = np.array([e.transform.translation.x, e.transform.translation.y,
+                       e.transform.translation.z])
+        d = pe - pw
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            return None
+        return d / n, pw, pe
+
+    def align_claw(self, target_dir=(0.0, 0.0, -1.0)):
+        """Compute the IK orientation that makes the SIM claw point along
+        target_dir (base frame), and lock it. Uses the measured claw axis."""
+        res = self._tf_claw_axis()
+        if res is None:
+            log("  cannot align: no TF/claw axis")
+            return False
+        a, _, _ = res
+        b = np.array(target_dir, dtype=float)
+        b = b / np.linalg.norm(b)
+        v = np.cross(a, b)
+        s = np.linalg.norm(v)
+        c = float(np.dot(a, b))
+        if s < 1e-6:
+            q_align = [0.0, 0.0, 0.0, 1.0] if c > 0 else \
+                list(quaternion_about_axis(np.pi, (1, 0, 0)))
+        else:
+            q_align = list(quaternion_about_axis(np.arctan2(s, c), v / s))
+        _, q_ik = self.current_pose()          # current IK-frame orientation
+        q_new = list(quaternion_multiply(q_align, q_ik))
+        self.fixed_rpy = [math.degrees(x) for x in euler_from_quaternion(q_new)]
+        log("  current claw axis = (%.2f, %.2f, %.2f), wanted (%.2f, %.2f, %.2f)"
+            % (a[0], a[1], a[2], b[0], b[1], b[2]))
+        log("  orientation lock -> (%.1f, %.1f, %.1f) deg  (use ik 3 then move)"
+            % tuple(self.fixed_rpy))
+        return True
+
+    def current_wrist_deg(self):
+        with self.lock:
+            q = list(self.joint_q) if self.joint_q is not None else []
+        base = 7 if self.active == "right" else 0
+        return [math.degrees(q[base + k]) for k in (4, 5, 6)]
+
+    def set_wrist(self, vals):
+        """Set the 3 wrist joints (hand_yaw, hand_pitch, hand_roll) in degrees,
+        leaving shoulder + elbow (and the other arm) where they are."""
+        with self.lock:
+            q = list(self.joint_q) if self.joint_q is not None else []
+        if len(q) != 14:
+            log("  no joint data yet")
+            return False
+        deg = [math.degrees(v) for v in q]
+        base = 7 if self.active == "right" else 0
+        for i, k in enumerate((4, 5, 6)):
+            deg[base + k] = float(vals[i])
+        log("  wrist (yaw, pitch, roll) -> (%.1f, %.1f, %.1f) deg"
+            % (float(vals[0]), float(vals[1]), float(vals[2])))
+        return self.move_joints(deg)
+
     def move_to(self, pos=None, quat=None):
         """Move the ACTIVE hand to an absolute position and/or quaternion.
         Whichever of pos/quat is None is taken from the current FK pose."""
         cur_pos, cur_quat = self.current_pose()
         tgt_pos = np.array(pos, dtype=float) if pos is not None else cur_pos.copy()
         tgt_quat = list(quat) if quat is not None else list(cur_quat)
+
+        if quat is None and self.fixed_rpy is not None:
+            tgt_quat = list(quaternion_from_euler(
+                *[math.radians(v) for v in self.fixed_rpy]))
+
+        if self.wrist_target and pos is not None:
+            off = self._wrist_offset()
+            if off is not None:
+                # the wrist->eef vector rotates with the hand; if we also change
+                # the orientation, rotate the measured offset into the target frame
+                if quat is None and self.fixed_rpy is not None:
+                    q_tgt = quaternion_from_euler(
+                        *[math.radians(v) for v in self.fixed_rpy])
+                    Rc = quaternion_matrix(cur_quat)[:3, :3]
+                    Rt = quaternion_matrix(q_tgt)[:3, :3]
+                    off = Rt.dot(Rc.T.dot(off))
+                tgt_pos = tgt_pos + off
+                log("  (wrist target: eef = wrist + [%.3f %.3f %.3f])" % tuple(off))
 
         d_xy = math.hypot(tgt_pos[0], tgt_pos[1])
         if d_xy > MAX_ABS_XY:
@@ -361,6 +539,15 @@ class ArmTestControl(object):
             log("    * orientation unreachable at that position -> try `ik 2` or `ik 6`")
             log("    * solver time_cost %.1f ms" % res.time_cost)
             return False
+
+        if self.freeze_wrist:
+            # keep the 3 wrist joints (indices 4,5,6) at their current values,
+            # so only shoulder + elbow move.
+            base = 7 if self.active == "right" else 0
+            for k in (4, 5, 6):
+                if base + k < len(q_cmd):
+                    q_cmd[base + k] = q_cur[base + k]
+            log("  (wrist frozen: only shoulder + elbow move)")
 
         log("  ABS %-5s -> pos (%7.3f, %7.3f, %7.3f)   rpy %s"
             % (self.active, tgt_pos[0], tgt_pos[1], tgt_pos[2],
@@ -525,6 +712,11 @@ class ArmTestControl(object):
             % (math.degrees(r), math.degrees(p), math.degrees(y),
                quat[0], quat[1], quat[2], quat[3]))
         log("  gripper %.1f%%" % (self.claw_pct[side] if self.claw_pct[side] is not None else -1.0))
+        R = quaternion_matrix(quat)[:3, :3]
+        zdir = R.dot(np.array([0.0, 0.0, 1.0]))
+        down = " -> pointing DOWN" if zdir[2] < -0.9 else ""
+        log("  claw axis (eef z) = (%.2f, %.2f, %.2f)  [base frame]%s"
+            % (zdir[0], zdir[1], zdir[2], down))
 
     def print_all(self):
         """Print both hands' position + orientation, copy-paste friendly."""
@@ -610,6 +802,47 @@ class ArmTestControl(object):
                 elif cmd == "ik":
                     self.ik_mode = int(a[0], 0)
                     log("  IK constraint mode = 0x%02x" % self.ik_mode)
+                elif cmd == "freeze":
+                    if a and a[0].lower() in ("on", "off"):
+                        self.freeze_wrist = (a[0].lower() == "on")
+                    else:
+                        self.freeze_wrist = not self.freeze_wrist
+                    log("  freeze wrist joints = %s" % self.freeze_wrist)
+                elif cmd == "target":
+                    if a and a[0].lower() in ("eef", "wrist"):
+                        self.wrist_target = (a[0].lower() == "wrist")
+                    else:
+                        self.wrist_target = not self.wrist_target
+                    log("  IK target = %s" % ("wrist (link7)" if self.wrist_target else "eef"))
+                elif cmd == "orient":
+                    if a and a[0].lower() == "off":
+                        self.fixed_rpy = None
+                        log("  orientation lock OFF")
+                    elif a and a[0].lower() == "here":
+                        _, q = self.current_pose()
+                        self.fixed_rpy = [math.degrees(v)
+                                          for v in euler_from_quaternion(q)]
+                        log("  orientation locked to current: (%.1f, %.1f, %.1f) deg"
+                            % tuple(self.fixed_rpy))
+                    else:
+                        self.fixed_rpy = [float(v) for v in a[:3]]
+                        log("  orientation locked to (%.1f, %.1f, %.1f) deg"
+                            % tuple(self.fixed_rpy))
+                elif cmd == "face":
+                    which = a[0].lower() if a else "x"
+                    # eef z-axis (wrist -> fingers) pointed along a base axis:
+                    #   (0, 90, yaw)  -> horizontal;  yaw 0/90/-90 = +x/+y/-y
+                    #   (0,  0,  0)   -> +z ;  (0,180,0) -> -z (pointing down)
+                    self.fixed_rpy = {
+                        "x": [0.0, 90.0, 0.0], "+x": [0.0, 90.0, 0.0],
+                        "-x": [0.0, -90.0, 0.0],
+                        "y": [0.0, 90.0, 90.0], "+y": [0.0, 90.0, 90.0],
+                        "-y": [0.0, 90.0, -90.0],
+                        "z": [0.0, 0.0, 0.0], "+z": [0.0, 0.0, 0.0],
+                        "-z": [0.0, 180.0, 0.0], "down": [0.0, 180.0, 0.0],
+                        "up": [0.0, 0.0, 0.0],
+                    }.get(which)
+                    log("  claw faces %s -> orientation %s" % (which, self.fixed_rpy))
                 elif cmd == "reset":
                     self.reset_all()
                 elif cmd == "save":
@@ -627,6 +860,32 @@ class ArmTestControl(object):
                         self.move_to(pos=p["pos"], quat=p["quat"])
                 elif cmd == "list":
                     log("  saved: %s" % (", ".join(self.poses) or "(none)"))
+                elif cmd == "check":
+                    self.check()
+                elif cmd == "down":
+                    self.align_claw((0.0, 0.0, -1.0))
+                elif cmd == "align":
+                    if len(a) >= 3:
+                        self.align_claw([float(v) for v in a[:3]])
+                    else:
+                        log("  usage: align X Y Z")
+                elif cmd == "wrist":
+                    if len(a) >= 3:
+                        self.set_wrist([float(v) for v in a[:3]])
+                    else:
+                        w = self.current_wrist_deg()
+                        log("  wrist deg (yaw, pitch, roll) = (%.1f, %.1f, %.1f)"
+                            % (w[0], w[1], w[2]))
+                elif cmd == "elbow":
+                    if a and a[0].lower() == "off":
+                        self.elbow_pos = None
+                        log("  elbow preference OFF")
+                    elif len(a) >= 3:
+                        self.elbow_pos = [float(v) for v in a[:3]]
+                        log("  elbow preference = (%.3f, %.3f, %.3f) [base frame]"
+                            % tuple(self.elbow_pos))
+                    else:
+                        log("  elbow preference = %s" % self.elbow_pos)
                 else:
                     log("  unknown command: %s   (h = help)" % cmd)
             except (ValueError, IndexError):
