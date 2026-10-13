@@ -385,7 +385,11 @@ def step_cluster(args):
 
 
 def step_weigh(args):
-    """Find the green weighing marker by colour, return its base-frame pose."""
+    """Find the green weighing marker by colour + depth, return its base-frame pose.
+
+    Several surfaces are green (floor, table top, sorting box inner), so we
+    deproject EVERY green blob and keep the ones landing on the table
+    (base_link y < 0), then take the largest of those.  All candidates are logged."""
     info = rospy.wait_for_message(INFO_TOPIC, CameraInfo, timeout=args.timeout)
     color = rospy.wait_for_message(COLOR_TOPIC, CompressedImage, timeout=args.timeout)
     depth = rospy.wait_for_message(DEPTH_TOPIC, CompressedImage, timeout=args.timeout)
@@ -403,57 +407,79 @@ def step_weigh(args):
     if not cnts:
         log("no green region found — adjust --green-lo/--green-hi")
         return
-    cnt = max(cnts, key=cv2.contourArea)
-    area_px = cv2.contourArea(cnt)
-    x0, y0, w0, h0 = cv2.boundingRect(cnt)
-    M = cv2.moments(cnt)
-    cu = M["m10"] / M["m00"]
-    cv_ = M["m01"] / M["m00"]
     inside = hsv[mask > 0]
-    if inside.size:
+    show = getattr(args, "show", False)
+    if show and inside.size:
         log("mask HSV   : H=%.0f S=%.0f V=%.0f (median)"
             % tuple(np.median(inside, axis=0)))
-    log("green marker: area=%d px  bbox=(%d,%d %dx%d)  centroid=(%.0f, %.0f)"
-        % (area_px, x0, y0, w0, h0, cu, cv_))
 
     d = to_metres(decode_depth(depth))
-    y0i, y1i = max(0, y0), min(d.shape[0], y0 + h0)
-    x0i, x1i = max(0, x0), min(d.shape[1], x0 + w0)
-    region = d[y0i:y1i, x0i:x1i]
-    valid = region[np.isfinite(region) & (region > 0)]
-    if valid.size == 0:
-        log("no valid depth on the marker region")
-        return
-    Z = float(np.median(valid))
-    p_cam = np.array([(cu - cx) * Z / fx, (cv_ - cy) * Z / fy, Z])
-
+    frame = color.header.frame_id or info.header.frame_id
     tf = Tf()
     rospy.sleep(0.3)
-    p_base = p_cam
-    frame = color.header.frame_id or info.header.frame_id
     M = tf.lookup(TARGET_FRAME, frame) if frame else None
-    if M is not None:
-        p_base = transform_points(M, p_cam.reshape(1, 3))[0]
-    else:
+    if M is None:
         log("  !! no TF to %s (keeping camera frame)" % TARGET_FRAME)
 
-    width_m = (x1i - x0i) * Z / fx
-    height_m = (y1i - y0i) * Z / fy
-    log("  depth Z=%.3f m  size≈%.3f x %.3f m" % (Z, width_m, height_m))
-    log("  center (%s) = (%.3f, %.3f, %.3f)"
-        % (TARGET_FRAME if M is not None else frame,
-           p_base[0], p_base[1], p_base[2]))
+    def deproject(cnt):
+        area = cv2.contourArea(cnt)
+        x0, y0, w0, h0 = cv2.boundingRect(cnt)
+        mm = cv2.moments(cnt)
+        if mm["m00"] <= 0:
+            return None
+        cu = mm["m10"] / mm["m00"]
+        cv_ = mm["m01"] / mm["m00"]
+        y0i, y1i = max(0, y0), min(d.shape[0], y0 + h0)
+        x0i, x1i = max(0, x0), min(d.shape[1], x0 + w0)
+        region = d[y0i:y1i, x0i:x1i]
+        valid = region[np.isfinite(region) & (region > 0)]
+        if valid.size == 0:
+            return None
+        Z = float(np.median(valid))
+        p_cam = np.array([(cu - cx) * Z / fx, (cv_ - cy) * Z / fy, Z])
+        p_base = transform_points(M, p_cam.reshape(1, 3))[0] if M is not None else p_cam
+        return {"cnt": cnt, "area": area, "bbox": (x0, y0, w0, h0),
+                "centroid": (cu, cv_), "Z": Z, "pos": p_base,
+                "width": (x1i - x0i) * Z / fx, "height": (y1i - y0i) * Z / fy}
+
+    cands = [c for c in (deproject(c) for c in cnts) if c is not None]
+    if not cands:
+        log("no green candidate with valid depth")
+        return
+    if show:
+        for c in cands:
+            p = c["pos"]
+            log("  candidate area=%5d px  Z=%.3f  base=(%.3f, %.3f, %.3f)  size≈%.3f x %.3f"
+                % (c["area"], c["Z"], p[0], p[1], p[2], c["width"], c["height"]))
+
+    on_table = [c for c in cands if c["pos"][1] < 0.0]   # marker is on the table; box is not
+    if not on_table:
+        log("  (no green blob on the table side — using the largest overall)")
+    best = max(on_table or cands, key=lambda c: c["area"])
+
+    x0, y0, w0, h0 = best["bbox"]
+    cu, cv_ = best["centroid"]
+    p_base = best["pos"]
+    if show:
+        log("green marker: area=%d px  bbox=(%d,%d %dx%d)  centroid=(%.0f, %.0f)"
+            % (best["area"], x0, y0, w0, h0, cu, cv_))
+        log("  depth Z=%.3f m  size≈%.3f x %.3f m"
+            % (best["Z"], best["width"], best["height"]))
+    log("weigh: %s = (%.3f, %.3f, %.3f)"
+        % (TARGET_FRAME if M is not None else frame, p_base[0], p_base[1], p_base[2]))
 
     import json
     with open(WEIGH_FILE, "w") as f:
         json.dump({"x": float(p_base[0]), "y": float(p_base[1]),
-                   "z": float(p_base[2]), "width": float(width_m),
-                   "height": float(height_m), "frame": frame}, f, indent=2)
-    log("saved %s" % WEIGH_FILE)
+                   "z": float(p_base[2]), "width": float(best["width"]),
+                   "height": float(best["height"]), "area": int(best["area"]),
+                   "frame": frame}, f, indent=2)
+    if show:
+        log("saved %s" % WEIGH_FILE)
 
     if args.show:
         vis = img.copy()
-        cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 2)
+        cv2.drawContours(vis, [best["cnt"]], -1, (0, 255, 0), 2)
         cv2.circle(vis, (int(cu), int(cv_)), 4, (0, 0, 255), -1)
         cv2.putText(vis, "weigh (%.2f, %.2f, %.2f)" % tuple(p_base), (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)

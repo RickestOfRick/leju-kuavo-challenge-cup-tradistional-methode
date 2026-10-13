@@ -79,8 +79,8 @@ from tf.transformations import (euler_from_quaternion, quaternion_about_axis,
                                 quaternion_from_euler, quaternion_matrix,
                                 quaternion_multiply)
 
-from kuavo_msgs.msg import (armTargetPoses, ikSolveParam, lejuClawState,
-                            sensorsData, twoArmHandPoseCmd)
+from kuavo_msgs.msg import (armTargetPoses, ikSolveParam, lejuClawCommand,
+                            lejuClawState, sensorsData, twoArmHandPoseCmd)
 from kuavo_msgs.srv import (changeArmCtrlMode, changeArmCtrlModeRequest,
                             controlLejuClaw, controlLejuClawRequest, fkSrv,
                             twoArmHandPoseCmdSrv)
@@ -95,6 +95,8 @@ CLAW_SIDE = {"left": 0, "right": 1}
 FK_SRV = "/ik/fk_srv"
 IK_SRV = "/ik/two_arm_hand_pose_cmd_srv"
 CLAW_SRV = "/control_robot_leju_claw"
+CLAW_CMD_TOPIC = "/leju_claw_command"
+CLAW_STATE_TOPIC = "/leju_claw_state"
 ARM_MODE_SRV = "/arm_traj_change_mode"
 TARGET_POSES_TOPIC = "/kuavo_arm_target_poses"
 ARM_TRAJ_TOPIC = "/kuavo_arm_traj"
@@ -123,6 +125,10 @@ MAX_ABS_XY = 1.2                   # refuse an absolute XY beyond this from the 
 POS_TOL_MM = 15.0                  # warn above this position error
 ORI_TOL_DEG = 8.0                  # warn above this orientation error
 SERVICE_TIMEOUT = 30.0
+CLAW_HOLD_HZ = 50.0                # rate of the continuous claw command
+CLAW_EFFORT = 2.0                  # grip force (claw docs: 1-2 A; 1.0 = weak)
+CLAW_GRABBED = 3                   # lejuClawState.state value meaning "grabbed"
+CLAW_REACHED = 2                   # jaw closed but nothing between them
 POSE_FILE = "/root/.ros/arm_test_poses.json"
 # ─────────────────────────────────────────────────────────────────
 
@@ -185,6 +191,60 @@ class ArmTrajStream(object):
             rate.sleep()
 
 
+class ClawHold(object):
+    """Continuously publishes /leju_claw_command at CLAW_HOLD_HZ, holding the last
+    claw setpoint. A one-shot command can relax; re-sending keeps the clamp force
+    applied while the arm moves, and lets us re-command the grip on a slip."""
+
+    def __init__(self, pub, hz=CLAW_HOLD_HZ):
+        self._pub = pub
+        self._hz = float(hz)
+        self._lock = threading.Lock()
+        self._pos = [0.0, 0.0]
+        self._vel = [80.0, 80.0]
+        self._eff = [CLAW_EFFORT, CLAW_EFFORT]
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="claw_hold", daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def set(self, pos, vel=None, eff=None):
+        with self._lock:
+            self._pos = [float(v) for v in pos]
+            if vel is not None:
+                self._vel = [float(v) for v in vel]
+            if eff is not None:
+                self._eff = [float(v) for v in eff]
+
+    def get(self):
+        with self._lock:
+            return list(self._pos)
+
+    def _run(self):
+        rate = rospy.Rate(self._hz)
+        while not self._stop.is_set() and not rospy.is_shutdown():
+            with self._lock:
+                pos = list(self._pos)
+                vel = list(self._vel)
+                eff = list(self._eff)
+            msg = lejuClawCommand()
+            msg.header.stamp = rospy.Time.now()
+            msg.data.name = list(CLAW_NAMES)
+            msg.data.position = pos
+            msg.data.velocity = vel
+            msg.data.effort = eff
+            self._pub.publish(msg)
+            rate.sleep()
+
+
 class ArmTestControl(object):
     def __init__(self):
         self.active = "right"
@@ -200,18 +260,22 @@ class ArmTestControl(object):
         self.joint_q = None
         self.roll = self.pitch = 0.0
         self.claw_pct = [None, None]
+        self.claw_state = [0, 0]       # lejuClawState.state: 3 = grabbed
         self.poses = {}
         self.stream = None
+        self.claw_hold = None
         self._load_poses()
 
         rospy.Subscriber("/sensors_data_raw", sensorsData, self._on_sensors,
                          queue_size=1)
-        rospy.Subscriber("/leju_claw_state", lejuClawState, self._on_claw,
+        rospy.Subscriber(CLAW_STATE_TOPIC, lejuClawState, self._on_claw,
                          queue_size=1)
 
         self.traj_pub = rospy.Publisher(ARM_TRAJ_TOPIC, JointState, queue_size=10)
         self.target_pub = rospy.Publisher(TARGET_POSES_TOPIC, armTargetPoses,
                                           queue_size=10)
+        self.claw_cmd_pub = rospy.Publisher(CLAW_CMD_TOPIC, lejuClawCommand,
+                                            queue_size=10)
         self.stop_pub = rospy.Publisher("/stop_robot", Bool, queue_size=10)
         self.vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
 
@@ -229,6 +293,9 @@ class ArmTestControl(object):
             if len(msg.data.position) >= 2:
                 self.claw_pct[0] = float(msg.data.position[0])
                 self.claw_pct[1] = float(msg.data.position[1])
+            if len(msg.state) >= 2:
+                self.claw_state[0] = int(msg.state[0])
+                self.claw_state[1] = int(msg.state[1])
 
     @staticmethod
     def _quat_to_roll_pitch(x, y, z, w):
@@ -284,6 +351,12 @@ class ArmTestControl(object):
         self.stream = ArmTrajStream(self.traj_pub, [math.degrees(v) for v in q])
         self.stream.start()
         log("  /kuavo_arm_traj stream started at %.0f Hz" % STREAM_HZ)
+
+        self.claw_hold = ClawHold(self.claw_cmd_pub)
+        self.claw_hold.set(self.claw_hold.get())    # open both
+        self.claw_hold.start()
+        log("  %s hold started at %.0f Hz (effort=%.1f)"
+            % (CLAW_CMD_TOPIC, CLAW_HOLD_HZ, CLAW_EFFORT))
         log("ready.  active arm = %s   move = %.1f s   IK mode = 0x%02x"
             % (self.active, self.move_time, self.ik_mode))
 
@@ -691,8 +764,9 @@ class ArmTestControl(object):
         return True
 
     # ───────────────────────────── gripper
-    def set_gripper(self, pct):
+    def set_gripper(self, pct, effort=None):
         pct = max(0.0, min(100.0, float(pct)))
+        eff = CLAW_EFFORT if effort is None else float(effort)
         with self.lock:
             left = self.claw_pct[0] if self.claw_pct[0] is not None else 0.0
             right = self.claw_pct[1] if self.claw_pct[1] is not None else 0.0
@@ -700,14 +774,45 @@ class ArmTestControl(object):
             right = pct
         else:
             left = pct
+        pos = [left, right]
+        if self.claw_hold is not None:               # keep re-sending this command
+            self.claw_hold.set(pos, eff=[eff, eff])
         req = controlLejuClawRequest()
         req.data.name = CLAW_NAMES
-        req.data.position = [left, right]
+        req.data.position = pos
         req.data.velocity = [80.0, 80.0]
-        req.data.effort = [1.0, 1.0]
+        req.data.effort = [eff, eff]
         self.claw_srv(req)
         time.sleep(GRIPPER_SETTLE)
-        log("  %s gripper -> %.0f%%" % (self.active, pct))
+        log("  %s gripper -> %.0f%%  (effort %.1f, hold on)" % (self.active, pct, eff))
+
+    def claw_state_of(self, side=None):
+        """(state, closure%) of one claw. state: 0 unknown,1 moving,2 reached/empty,3 grabbed."""
+        s = CLAW_SIDE[self.active if side is None else side]
+        with self.lock:
+            return self.claw_state[s], self.claw_pct[s]
+
+    def grip_close_loop(self, timeout=2.0, effort=None):
+        """Close the ACTIVE claw through the hold, then watch the claw STATE.
+
+        The claw reports `kGrabbed` when it has an object between the jaws. While
+        holding, /leju_claw_command keeps re-commanding the close so the force is
+        maintained during the carry. Returns True if it grabbed."""
+        side = CLAW_SIDE[self.active]
+        self.set_gripper(100.0, effort=effort)
+        t0 = time.time()
+        while not rospy.is_shutdown() and time.time() - t0 < timeout:
+            st, pct = self.claw_state_of()
+            closure = "?" if pct is None else "%.1f%%" % pct
+            if st == CLAW_GRABBED:
+                log("  %s claw: GRABBED (state=3, closure %s) — holding" % (self.active, closure))
+                return True
+            if st == CLAW_REACHED:
+                log("  %s claw: closed EMPTY (state=2, closure %s)" % (self.active, closure))
+                return False
+            time.sleep(0.1)
+        log("  %s claw: no grab confirmed in %.1fs" % (self.active, timeout))
+        return False
 
     # ───────────────────────────── reset
     def reset_all(self):
@@ -959,6 +1064,8 @@ class ArmTestControl(object):
     def shutdown(self):
         if self.stream is not None:
             self.stream.stop()
+        if self.claw_hold is not None:
+            self.claw_hold.stop()
         try:
             self.vel_pub.publish(Twist())
             self.stop_pub.publish(Bool(True))

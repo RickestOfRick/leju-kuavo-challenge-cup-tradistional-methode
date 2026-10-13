@@ -12,13 +12,20 @@ At the `task>` prompt:
     cluster              cluster + PCA -> objects (x, y, z, yaw)
     weigh                find the green weighing marker
     all                  cloud -> ransac -> cluster
+    detect               head -> cloud -> ransac -> cluster -> classify -> weigh (one shot)
     live [SEC]           repeat detection every SEC s (default 1.0)
-    show [on|off]        toggle the overlay window
     pitch V | yaw V      head angles in degrees (pitch>0 looks down)
 
   ---- arm ----
     gobag [BAG]          replay the go-bag arm trajectory to the ready pose
+    home [SEC]           both arms to the ready pose (joint space, default 1.5 s, no bag)
+    sethome              capture the CURRENT arm joints as the retract waypoint for `home`
     pick [N]             phase 1: pick parcel N (align above -> descend -> clamp)
+    wrist [Y P R]        print or set the 3 wrist joint angles (degrees)
+    joints               print the current 14 arm joint angles (degrees) — to capture a pose
+    j INDEX VALUE        set ONE arm joint (0..13) to VALUE degrees (0-6 left, 7-13 right)
+    lift [Z]             move the right hand straight to height Z (default cur z + 0.05)
+    keys                 raw single-key mode to nudge hand/wrist (W/S z, A/D y, R/F x, I/K wrist-pitch, ...)
     scale [N]            phase 2: place on the scale, then regrasp
     handoff              phase 3: hand the parcel to the left hand
     box [N]              phase 4: drop into the sorting box
@@ -50,14 +57,25 @@ import rospy
 import perception as P
 
 DEFAULT_READY_BAG = "/root/kuavo_ws/go.bag"
+# ready pose (14 arm joint angles, degrees) — captured from the go-bag replay,
+# so we no longer need the bag for `home`
+READY_JOINTS = [30.3, 0.0, 9.6, -137.2, -86.8, -2.9, -2.4,
+                30.2, 0.0, -9.2, -138.4, 81.4, 8.0, -1.1]
+HOME_TIME = 1.0                    # seconds per segment of the home move (fast)
+# "swing back" retract waypoint (14 joints, deg): shoulder rotated back and the
+# elbow straighter than in the ready pose, so the arms clear the table on the way.
+# First 7 = left arm, last 7 = right arm.
+HOME_RETRACT = [60.0, 10.8, 9.6, -100.0, -86.8, -2.9, -2.4,
+                60.0, -11.0, -9.2, -100.0, 81.4, 8.0, -1.1]
 DET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detections.json")
+WEIGH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weigh.json")
 
 # ── scene-1 pick constants (ported from the organisers' collector) ─────────
 PICK_IK_Z = -0.03                     # absolute grasp height
 # grasp offset split by SIDE (right / left), decided by y vs the row's median y
 PICK_OFFSET_RIGHT = [-0.03, 0.0, 0.0]
 PICK_OFFSET_LEFT = [-0.03, -0.02, 0.0]
-PICK_FIRST_YPR = [0.0, -90.0, 0.0]    # approach direction
+PICK_FIRST_YPR = [0.0, -100, 0.0]    # approach direction
 PICK_SECOND_YPR = [90.0, 0.0, 0.0]    # tool roll
 PICK_TRANSIT_Z = 0.120                # align height before descending
 # optional extra offset on the pick point (m).  The organisers' pick uses the
@@ -65,8 +83,10 @@ PICK_TRANSIT_Z = 0.120                # align height before descending
 FRAME_OFFSET = [0.0, 0.0, 0.0]
 
 # ── scale (weigh) / handoff / box: fixed scene points, IK frame ────────────
-WEIGH_TRANSIT_Z = 0.326217            # carry height over the scale
-WEIGH_RELEASE = [0.396, -0.574, 0.146217]
+WEIGH_TRANSIT_Z = 0.25            # carry height over the scale
+WEIGH_RELEASE = [0.396, -0.574, 0.146217]   # x, y = fallback if no detection; [2] = drop height
+WEIGH_DROP_Z =  0.146217              # hand height where it OPENS to drop the parcel (tune me)
+WEIGH_REGRASP_Z = -0.04               # hand height where it re-grasps after weighing
 WEIGH_RELEASE_FIRST_YPR = [0.0, -100.0, 0.0]
 WEIGH_RELEASE_SECOND_YPR = [90.0, 0.0, 0.0]
 WEIGH_RELEASE_SETTLE = 1.5            # wait before opening
@@ -213,6 +233,7 @@ class TaskSequence(object):
         self.box = None
         self.parcels = []
         self.frame_offset = list(args.frame)
+        self.home_retract = list(HOME_RETRACT) if HOME_RETRACT else None
 
     # ── arm (lazy) ──────────────────────────────────────────────────
     def ensure_arm(self):
@@ -223,6 +244,32 @@ class TaskSequence(object):
             a.setup()
             self.arm = a
         return self.arm
+
+    def do_sethome(self):
+        """Capture the CURRENT 14 arm joints as the 'retract' waypoint used by `home`.
+
+        So you can build your own trajectory:  move the arms where you want the
+        retract (with `keys` / `pos` / `wrist`), then `sethome`, then `home`."""
+        ar = self.ensure_arm()
+        with ar.lock:
+            q = list(ar.joint_q) if ar.joint_q is not None else []
+        if not q:
+            log("  no joint data yet")
+            return
+        self.home_retract = [math.degrees(v) for v in q]
+        log("  home retract captured = [%s]"
+            % ", ".join("%.1f" % v for v in self.home_retract))
+        log("  (now `home` will pass through this pose before the ready pose)")
+
+    def do_home(self, duration=None):
+        """Move both arms to the ready pose, passing the captured retract waypoint
+        first so the arms clear the table."""
+        ar = self.ensure_arm()
+        dur = HOME_TIME if duration is None else float(duration)
+        if self.home_retract is not None:
+            log("  home: retract waypoint -> ready pose")
+            ar.move_joints(self.home_retract, duration=dur)
+        return ar.move_joints(READY_JOINTS, duration=dur)
 
     def do_gobag(self, path=None):
         """Replay the go-bag arm trajectory to reach the ready pose."""
@@ -354,6 +401,102 @@ class TaskSequence(object):
     def do_pose(self):
         self.ensure_arm().print_pose()
 
+    def do_jset(self, index, value):
+        """Set ONE arm joint (0..13) to `value` deg, keeping the others — to explore
+        which joint makes a movement. e.g. `j 1 -20` (left shoulder roll)."""
+        ar = self.ensure_arm()
+        with ar.lock:
+            q = list(ar.joint_q) if ar.joint_q is not None else []
+        if len(q) != 14:
+            log("  no joint data yet")
+            return
+        i = int(index)
+        if not (0 <= i < 14):
+            log("  index must be 0..13 (0-6 left arm, 7-13 right arm)")
+            return
+        deg = [math.degrees(v) for v in q]
+        deg[i] = float(value)
+        log("  joint %d -> %.1f  (L:1-7, R:8-14)" % (i + 1, float(value)))
+        ar.move_joints(deg)
+
+    def do_joints(self):
+        """Print the current 14 arm joint angles (degrees), so a pose can be captured."""
+        ar = self.ensure_arm()
+        with ar.lock:
+            q = list(ar.joint_q) if ar.joint_q is not None else []
+        if not q:
+            log("  no joint data yet")
+            return
+        deg = [math.degrees(v) for v in q]
+        log("  arm joints (deg) = [%s]" % ", ".join("%.1f" % v for v in deg))
+        log("  arm joints (rad) = [%s]" % ", ".join("%.4f" % v for v in q))
+
+    def do_wrist(self, vals=None):
+        """Print the 3 wrist joint angles (yaw, pitch, roll), or set them."""
+        ar = self.ensure_arm()
+        if vals is None:
+            w = ar.current_wrist_deg()
+            log("  wrist deg (yaw, pitch, roll) = (%.1f, %.1f, %.1f)" % (w[0], w[1], w[2]))
+        else:
+            ar.set_wrist(list(vals))
+
+    def do_keys(self, step_pos=0.01, step_wrist=2.0):
+        """Raw single-key mode to nudge the hand / wrist. Esc (or Ctrl-C) to exit.
+        W/S z,  A/D y,  R/F x,  I/K wrist pitch,  J/L wrist yaw,  U/O wrist roll."""
+        import sys
+        import termios
+        import tty
+        ar = self.ensure_arm()
+        log("  keys:  W/S z   A/D y   R/F x   I/K wrist-pitch   J/L wrist-yaw   U/O wrist-roll   (Esc to exit)")
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not rospy.is_shutdown():
+                ch = sys.stdin.read(1)
+                if ch in ("\x1b", "\x03"):
+                    break
+                k = ch.lower()
+                if k in "wsadrf":
+                    cur = ar.current_pose()[0]
+                    dz = step_pos if k == "w" else (-step_pos if k == "s" else 0.0)
+                    dy = step_pos if k == "a" else (-step_pos if k == "d" else 0.0)
+                    dx = step_pos if k == "r" else (-step_pos if k == "f" else 0.0)
+                    ar.wrist_target = False
+                    ar.ik_mode = IK_MODE_THREE_POINT
+                    ar.move_to(pos=[cur[0] + dx, cur[1] + dy, cur[2] + dz])
+                elif k in "ikjluo":
+                    w = ar.current_wrist_deg()
+                    dw = [0.0, 0.0, 0.0]
+                    if k == "i":
+                        dw[1] += step_wrist
+                    elif k == "k":
+                        dw[1] -= step_wrist
+                    elif k == "j":
+                        dw[0] += step_wrist
+                    elif k == "l":
+                        dw[0] -= step_wrist
+                    elif k == "u":
+                        dw[2] += step_wrist
+                    elif k == "o":
+                        dw[2] -= step_wrist
+                    ar.set_wrist([w[0] + dw[0], w[1] + dw[1], w[2] + dw[2]])
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        log("  keys mode off")
+
+    def do_lift(self, z=None):
+        """Move the RIGHT hand straight up/down to height z (x,y + orientation kept).
+        Default: current z + 0.05."""
+        ar = self.ensure_arm()
+        ar.active = "right"
+        ar.wrist_target = False
+        ar.ik_mode = IK_MODE_THREE_POINT
+        cur = ar.current_pose()[0]
+        z = (float(cur[2]) + 0.05) if z is None else float(z)
+        log("  lift -> z=%.3f at (%.3f, %.3f)" % (z, cur[0], cur[1]))
+        ar.move_to(pos=[float(cur[0]), float(cur[1]), z])
+
     def do_pick(self, idx=0):
         """Pick parcel idx: align above it at the transit height, descend to the
         grasp height with the hard pose (0x03, fallback 0x06), then clamp."""
@@ -402,38 +545,55 @@ class TaskSequence(object):
         return ar.move_to(pos=list(pos), quat=list(quat) if quat else None)
 
     def grip(self, side, pct):
-        """Open/close ONE claw (0 = open, 100 = closed); the other keeps state."""
+        """Open/close ONE claw. On close, use the closed-loop grip (hold + grab check);
+        the other claw keeps its state."""
         ar = self.ensure_arm()
         prev = ar.active
         ar.active = side
-        ar.set_gripper(pct)
+        if pct > 0:
+            ar.grip_close_loop()
+        else:
+            ar.set_gripper(pct)
         ar.active = prev
 
     # ── phase 2: place on the scale, then regrasp ───────────────────
+    def weigh_xy(self):
+        """Scale centre (x, y) from the detected green marker, else the fixed default."""
+        try:
+            with open(WEIGH_FILE) as f:
+                d = json.load(f)
+            return [float(d["x"]), float(d["y"])], "detected"
+        except Exception:
+            return [WEIGH_RELEASE[0], WEIGH_RELEASE[1]], "default"
+
     def do_scale(self, idx=0):
         q_carry = _quat_from_ypr(PICK_FIRST_YPR, PICK_SECOND_YPR)
         q_rel = _quat_from_ypr(WEIGH_RELEASE_FIRST_YPR, WEIGH_RELEASE_SECOND_YPR)
+        (wx, wy), src = self.weigh_xy()
+        release = [wx, wy, WEIGH_DROP_Z]
+        regrasp = [wx, wy, WEIGH_REGRASP_Z]
+        log("  scale target (%s): x=%.3f y=%.3f" % (src, wx, wy))
         ar = self.ensure_arm()
         ar.active = "right"
         cur = ar.current_pose()[0]
         ar.ik_mode = IK_MODE_THREE_POINT
         ar.move_linear([cur[0], cur[1], WEIGH_TRANSIT_Z], q_carry, n_points=4)
-        self.move_hand("right", _with_z(WEIGH_RELEASE, WEIGH_TRANSIT_Z), q_carry,
+        self.move_hand("right", _with_z(release, WEIGH_TRANSIT_Z), q_carry,
                        IK_MODE_THREE_POINT, HANDOFF_MOVE_TIME, settle=0.0)
-        self.move_hand("right", WEIGH_RELEASE, q_rel, IK_MODE_POS_HARD_ORI_HARD,
+        self.move_hand("right", release, q_rel, IK_MODE_POS_HARD_ORI_HARD,
                        PICK_GRASP_MOVE_TIME)
         rospy.sleep(WEIGH_RELEASE_SETTLE)
         self.grip("right", 0.0)
         rospy.sleep(WEIGH_DWELL)
         q_re = _quat_from_ypr(WEIGH_REGRASP_FIRST_YPR, WEIGH_REGRASP_SECOND_YPR)
-        pre = _with_z(WEIGH_REGRASP, WEIGH_RELEASE[2])
+        pre = _with_z(regrasp, release[2])
         self.move_hand("right", pre, q_re, IK_MODE_THREE_POINT, MOVE_TIME, settle=0.0)
-        self.move_hand("right", WEIGH_REGRASP, q_re, IK_MODE_POS_HARD_ORI_HARD,
+        self.move_hand("right", regrasp, q_re, IK_MODE_POS_HARD_ORI_HARD,
                        PICK_GRASP_MOVE_TIME)
         self.grip("right", 100.0)
         rospy.sleep(GRIPPER_HOLD)
         cur = ar.current_pose()[0]
-        ar.move_linear([cur[0], cur[1], WEIGH_RELEASE[2]], q_re, n_points=3)
+        ar.move_linear([cur[0], cur[1], release[2]], q_re, n_points=3)
         return True
 
     # ── phase 3: hand off to the left hand ──────────────────────────
@@ -443,20 +603,13 @@ class TaskSequence(object):
         ar = self.ensure_arm()
         self.grip("left", 0.0)
         ar.active = "right"
-        done = False
-        for z in [RIGHT_HANDOFF_TRANSIT_Z] + RIGHT_HANDOFF_FALLBACK_ZS:
-            cur = ar.current_pose()[0]
-            if (self.move_hand("right", [cur[0], cur[1], z], None,
-                               IK_MODE_THREE_POINT, MOVE_TIME)
-                    and self.move_hand("right", _with_z(RIGHT_HANDOFF, z), q_h,
-                                       IK_MODE_THREE_POINT, HANDOFF_MOVE_TIME)):
-                if z != RIGHT_HANDOFF_TRANSIT_Z:
-                    log("  (handoff transit z fallback %.3f)" % z)
-                done = True
-                break
-        if not done:
-            log("  handoff raise failed")
-            return False
+        # Raise + align are TRANSITS — do NOT abort on a tolerance miss. The arm
+        # tracks with ~cm error, so move_to often returns False even though it moved.
+        cur = ar.current_pose()[0]
+        self.move_hand("right", [cur[0], cur[1], RIGHT_HANDOFF_TRANSIT_Z], None,
+                       IK_MODE_THREE_POINT, MOVE_TIME)
+        self.move_hand("right", _with_z(RIGHT_HANDOFF, RIGHT_HANDOFF_TRANSIT_Z), q_h,
+                       IK_MODE_THREE_POINT, HANDOFF_MOVE_TIME)
         self.move_hand("right", RIGHT_HANDOFF, q_h, IK_MODE_THREE_POINT, HANDOFF_MOVE_TIME)
         self.move_hand("left", LEFT_RECEIVE_READY, q_recv, IK_MODE_THREE_POINT, MOVE_TIME)
         self.move_hand("left", LEFT_RECEIVE, q_recv, IK_MODE_THREE_POINT, HANDOFF_MOVE_TIME)
@@ -522,6 +675,32 @@ class TaskSequence(object):
 
     def do_cluster(self):
         P.step_cluster(self.pa)
+
+    def do_detect(self):
+        """head -> cloud -> ransac -> cluster -> classify -> weigh, printing only the
+        cluster/parcel result (cloud + ransac are silenced)."""
+        import io
+        import sys
+        log("  -- detect: head -> cloud -> ransac -> cluster -> classify -> weigh --")
+        self.do_head()
+        sink = io.StringIO()
+        real = sys.stdout
+        sys.stdout = sink
+        try:
+            self.do_cloud()
+            self.do_ransac()
+        finally:
+            sys.stdout = real
+        # draw the cluster overlay automatically (blocking window: it shows, you press
+        # a key in it to continue)
+        self.pa.show = True
+        self.pa.live = False
+        try:
+            self.do_cluster()
+        finally:
+            self.pa.show = False
+        self.do_classify()
+        self.do_weigh()
 
     def do_weigh(self):
         P.step_weigh(self.pa)
@@ -607,14 +786,10 @@ class TaskSequence(object):
                     self.do_cloud()
                     self.do_ransac()
                     self.do_cluster()
+                elif cmd in ("detect", "scan"):
+                    self.do_detect()
                 elif cmd == "live":
                     self.do_live(float(a[0]) if a else 1.0)
-                elif cmd == "show":
-                    if a and a[0].lower() in ("on", "off"):
-                        self.pa.show = (a[0].lower() == "on")
-                    else:
-                        self.pa.show = not self.pa.show
-                    log("show = %s" % self.pa.show)
                 elif cmd == "pitch":
                     self.head_pitch = float(a[0])
                     log("head pitch = %.1f" % self.head_pitch)
@@ -623,6 +798,10 @@ class TaskSequence(object):
                     log("head yaw = %.1f" % self.head_yaw)
                 elif cmd == "gobag":
                     self.do_gobag(a[0] if a else None)
+                elif cmd == "home":
+                    self.do_home(float(a[0]) if a else None)
+                elif cmd in ("sethome", "sh"):
+                    self.do_sethome()
                 elif cmd in ("dets", "det"):
                     self.do_dets()
                 elif cmd == "classify":
@@ -651,6 +830,16 @@ class TaskSequence(object):
                         ar.print_pose()
                     else:
                         log("  usage: pos X Y Z")
+                elif cmd == "wrist":
+                    self.do_wrist([float(v) for v in a[:3]] if len(a) >= 3 else None)
+                elif cmd == "joints":
+                    self.do_joints()
+                elif cmd in ("j", "jset"):
+                    self.do_jset(int(a[0]), float(a[1]))
+                elif cmd == "lift":
+                    self.do_lift(float(a[0]) if a else None)
+                elif cmd in ("keys", "k"):
+                    self.do_keys()
                 elif cmd in ("pose", "p"):
                     self.do_pose()
                 elif cmd == "check":
@@ -700,7 +889,7 @@ def main():
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
 
-    rospy.init_node("task_sequence", anonymous=True)
+    rospy.init_node("task_sequence", anonymous=True, log_level=rospy.ERROR)
     TaskSequence(args).run()
 
 
