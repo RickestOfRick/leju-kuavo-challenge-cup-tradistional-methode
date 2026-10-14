@@ -129,6 +129,7 @@ CLAW_HOLD_HZ = 50.0                # rate of the continuous claw command
 CLAW_EFFORT = 2.0                  # grip force (claw docs: 1-2 A; 1.0 = weak)
 CLAW_GRABBED = 3                   # lejuClawState.state value meaning "grabbed"
 CLAW_REACHED = 2                   # jaw closed but nothing between them
+CLAW_HOLD_PCT = 80.0               # closure below this = something between the jaws
 POSE_FILE = "/root/.ros/arm_test_poses.json"
 # ─────────────────────────────────────────────────────────────────
 
@@ -255,6 +256,8 @@ class ArmTestControl(object):
         self.wrist_target = False      # treat move_to(pos) as the WRIST target
         self.fixed_rpy = None          # lock orientation (degrees) for pos-only moves
         self.elbow_pos = None          # preferred elbow position (base frame)
+        self.joint_bias = [0.0] * 14   # per-joint offset (deg) added to the active arm's command
+        self.bias_active = False       # apply the bias only while a parcel is held (auto)
         self.tf_buffer = None
         self.lock = threading.Lock()
         self.joint_q = None
@@ -555,6 +558,18 @@ class ArmTestControl(object):
             % (float(vals[0]), float(vals[1]), float(vals[2])))
         return self.move_joints(deg)
 
+    def _apply_bias(self, deg):
+        """Add the per-joint bias (deg) to the ACTIVE arm's joints of a 14-joint command.
+        Only applied while `bias_active` (i.e. while a parcel is held)."""
+        if not self.bias_active:
+            return [float(v) for v in deg]
+        base = 7 if self.active == "right" else 0
+        out = [float(v) for v in deg]
+        for k in range(7):
+            if base + k < len(out):
+                out[base + k] += float(self.joint_bias[base + k])
+        return out
+
     def move_to(self, pos=None, quat=None):
         """Move the ACTIVE hand to an absolute position and/or quaternion.
         Whichever of pos/quat is None is taken from the current FK pose."""
@@ -629,7 +644,11 @@ class ArmTestControl(object):
                                                 for v in euler_from_quaternion(tgt_quat))))
 
         start_deg = [math.degrees(v) for v in q_cur]
-        target_deg = [math.degrees(v) for v in q_cmd]
+        target_deg = self._apply_bias([math.degrees(v) for v in q_cmd])
+        if self.bias_active and any(self.joint_bias):
+            log("  (joint bias active on %s: %s)"
+                % (self.active, ", ".join("j%d%+.0f" % (k + 1, self.joint_bias[k])
+                                          for k in range(14) if self.joint_bias[k])))
 
         # MPC arm target trajectory (degrees, one waypoint at move_time)
         tmsg = armTargetPoses()
@@ -652,12 +671,22 @@ class ArmTestControl(object):
         IK (the other arm holds its pose), and the joint waypoints are streamed
         continuously. Keeping every waypoint on the line stops the hand from
         dipping mid-path (unlike a single joint-space interpolation)."""
-        quat = list(quat)
+        if quat is None:
+            if self.fixed_rpy is not None:
+                quat = list(quaternion_from_euler(
+                    *[math.radians(v) for v in self.fixed_rpy]))
+            else:
+                _, q0 = self.current_pose()
+                quat = list(q0)
+        else:
+            quat = list(quat)
         cur_pos, _ = self.current_pose()
         start = np.array(cur_pos, dtype=float)
         end = np.array(pos, dtype=float)
         with self.lock:
             warm = list(self.joint_q)
+        base = 7 if self.active == "right" else 0
+        wrist_hold = [warm[base + k] for k in (4, 5, 6)] if self.freeze_wrist else None
         joint_wps = [[math.degrees(v) for v in warm]]
         for k in range(1, int(n_points) + 1):
             a = float(k) / float(n_points)
@@ -678,9 +707,16 @@ class ArmTestControl(object):
             if q_cmd is None:
                 log("  LINEAR IK failed at segment %d/%d" % (k, int(n_points)))
                 return False
+            if wrist_hold is not None:
+                for i, kk in enumerate((4, 5, 6)):
+                    q_cmd[base + kk] = wrist_hold[i]
             warm = q_cmd
-            joint_wps.append([math.degrees(v) for v in q_cmd])
+            joint_wps.append(self._apply_bias([math.degrees(v) for v in q_cmd]))
         self._publish_joint_wps(joint_wps, seg_time)
+        if self.bias_active and any(self.joint_bias):
+            log("  (joint bias active on %s: %s)"
+                % (self.active, ", ".join("j%d%+.0f" % (k + 1, self.joint_bias[k])
+                                          for k in range(14) if self.joint_bias[k])))
         rospy.sleep(self.settle or SETTLE_SECONDS)
         log("  LINEAR %-5s -> pos (%7.3f, %7.3f, %7.3f)  (%d segments)"
             % (self.active, end[0], end[1], end[2], int(n_points)))
@@ -766,6 +802,8 @@ class ArmTestControl(object):
     # ───────────────────────────── gripper
     def set_gripper(self, pct, effort=None):
         pct = max(0.0, min(100.0, float(pct)))
+        if pct <= 0.0:
+            self.bias_active = False           # released — bias off
         eff = CLAW_EFFORT if effort is None else float(effort)
         with self.lock:
             left = self.claw_pct[0] if self.claw_pct[0] is not None else 0.0
@@ -806,12 +844,19 @@ class ArmTestControl(object):
             closure = "?" if pct is None else "%.1f%%" % pct
             if st == CLAW_GRABBED:
                 log("  %s claw: GRABBED (state=3, closure %s) — holding" % (self.active, closure))
+                self.bias_active = True        # bias now applies while carrying
+                return True
+            if pct is not None and pct < CLAW_HOLD_PCT:      # closure dropped => holding
+                log("  %s claw: HOLDING (closure %s) — holding" % (self.active, closure))
+                self.bias_active = True
                 return True
             if st == CLAW_REACHED:
                 log("  %s claw: closed EMPTY (state=2, closure %s)" % (self.active, closure))
                 return False
             time.sleep(0.1)
-        log("  %s claw: no grab confirmed in %.1fs" % (self.active, timeout))
+        log("  %s claw: no grab confirmed in %.1fs (closure %s)"
+            % (self.active, timeout, "?" if self.claw_pct[side] is None
+               else "%.1f%%" % self.claw_pct[side]))
         return False
 
     # ───────────────────────────── reset

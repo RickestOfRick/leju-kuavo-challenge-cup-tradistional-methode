@@ -55,6 +55,7 @@ UV_FILE = os.path.join(HERE, "last_uv.npy")
 K_FILE = os.path.join(HERE, "last_K.npy")
 M_FILE = os.path.join(HERE, "last_M.npy")
 KEPT_FILE = os.path.join(HERE, "last_kept.npy")
+WRIST_DEBUG_FILE = os.path.join(HERE, "wrist_last.png")   # debug: what the wrist cam saw
 
 DEPTH_STRIDE = 4          # sample every Nth pixel
 DEPTH_MIN = 0.15          # ignore closer than this (m)
@@ -97,6 +98,8 @@ def decode_color(msg):
 
 
 def _show_window(name, img, live):
+    if os.environ.get("PERCEPTION_HEADLESS"):
+        return                  # non-interactive runs: don't open/block on a window
     cv2.imshow(name, img)
     if live:
         cv2.waitKey(1)          # non-blocking, for the live loop
@@ -161,6 +164,177 @@ class Tf(object):
 
 def transform_points(M, pts):
     return (M[:3, :3] @ pts.T).T + M[:3, 3]
+
+
+# ───────────────────── wrist-camera parcel locate ─────────────────────
+WRIST_TOPICS = {
+    "right": ("/cam_r/color/image_raw/compressed",
+              "/cam_r/depth/image_rect_raw/compressedDepth",
+              "/cam_r/color/camera_info"),
+    "left": ("/cam_l/color/image_raw/compressed",
+             "/cam_l/depth/image_rect_raw/compressedDepth",
+             "/cam_l/color/camera_info"),
+}
+
+
+WRIST_CLAW_DIST = 0.06    # anything closer than this to the wrist cam is the CLAW, not a parcel
+
+
+def wrist_locate(args, cam="right", near_min=WRIST_CLAW_DIST, near_max=0.60,
+                 near_band=0.0, cluster_tol=0.02, min_pts=15, max_extent=0.16,
+                 hint=None, timeout=None):
+    """Look through a WRIST camera and return the (x, y, z_top) of the parcel below the
+    hand, in TARGET_FRAME (base_link) — or None if nothing usable is seen.
+
+    WHOLE image (no border cropping), and two cuts:
+      1) DISTANCE cut for the claw: drop everything nearer than `near_min` (the claw is
+         the closest thing to the camera);
+      2) NEAREST-SURFACE cut: keep only points within `near_band` of the nearest remaining
+         surface — that isolates the parcel's TOP FACE (clustering alone cannot separate
+         the parcel from the scale/table it is resting on, they touch);
+    then cluster what's left and pick the parcel = the cluster nearest `hint` (the xy where
+    it was dropped), or the largest cluster when no hint is given.
+    """
+    ct, dt, it = WRIST_TOPICS[cam]
+    t = timeout if timeout is not None else args.timeout
+    info = rospy.wait_for_message(it, CameraInfo, timeout=t)
+    depth = rospy.wait_for_message(dt, CompressedImage, timeout=t)
+    img = decode_depth(depth)
+    if img is None:
+        log("  wrist_locate[%s]: could not decode %s" % (cam, dt))
+        return None
+    try:
+        color = decode_color(rospy.wait_for_message(ct, CompressedImage, timeout=t))
+    except Exception:
+        color = None
+
+    def show(note, marks=(), chosen=None):
+        """ALWAYS show the window (blocking) — even when nothing was found — so the
+        detection can be inspected. `marks` = [(mu_arr, mv_arr, colour), ...]."""
+        try:
+            vis = color.copy() if color is not None else np.zeros((240, 320, 3), np.uint8)
+            for mu_, mv_, col_ in marks:
+                for u_, v_ in zip(mu_, mv_):
+                    cv2.circle(vis, (int(u_), int(v_)), 2, col_, -1)
+            if chosen is not None:
+                cv2.drawMarker(vis, (int(np.median(chosen[0])), int(np.median(chosen[1]))),
+                               (0, 0, 255), cv2.MARKER_CROSS, 16, 2)
+            cv2.putText(vis, note, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+            cv2.imwrite(WRIST_DEBUG_FILE, vis)
+            log("  wrist_locate[%s]: %s — press any key in the window ..." % (cam, note))
+            _show_window("wrist parcel [%s]" % cam, vis, getattr(args, "live", False))
+        except Exception as e:
+            log("  wrist_locate[%s]: window failed (%s)" % (cam, e))
+
+    d = to_metres(img)
+    K = list(info.K)
+    fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+    h, w = d.shape
+    step = max(1, args.stride)
+    us = np.arange(0, w, step)
+    vs = np.arange(0, h, step)
+    z = d[np.ix_(vs, us)]
+    uu, vv = np.meshgrid(us, vs)
+    mask = np.isfinite(z) & (z >= near_min) & (z <= near_max)
+    if mask.sum() < min_pts:
+        log("  wrist_locate[%s]: only %d px in %.2f-%.2f m (claw too close? lower near_min)"
+            % (cam, int(mask.sum()), near_min, near_max))
+        show("only %d px in %.2f-%.2f m" % (int(mask.sum()), near_min, near_max))
+        return None
+    zz = z[mask]
+    mu = uu[mask]
+    mv = vv[mask]
+    if near_band and near_band > 0:
+        d_near = float(np.percentile(zz, 5))          # nearest non-claw surface = parcel top
+        keep = zz <= d_near + near_band
+        log("  wrist_locate[%s]: nearest %.3f m, keeping %.3f-%.3f m (%d of %d px)"
+            % (cam, d_near, d_near, d_near + near_band, int(keep.sum()), len(zz)))
+        if keep.sum() >= min_pts:
+            zz, mu, mv = zz[keep], mu[keep], mv[keep]
+    pts_cam = np.stack([(mu - cx) * zz / fx, (mv - cy) * zz / fy, zz], axis=1)
+    frame = depth.header.frame_id or info.header.frame_id
+    tf = Tf()
+    rospy.sleep(0.3)
+    M = tf.lookup(TARGET_FRAME, frame) if frame else None
+    if M is None:
+        log("  wrist_locate[%s]: no TF %s <- %s" % (cam, TARGET_FRAME, frame))
+        show("no TF %s <- %s" % (TARGET_FRAME, frame))
+        return None
+    pts = transform_points(M, pts_cam)
+
+    # cluster everything that isn't the claw, then pick the parcel cluster.
+    # A PARCEL is small: reject anything whose bounding box is bigger than `max_extent`
+    # (that is the table / the scale). Then take the survivor nearest `hint`.
+    labels = _cluster(pts, cluster_tol)
+    cands = []
+    rej = []
+    for lab in np.unique(labels):
+        if lab < 0:
+            continue
+        idx = np.where(labels == lab)[0]
+        if len(idx) < min_pts:
+            continue
+        P_ = pts[idx]
+        ext = float(np.linalg.norm(P_.max(axis=0) - P_.min(axis=0)))
+        cx_ = float(np.median(P_[:, 0]))
+        cy_ = float(np.median(P_[:, 1]))
+        zt_ = float(np.percentile(P_[:, 2], 90))
+        if max_extent and ext > max_extent:
+            log("  wrist_locate[%s] reject n=%-5d ext=%.3f base(%.3f, %.3f)  (too big: table/scale)"
+                % (cam, len(idx), ext, cx_, cy_))
+            rej.append((idx, ext, cx_, cy_))
+            continue
+        cands.append((idx, cx_, cy_, zt_, ext))
+    # the debug view: rejected clusters orange, candidates green, chosen gets a cross
+    marks = [(mu[c[0]], mv[c[0]], (0, 165, 255)) for c in rej]
+    marks += [(mu[c[0]], mv[c[0]], (0, 255, 0)) for c in cands]
+    if not cands:
+        log("  wrist_locate[%s]: %d px but no parcel-sized cluster >= %d pts"
+            % (cam, int(mask.sum()), min_pts))
+        show("no parcel-sized cluster (rej=%d)" % len(rej))
+        return None
+    if hint is not None:
+        cands.sort(key=lambda c: float(np.hypot(c[1] - hint[0], c[2] - hint[1])))
+    else:
+        cands.sort(key=lambda c: c[4])                  # smallest bounding box first
+    idx, x, y, ztop, ext = cands[0]
+    for c in cands[:4]:
+        d_hint = (float(np.hypot(c[1] - hint[0], c[2] - hint[1])) if hint is not None else -1.0)
+        log("  wrist_locate[%s] cand: n=%-5d ext=%.3f base(%.3f, %.3f) top z=%.3f  hint d=%.3f"
+            % (cam, len(c[0]), c[4], c[1], c[2], c[3], d_hint))
+    log("  wrist_locate[%s]: picked n=%d ext=%.3f -> base (%.3f, %.3f)  top z=%.3f  (claw cut %.2f)"
+        % (cam, len(idx), ext, x, y, ztop, near_min))
+    show("n=%d base(%.3f,%.3f) z=%.3f  green=cands orange=rejected"
+         % (len(idx), x, y, ztop),
+         marks=marks, chosen=(mu[idx], mv[idx]))
+    return x, y, ztop
+
+
+def wrist_distance(args, cam="left", near_min=0.02, near_max=0.60, timeout=None):
+    """How CLOSE is the hand to whatever is in front of its wrist camera (the parcel)?
+
+    Returns (nearest_depth_m, n_valid_px) — the 5th-percentile depth of the valid middle
+    pixels, i.e. the nearest surface. Use it to tell whether the claw has actually reached
+    the parcel. (None, 0) when nothing valid is seen.
+    """
+    ct, dt, it = WRIST_TOPICS[cam]
+    t = timeout if timeout is not None else args.timeout
+    info = rospy.wait_for_message(it, CameraInfo, timeout=t)
+    depth = rospy.wait_for_message(dt, CompressedImage, timeout=t)
+    img = decode_depth(depth)
+    if img is None:
+        return None, 0
+    d = to_metres(img)
+    h, w = d.shape
+    step = max(1, args.stride)
+    us = np.arange(int(w * 0.2), int(w * 0.8), step)
+    vs = np.arange(int(h * 0.2), int(h * 0.8), step)
+    z = d[np.ix_(vs, us)]
+    mask = np.isfinite(z) & (z >= near_min) & (z <= near_max)
+    n = int(mask.sum())
+    if n < 5:
+        return None, n
+    return float(np.percentile(z[mask], 5)), n
 
 
 def set_head(yaw_deg, pitch_deg, settle=0.8):
