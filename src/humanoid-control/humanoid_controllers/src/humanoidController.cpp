@@ -67,7 +67,8 @@
 
 namespace humanoid_controller
 {
-  using namespace ocs2;
+  // arm PD gains are read live from /arm_pd/{kp,kd,ki,clamp} (no rebuild needed)
+using namespace ocs2;
   using namespace humanoid;
   using Duration = std::chrono::duration<double>;
   using Clock = std::chrono::high_resolution_clock;
@@ -1447,6 +1448,17 @@ void humanoidController::sensorsDataCallback(const kuavo_msgs::sensorsData::Cons
       }
     }
     ros::Time ros_time = msg->header.stamp;
+    if (arm_q_live_.size() != armNumReal_)
+    {
+      arm_q_live_ = Eigen::VectorXd::Zero(armNumReal_);
+      arm_v_live_ = Eigen::VectorXd::Zero(armNumReal_);
+    }
+    for (int k = 0; k < armNumReal_; ++k)
+    {
+      arm_q_live_(k) = joint_data.joint_q[jointNumReal_ + waistNum_ + k];
+      arm_v_live_(k) = joint_data.joint_v[jointNumReal_ + waistNum_ + k];
+    }
+
     sensor_data.timeStamp_ = msg->sensor_time;
     sensor_data_rl.timeStamp_ = msg->sensor_time;
     double sensor_time_diff = (ros::Time::now() - ros_time).toSec() * 1000;
@@ -2979,12 +2991,168 @@ void humanoidController::sensorsDataCallback(const kuavo_msgs::sensorsData::Cons
         jointCmdMsg.joint_kd[11] = 0.0;
       }
 
-      // 补全手臂的Cmd维度
+      // 补全手臂的Cmd维度  (+ ARM PD: added stiffness on top of the WBC torque)
+      // The WBC alone tracks the arm as a soft task -> sag under load. This adds a
+      // spring-damper that pulls the measured arm joints toward the /kuavo_arm_traj
+      // target. It is ADDITIVE and CLAMPED, so the WBC keeps authority (balance) and
+      // the correction can never dominate it. Set ARM_PD_KP = 0 to disable.
+      // In MPC mode desire_arm_q_ is NEVER updated (its callback is RL-only). The MPC
+      // path stores the same /kuavo_arm_traj reference in arm_joint_trajectory_.pos.
+      const bool mpc_ref_ok = (arm_joint_trajectory_.pos.size() == armNumReal_);
+      const bool arm_pd_ok =
+          ((mpc_ref_ok || desire_arm_q_.size() == armNumReal_) &&
+           jointPosWBC_.size() >= jointNumReal_ + waistNum_ + armNumReal_ &&
+           jointVelWBC_.size() >= jointNumReal_ + waistNum_ + armNumReal_);
+
+      // ── LIVE-TUNABLE gains ────────────────────────────────────────────────
+      // Read from the ROS param server ~10x per second, so NO REBUILD is needed:
+      //   rosparam set /arm_pd/kp 6.0     rosparam set /arm_pd/kd 1.5
+      //   rosparam set /arm_pd/ki 0.5     rosparam set /arm_pd/clamp 3.0
+      // kp/kd/ki all 0 (the default) = patch completely inert.
+      static double ap_kp = 0.0, ap_kd = 0.0, ap_ki = 0.0, ap_clamp = 3.0;
+      // per-WRIST overrides (last 3 joints of each 7-joint arm: l5,l6,l7 / r5,r6,r7).
+      // < 0 means "not set" -> fall back to the whole-arm gains above.
+      static double ap_kpw = -1.0, ap_kdw = -1.0, ap_kiw = -1.0, ap_clampw = -1.0;
+      // optional PER-JOINT override: arrays of 14 values (arm joints 0..13).
+      // If a list is set on the param server it wins over everything else per joint.
+      static std::vector<double> ap_kpj, ap_kdj, ap_kij, ap_clj;
+      static bool ap_inv_roll = false;   // /arm_pd/invert_roll (L5 / R5 sign flip)
+      static bool ap_replace = false;    // /arm_pd/replace: use ONLY the PID (drop the WBC torque)
+      static std::vector<double> ap_replj;   // /arm_pd/replace_joints: 14 flags (1 = PID only)
+      // full per-joint debug: 13 fields x 14 joints, published on /arm_pd/debug
+      static std::vector<double> ap_dbg(14 * 13, 0.0);
+      static Eigen::VectorXd ap_tau = Eigen::VectorXd::Zero(14);
+      static Eigen::VectorXd ap_err = Eigen::VectorXd::Zero(14);
+      static int ap_log = 0;
+      static Eigen::VectorXd ap_i;
+      static int ap_tick = 0;
+      if (ap_i.size() != armNumReal_)
+      {
+        ap_i = Eigen::VectorXd::Zero(armNumReal_);
+      }
+      if (++ap_tick >= 100)                       // 1 kHz / 100 = 10 Hz
+      {
+        ap_tick = 0;
+        double v = 0.0;
+        if (ros::param::get("/arm_pd/kp", v))    ap_kp = v;
+        if (ros::param::get("/arm_pd/kd", v))    ap_kd = v;
+        if (ros::param::get("/arm_pd/ki", v))    ap_ki = v;
+        if (ros::param::get("/arm_pd/clamp", v)) ap_clamp = std::max(0.0, v);
+        if (ros::param::get("/arm_pd/kp_wrist", v))    ap_kpw = v;
+        if (ros::param::get("/arm_pd/kd_wrist", v))    ap_kdw = v;
+        if (ros::param::get("/arm_pd/ki_wrist", v))    ap_kiw = v;
+        if (ros::param::get("/arm_pd/clamp_wrist", v)) ap_clampw = std::max(0.0, v);
+        bool b = false;
+        if (ros::param::get("/arm_pd/invert_roll", b)) ap_inv_roll = b;
+        if (ros::param::get("/arm_pd/replace", b)) ap_replace = b;
+        std::vector<double> rv;
+        if (ros::param::get("/arm_pd/replace_joints", rv) && rv.size() == (size_t)armNumReal_)
+          ap_replj = rv;
+        std::vector<double> tmp;
+        if (ros::param::get("/arm_pd/kp_joints", tmp) && tmp.size() == (size_t)armNumReal_) ap_kpj = tmp;
+        if (ros::param::get("/arm_pd/kd_joints", tmp) && tmp.size() == (size_t)armNumReal_) ap_kdj = tmp;
+        if (ros::param::get("/arm_pd/ki_joints", tmp) && tmp.size() == (size_t)armNumReal_) ap_kij = tmp;
+        if (ros::param::get("/arm_pd/clamp_joints", tmp) && tmp.size() == (size_t)armNumReal_) ap_clj = tmp;
+        if (ap_kp == 0.0 && ap_kd == 0.0 && ap_ki == 0.0)
+        {
+          ap_i.setZero();                        // no windup while disabled
+        }
+      }
+
+      if (++ap_log >= 200)
+      {
+        ap_log = 0;
+        static ros::Publisher ap_dbg_pub =
+            controllerNh_.advertise<std_msgs::Float64MultiArray>("/arm_pd/debug", 10);
+        std_msgs::Float64MultiArray dbg;
+        dbg.data.reserve(2 + 14 * 13);
+        dbg.data.push_back(arm_pd_ok ? 1.0 : 0.0);
+        dbg.data.push_back(ap_replace ? 1.0 : 0.0);
+        for (size_t k = 0; k < ap_dbg.size(); ++k) dbg.data.push_back(ap_dbg[k]);
+        ap_dbg_pub.publish(dbg);
+        std::ostringstream oss;
+        oss << "[arm_pd] kp=" << ap_kp << " kdw=" << ap_kpw << " clampw=" << ap_clampw
+            << " | L5:" << ap_tau(4) << "N/" << ap_err(4)*57.3 << "deg"
+            << " L6:" << ap_tau(5) << "N/" << ap_err(5)*57.3 << "deg"
+            << " R6:" << ap_tau(12) << "N/" << ap_err(12)*57.3 << "deg";
+        ROS_INFO_STREAM(oss.str());
+      }
       for(int i2 = 0; i2 < armNumReal_; ++i2)
       {
+        const double tau_wbc = output_tau_(waistNum_+jointNum_+i2);
+        const bool rep_this = ap_replace ||
+            (ap_replj.size() == (size_t)armNumReal_ && ap_replj[i2] != 0.0);
+        double tau_cmd = rep_this ? 0.0 : tau_wbc;
+        double tau_pid_v = 0.0;
+        // wrist = indices 4,5,6 inside each 7-joint arm (l5,l6,l7 / r5,r6,r7)
+        const bool is_wrist = ((i2 % 7) >= 4);
+        double g_kp    = (is_wrist && ap_kpw    >= 0.0) ? ap_kpw    : ap_kp;
+        double g_kd    = (is_wrist && ap_kdw    >= 0.0) ? ap_kdw    : ap_kd;
+        double g_ki    = (is_wrist && ap_kiw    >= 0.0) ? ap_kiw    : ap_ki;
+        double g_clamp = (is_wrist && ap_clampw >= 0.0) ? ap_clampw : ap_clamp;
+        if (ap_kpj.size() == (size_t)armNumReal_) g_kp    = ap_kpj[i2];   // per-joint wins
+        if (ap_kdj.size() == (size_t)armNumReal_) g_kd    = ap_kdj[i2];
+        if (ap_kij.size() == (size_t)armNumReal_) g_ki    = ap_kij[i2];
+        if (ap_clj.size() == (size_t)armNumReal_) g_clamp = ap_clj[i2];
+        // WRIST ROLL (L5 / R5, i2 % 7 == 4): this joint's measured position AND
+        // velocity have the opposite sign to the commanded reference, so the whole
+        // PD must be mirrored. Keep the params POSITIVE; the sign is handled here.
+        if (ap_inv_roll && (i2 % 7) == 4)
+        {
+          g_kp = -g_kp;
+          g_kd = -g_kd;
+          g_ki = -g_ki;
+        }
+        if (arm_pd_ok && (g_kp != 0.0 || g_kd != 0.0 || g_ki != 0.0))
+        {
+          // LIVE sensor values (jointPosWBC_ can be stale)
+          double q_now  = (arm_q_live_.size() == armNumReal_)
+                          ? arm_q_live_(i2) : jointPosWBC_(jointNumReal_ + waistNum_ + i2);
+          double qd_now = (arm_v_live_.size() == armNumReal_)
+                          ? arm_v_live_(i2) : jointVelWBC_(jointNumReal_ + waistNum_ + i2);
+          double q_des  = mpc_ref_ok ? arm_joint_trajectory_.pos(i2)
+                                     : desire_arm_q_(i2);
+          double err    = q_des - q_now;
+          if (g_ki != 0.0)
+          {
+            ap_i(i2) += g_ki * err * dt_;
+            ap_i(i2) = std::clamp(ap_i(i2), -g_clamp, g_clamp);
+          }
+          const double tau_pd_raw = g_kp * err - g_kd * qd_now + ap_i(i2);
+          double tau_pd = std::clamp(tau_pd_raw, -g_clamp, g_clamp);
+          tau_pid_v = tau_pd;
+          tau_cmd += tau_pd;
+          ap_tau(i2) = tau_pd;
+          ap_err(i2) = err;
+          {   // full record
+            double *d = &ap_dbg[i2 * 13];
+            d[0]  = q_des  * 57.2958;
+            d[1]  = q_now  * 57.2958;
+            d[2]  = qd_now * 57.2958;
+            d[3]  = err    * 57.2958;
+            d[4]  = g_kp;  d[5] = g_kd;  d[6] = g_ki;  d[7] = g_clamp;
+            d[8]  = ap_i(i2);
+            d[9]  = tau_pd_raw;
+            d[10] = tau_pd;
+            d[11] = tau_wbc;
+            d[12] = tau_cmd;
+          }
+        }
+        if (!(arm_pd_ok && (g_kp != 0.0 || g_kd != 0.0 || g_ki != 0.0)))
+        {   // still record what the inputs were, so "off" joints are visible
+          const int ia = jointNumReal_ + waistNum_ + i2;
+          double q_now  = (arm_q_live_.size() == armNumReal_) ? arm_q_live_(i2) : jointPosWBC_(ia);
+          double qd_now = (arm_v_live_.size() == armNumReal_) ? arm_v_live_(i2) : jointVelWBC_(ia);
+          double q_des  = mpc_ref_ok ? arm_joint_trajectory_.pos(i2) : 0.0;
+          double *d = &ap_dbg[i2 * 13];
+          d[0] = q_des * 57.2958; d[1] = q_now * 57.2958; d[2] = qd_now * 57.2958;
+          d[3] = (q_des - q_now) * 57.2958;
+          d[4] = g_kp; d[5] = g_kd; d[6] = g_ki; d[7] = g_clamp;
+          d[8] = 0.0; d[9] = 0.0; d[10] = 0.0; d[11] = tau_wbc; d[12] = tau_cmd;
+        }
         jointCmdMsg.joint_q.push_back(output_pos_(waistNum_+jointNum_+i2));
         jointCmdMsg.joint_v.push_back(output_vel_(waistNum_+jointNum_+i2));
-        jointCmdMsg.tau.push_back(output_tau_(waistNum_+jointNum_+i2));
+        jointCmdMsg.tau.push_back(tau_cmd);
         jointCmdMsg.tau_ratio.push_back(1);
         jointCmdMsg.tau_max.push_back(kuavo_settings_.hardware_settings.max_current[waistNum_+jointNum_+i2]);
         jointCmdMsg.control_modes.push_back(joint_control_modes_[waistNum_+jointNum_+i2]);

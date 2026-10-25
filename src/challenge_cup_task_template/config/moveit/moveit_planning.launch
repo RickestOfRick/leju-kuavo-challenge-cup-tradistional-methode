@@ -1,0 +1,45 @@
+<launch>
+  <!-- Plan-only MoveIt for the Kuavo arms. No controllers: we read the planned joint
+       trajectory and stream it ourselves over /kuavo_arm_traj. -->
+  <!-- package-relative: the workspace path differs inside the container -->
+  <arg name="robot_description"
+       default="$(find challenge_cup_task_template)/config/moveit/planning_robot.urdf"/>
+  <arg name="srdf"
+       default="$(find challenge_cup_task_template)/config/moveit/biped_s52_plan.srdf"/>
+  <arg name="rviz" default="false"/>
+
+  <param name="robot_description" textfile="$(arg robot_description)"/>
+  <param name="robot_description_semantic" textfile="$(arg srdf)"/>
+  <rosparam command="load"
+            file="$(find challenge_cup_task_template)/config/moveit/kinematics.yaml"/>
+  <!-- standalone only: in the real run /joint_states comes from the simulator -->
+  <node pkg="joint_state_publisher" type="joint_state_publisher" name="joint_state_publisher">
+    <param name="rate" value="30"/>
+  </node>
+
+  <node pkg="moveit_ros_move_group" type="move_group" name="move_group" output="screen">
+    <!-- these MUST be private (~): with them global move_group logs
+         "Loading planning pipeline ''" and silently falls back to CHOMP -->
+    <param name="planning_plugin" value="ompl_interface/OMPLPlanner"/>
+    <param name="request_adapters"
+           value="default_planner_request_adapters/AddTimeParameterization
+                  default_planner_request_adapters/FixWorkspaceBounds
+                  default_planner_request_adapters/FixStartStateBounds
+                  default_planner_request_adapters/FixStartStateCollision
+                  default_planner_request_adapters/FixStartStatePathConstraints"/>
+    <param name="start_state_max_bounds_error" value="0.1"/>
+    <rosparam command="load"
+              file="$(find challenge_cup_task_template)/config/moveit/ompl_planning.yaml"/>
+    <!-- we never execute through MoveIt; this keeps it from aborting on startup -->
+    <param name="moveit_controller_manager"
+           value="moveit_fake_controller_manager/MoveItFakeControllerManager"/>
+    <param name="allow_trajectory_execution" value="false"/>
+    <param name="fake_execution" value="true"/>
+    <param name="publish_planning_scene" value="true"/>
+    <param name="publish_geometry_updates" value="true"/>
+    <param name="publish_state_updates" value="true"/>
+    <param name="publish_transforms_updates" value="true"/>
+  </node>
+
+  <!-- plan-only: no ros_control, no joint_trajectory_controller -->
+</launch>

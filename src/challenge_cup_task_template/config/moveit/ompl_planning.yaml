@@ -1,0 +1,12 @@
+planner_configs:
+  RRTConnect:
+    type: geometric::RRTConnect
+    range: 0.0
+left_arm:
+  default_planner_config: RRTConnect
+  planner_configs: [RRTConnect]
+  longest_valid_segment_fraction: 0.005
+right_arm:
+  default_planner_config: RRTConnect
+  planner_configs: [RRTConnect]
+  longest_valid_segment_fraction: 0.005

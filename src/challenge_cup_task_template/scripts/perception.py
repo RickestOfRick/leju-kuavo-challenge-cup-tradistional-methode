@@ -136,12 +136,17 @@ class Tf(object):
         except Exception as e:
             log("  (tf2 not available: %s)" % e)
 
-    def lookup(self, target, source, timeout=2.0):
-        """Returns 4x4 matrix target<-source, or None."""
+    def lookup(self, target, source, timeout=2.0, stamp=None):
+        """Returns 4x4 matrix target<-source, or None.
+
+        `stamp` should be the IMAGE timestamp: using Time(0) ("latest") gives the
+        transform for a different instant than the picture, and any head/arm motion
+        in between shifts the whole cloud by the same amount."""
         if self.buffer is None:
             return None
+        when = rospy.Time(0) if stamp is None else stamp
         try:
-            tr = self.buffer.lookup_transform(target, source, rospy.Time(0),
+            tr = self.buffer.lookup_transform(target, source, when,
                                               rospy.Duration(timeout))
         except Exception as e:
             log("  TF %s <- %s failed: %s" % (target, source, e))

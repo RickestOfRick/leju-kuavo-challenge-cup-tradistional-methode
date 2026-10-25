@@ -114,12 +114,19 @@ ARM_TRAJ_TOPIC = "/kuavo_arm_traj"
 IK_MODE_POS_HARD_ORI_SOFT = 0x02
 IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT_MIXED = 0x06
+IK_POS_TOL_RELAXED = 0.02          # last-resort IK: accept ~2 cm position error instead of
+                                   # "no solution" when the target sits at the edge of reach
 DEFAULT_IK_MODE = IK_MODE_THREE_POINT_MIXED
 
 MOVE_SECONDS = 2.0                 # default duration of a move
-SETTLE_SECONDS = 0.4               # extra wait after a move before verifying
+SETTLE_SECONDS = 0.0               # extra wait after a move before verifying (0 = no wait)
 STREAM_HZ = 100.0                  # /kuavo_arm_traj publish rate
-GRIPPER_SETTLE = 1.0               # wait after a gripper command
+MOVE_PROFILE = "trapz"             # "trapz" (smooth start/stop) | "cosine" | "linear"
+ACCEL_FRAC = 0.20                  # trapz: fraction of the move spent accelerating
+GRIPPER_SETTLE = 0.0               # wait after a gripper command (0 = no wait; the grab is
+                                   # still confirmed by polling the claw state)
+JOINT_SETTLE = 0.0                 # wait after each joint-space preset move (home/retract):
+                                   # keeps chained segments from blending into one fast swing
 TILT_LIMIT_DEG = 25.0              # abort if the base tilts more than this
 MAX_ABS_XY = 1.2                   # refuse an absolute XY beyond this from the base
 POS_TOL_MM = 15.0                  # warn above this position error
@@ -263,6 +270,7 @@ class ArmTestControl(object):
         self.joint_q = None
         self.roll = self.pitch = 0.0
         self.claw_pct = [None, None]
+        self.last_ee_err = [0.0, 0.0, 0.0, 0.0]
         self.claw_state = [0, 0]       # lejuClawState.state: 3 = grabbed
         self.poses = {}
         self.stream = None
@@ -378,25 +386,25 @@ class ArmTestControl(object):
         pose = getattr(p, self.active + "_pose")
         return np.array(pose.pos_xyz, dtype=float), list(pose.quat_xyzw)
 
-    def _ik_param(self, mode=None):
+    def _ik_param(self, mode=None, pos_tol=1e-3):
         p = ikSolveParam()
         p.major_optimality_tol = 1e-3
         p.major_feasibility_tol = 1e-3
         p.minor_feasibility_tol = 1e-3
         p.major_iterations_limit = 500
         p.oritation_constraint_tol = 1e-3
-        p.pos_constraint_tol = 1e-3
+        p.pos_constraint_tol = pos_tol
         p.pos_cost_weight = 1.0
         p.constraint_mode = self.ik_mode if mode is None else mode
         return p
 
-    def _solve_ik(self, q_cur, l_pos, l_quat, r_pos, r_quat, mode):
+    def _solve_ik(self, q_cur, l_pos, l_quat, r_pos, r_quat, mode, pos_tol=1e-3):
         """Call the IK service. Returns (q_cmd_14 | None, response)."""
         cmd = twoArmHandPoseCmd()
         cmd.use_custom_ik_param = True
         cmd.joint_angles_as_q0 = True
         cmd.frame = 0
-        cmd.ik_param = self._ik_param(mode)
+        cmd.ik_param = self._ik_param(mode, pos_tol)
         cmd.hand_poses.left_pose.joint_angles = q_cur[:7]
         cmd.hand_poses.right_pose.joint_angles = q_cur[7:]
         l_elbow = np.zeros(3)
@@ -620,6 +628,15 @@ class ArmTestControl(object):
             q_cmd, res = self._solve_ik(q_cur, l_pos, l_quat, r_pos, r_quat,
                                         IK_MODE_THREE_POINT_MIXED)
         if q_cmd is None:
+            # last resort: accept up to IK_POS_TOL_RELAXED position error. Near the edge
+            # of the workspace the solver otherwise reports "no solution" even though a
+            # point a centimetre away is perfectly reachable.
+            log("  IK retry with relaxed position tol (%.0f mm) ..."
+                % (IK_POS_TOL_RELAXED * 1000.0))
+            q_cmd, res = self._solve_ik(q_cur, l_pos, l_quat, r_pos, r_quat,
+                                        IK_MODE_POS_HARD_ORI_SOFT,
+                                        pos_tol=IK_POS_TOL_RELAXED)
+        if q_cmd is None:
             log("  IK FAILED — the solver found no solution.")
             log("  This service leaves error_reason empty; the real reason is in the")
             log("  Terminal 1 log (look for 'out of workspace!'). Likely causes:")
@@ -705,7 +722,18 @@ class ArmTestControl(object):
                 q_cmd, res = self._solve_ik(warm, l_pos, l_quat, r_pos, r_quat,
                                             IK_MODE_THREE_POINT_MIXED)
             if q_cmd is None:
-                log("  LINEAR IK failed at segment %d/%d" % (k, int(n_points)))
+                q_cmd, res = self._solve_ik(warm, l_pos, l_quat, r_pos, r_quat,
+                                            IK_MODE_POS_HARD_ORI_SOFT,
+                                            pos_tol=IK_POS_TOL_RELAXED)
+            if q_cmd is None:
+                solved = len(joint_wps) - 1
+                log("  LINEAR IK failed at segment %d/%d (mode 0x%02x) — keeping %d solved"
+                    % (k, int(n_points), self.ik_mode, solved))
+                # DO NOT throw away the progress we already solved: stream the waypoints
+                # that DID solve, so the hand advances as far as it can instead of freezing.
+                if solved > 0:
+                    self._publish_joint_wps(joint_wps, seg_time)
+                    rospy.sleep(self.settle or SETTLE_SECONDS)
                 return False
             if wrist_hold is not None:
                 for i, kk in enumerate((4, 5, 6)):
@@ -735,7 +763,9 @@ class ArmTestControl(object):
         for step in range(total + 1):
             if rospy.is_shutdown():
                 return
-            fpos = (float(step) / float(total)) * (n - 1)
+            # same profile as joint moves -> no velocity step at the ends
+            a = self._ramp(float(step) / float(total))
+            fpos = a * (n - 1)
             seg = min(int(fpos), n - 2)
             s = fpos - seg
             p1, p2 = joint_wps[seg], joint_wps[seg + 1]
@@ -743,6 +773,53 @@ class ArmTestControl(object):
             if step < total:
                 rate.sleep()
         self.stream.set(joint_wps[-1])
+
+    def follow_joint_path(self, pts, times, hold_other=True):
+        """Stream a PLANNED joint path for the ACTIVE arm.
+
+        pts   : 7 joint targets in DEGREES (a MoveIt plan for this arm's group)
+        times : matching time_from_start values in seconds
+        The other arm is held at its current joints. The waypoints are resampled at
+        STREAM_HZ, so the motion is continuous instead of segment-by-segment.
+        """
+        if not pts:
+            return False
+        base = 7 if self.active == "right" else 0
+        with self.lock:
+            cur = [math.degrees(v) for v in self.joint_q]
+        if len(times) != len(pts):
+            times = [float(i + 1) for i in range(len(pts))]
+        t0 = float(times[0])
+        tl = [max(0.0, float(t) - t0) for t in times]
+        for i in range(1, len(tl)):                 # strictly increasing timestamps
+            if tl[i] <= tl[i - 1]:
+                tl[i] = tl[i - 1] + 1.0 / STREAM_HZ
+        total = max(tl[-1], 1.0 / STREAM_HZ)
+        steps = max(1, int(round(total * STREAM_HZ)))
+        rate = rospy.Rate(STREAM_HZ)
+        j = 0
+        for i in range(steps + 1):
+            if rospy.is_shutdown():
+                break
+            t = total * i / steps
+            while j + 1 < len(tl) and tl[j + 1] <= t:
+                j += 1
+            if j + 1 < len(tl):
+                span = tl[j + 1] - tl[j]
+                a = 0.0 if span <= 0.0 else (t - tl[j]) / span
+                a = min(max(a, 0.0), 1.0)
+                tgt = [pts[j][k] + (pts[j + 1][k] - pts[j][k]) * a for k in range(7)]
+            else:
+                tgt = list(pts[-1])
+            out = list(cur)
+            for k in range(7):
+                out[base + k] = tgt[k]
+            self.stream.set(out)
+            if i < steps:
+                rate.sleep()
+        log("  PATH %-5s -> %d waypoints, %.2f s" % (self.active, len(pts), total))
+        rospy.sleep(self.settle or SETTLE_SECONDS)
+        return True
 
     def move_joints(self, degrees, duration=None):
         """Move BOTH arms to a joint-space preset (14 joint angles, degrees).
@@ -762,16 +839,45 @@ class ArmTestControl(object):
         tmsg.values = list(target_deg)
         self.target_pub.publish(tmsg)
         self._interpolate(start_deg, target_deg, dur)
-        rospy.sleep(self.settle or SETTLE_SECONDS)
+        # joint-space presets (home, retract, sixty-seven) are always chained back-to-back;
+        # without this settle the next move is re-targeted before the arm arrives, so the
+        # segments blend into one fast swing and the waypoint is never actually reached.
+        rospy.sleep(JOINT_SETTLE)
         return self._upright()
 
+    @staticmethod
+    def _ramp(s, profile=None, f=None):
+        """Normalised position profile: 0 at s=0, 1 at s=1, s in [0,1].
+
+        trapz  : trapezoidal velocity (constant acceleration, cruise, deceleration)
+        cosine : raised-cosine ease-in/ease-out
+        linear : constant velocity (abrupt start/stop)
+        """
+        prof = profile or MOVE_PROFILE
+        f = ACCEL_FRAC if f is None else f
+        s = min(max(s, 0.0), 1.0)
+        if prof == "linear":
+            return s
+        if prof == "cosine":
+            return 0.5 - 0.5 * math.cos(math.pi * s)
+        # trapezoid
+        if f <= 0.0 or f >= 0.5:
+            return s
+        den = 2.0 * f * (1.0 - f)
+        if s < f:
+            return (s * s) / den
+        if s > 1.0 - f:
+            return 1.0 - ((1.0 - s) * (1.0 - s)) / den
+        return (s - 0.5 * f) / (1.0 - f)
+
     def _interpolate(self, start_deg, target_deg, duration):
+        """Stream a smooth setpoint ramp from start to target over `duration`."""
         steps = max(1, int(round(duration * STREAM_HZ)))
         rate = rospy.Rate(STREAM_HZ)
         for i in range(steps + 1):
             if rospy.is_shutdown():
                 break
-            a = float(i) / float(steps)
+            a = self._ramp(float(i) / float(steps))
             self.stream.set([start_deg[j] + (target_deg[j] - start_deg[j]) * a
                              for j in range(len(target_deg))])
             if i < steps:
@@ -783,6 +889,25 @@ class ArmTestControl(object):
         oerr = ori_error_deg(act_quat, tgt_quat)
         log("  reached (%7.3f, %7.3f, %7.3f)   pos err %5.1f mm   ori err %5.1f deg"
             % (act_pos[0], act_pos[1], act_pos[2], perr, oerr))
+        self.last_ee_err = [(tgt_pos[0] - act_pos[0]) * 1000.0,
+                            (tgt_pos[1] - act_pos[1]) * 1000.0,
+                            (tgt_pos[2] - act_pos[2]) * 1000.0,
+                            perr]
+        try:                                    # log the xyz error for plotting
+            import os
+            path = "/tmp/ee_err.csv"
+            new = not os.path.exists(path)
+            with open(path, "a") as f:
+                if new:
+                    f.write("t,dx,dy,dz,norm\n")
+                f.write("%.3f,%.1f,%.1f,%.1f,%.1f\n"
+                        % (time.time(),
+                           (tgt_pos[0] - act_pos[0]) * 1000.0,
+                           (tgt_pos[1] - act_pos[1]) * 1000.0,
+                           (tgt_pos[2] - act_pos[2]) * 1000.0,
+                           perr))
+        except Exception:
+            pass
         if perr > POS_TOL_MM or oerr > ORI_TOL_DEG:
             log("  !! target not reached well (pos tol %.0f mm, ori tol %.0f deg)"
                 % (POS_TOL_MM, ORI_TOL_DEG))

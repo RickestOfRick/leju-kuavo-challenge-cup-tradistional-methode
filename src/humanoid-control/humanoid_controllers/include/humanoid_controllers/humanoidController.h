@@ -648,6 +648,9 @@ namespace humanoid_controller
     vector_t dexhand_joint_pos_ = vector_t::Zero(12);
 
     vector_t jointPosWBC_, jointVelWBC_;
+    // LIVE arm state straight from /sensors_data_raw (jointPosWBC_ was observed to
+    // freeze, which made the arm PID compute its error from a stale value)
+    Eigen::VectorXd arm_q_live_, arm_v_live_;
     vector_t jointAccWBC_;
     vector_t jointCurrentWBC_;
 
