@@ -38,6 +38,15 @@ At the `task>` prompt:
     box [N]              phase 4: drop into the sorting box
     task [N]             the whole chain (pick -> scale -> handoff -> box) for parcel N
     runall               the whole chain for EVERY parcel, 0 -> 1 -> 2 -> 3
+
+  ---- recording (ACT data) ----
+    data on|off          data-collection timing (fixed waits, claw 0/255)
+    rec N                record parcel N as one bag (enables data mode itself)
+    rec 0123             record several parcels back to back, 2 s apart
+    r [N]                detect -> confirm y/n -> home -> recp N   (one bag per seed)
+    r all                same, but records ALL parcels (one full bag each, rec 0..N)
+    rfull                record the WHOLE run (all parcels) as ONE continuous bag
+    recp N               record ONLY the pick of parcel N (ready -> grasp)
     67 [N]               bonus: the "6-7" arm swing (joint space), N cycles (default 4)
     set67                capture the CURRENT arm pose as the `67` base (arms out front)
 
@@ -91,7 +100,7 @@ DET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detections.
 WEIGH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weigh.json")
 
 # ── scene-1 pick constants (ported from the organisers' collector) ─────────
-PICK_IK_Z = -0.040                    # absolute grasp height (lower = deeper grip)
+PICK_IK_Z = -0.047                    # a bit deeper (was -0.040)
 # grasp offset split by SIDE (right / left), decided by y vs the row's median y
 PICK_OFFSET_RIGHT = [-0.04, -0.02, 0.0]
 PICK_OFFSET_LEFT = [-0.03, 0.00, 0.0]
@@ -106,7 +115,7 @@ FRAME_OFFSET = [0.0, 0.0, 0.0]
 WEIGH_TRANSIT_Z = 0.32            # higher carry height from the pick to the scale
 WEIGH_RELEASE = [0.396, -0.574, 0.146217]   # x, y = fallback if no detection; [2] = drop height
 WEIGH_DROP_Z =  -0.02             # hand height where it OPENS to drop the parcel (tune me)
-WEIGH_REGRASP_Z = -0.040              # lower re-grasp (was -0.02)
+WEIGH_REGRASP_Z = -0.060              # 10 mm lower on the scale (was -0.050)
 # shift the scale placement toward the robot (the arm can't reach the centre
 # comfortably). [x, y, z] in the base frame: +x away from the body, +y left.
 WEIGH_OFFSET = [-0.03, 0.03, 0.0]
@@ -120,6 +129,7 @@ WEIGH_REGRASP_FIRST_YPR = [-45.0, -60.0, 0.0]
 WEIGH_REGRASP_SECOND_YPR = [90.0, 0.0, 0.0]
 WEIGH_RELEASE_DELAY = 0.3             # pause BEFORE opening the claw on the scale
 WEIGH_DWELL = 0.2                     # wait after releasing, before re-grasping
+SCALE_RELEASE_DELAY = 1.0             # pause at the drop height before opening the claw
 # The claw must point straight down when the parcel is placed on the scale, but the
 # arm's small "points-up" tracking error leaves it a few degrees high. So we OVER-ROTATE
 # the aim PAST vertical (≈ "curl more"). Positive = curl back toward the robot (-x);
@@ -132,20 +142,20 @@ _TOPDOWN_T = math.radians(TOPDOWN_TILT_DEG)
 WEIGH_TOPDOWN_DIR = [-math.sin(_TOPDOWN_T), 0.0, -math.cos(_TOPDOWN_T)]
 
 HANDOFF_FWD = 0.0                      # moves BOTH arms; does not change the gap
-RIGHT_HANDOFF = [0.246 + HANDOFF_FWD, -0.044645, 0.3016983]
+RIGHT_HANDOFF = [0.246 + HANDOFF_FWD, -0.044645, 0.3116983]   # 10 mm higher (was 0.3017)
 RIGHT_HANDOFF_TRANSIT_Z = 0.40
 RIGHT_HANDOFF_FALLBACK_ZS = [0.37, 0.35]
-RIGHT_HANDOFF_FIRST_YPR = [-0.839, -100.0, 0.0]
-RIGHT_HANDOFF_SECOND_YPR = [90.0, -20.0, 90.0]
+RIGHT_HANDOFF_FIRST_YPR = [-0.839, -90.0, 0.0]   # level, original yaw kept
+RIGHT_HANDOFF_SECOND_YPR = [95.0, 0.0, 90.0]   # +5 deg roll (was 90)
 LEFT_RECEIVE_READY = [0.266, 0.209, 0.250]
 LEFT_RECEIVE = [0.266, 0.05, 0.250]   # restored to the value that worked
 # ── handoff poses: identical to collect_scene1_handoff_dataset.py ──
 # left is defined RELATIVE to the right handoff, so moving RIGHT_HANDOFF moves both.
 # LEFT_RECEIVE_Y: how far the left claw sits toward its own side (+y). Larger = it
 # stops further away from the parcel (less deep). This is the "too deep" knob.
-LEFT_RECEIVE_X_OFF = -0.005     # half of the previous pull-back (-0.015)
+LEFT_RECEIVE_X_OFF = 0.005      # 10 mm further from the body
 LEFT_RECEIVE_Y_OFF = 0.125      # final grab point (unchanged)
-LEFT_RECEIVE_Z_OFF = -0.0850    # 10 mm higher than -0.0950
+LEFT_RECEIVE_Z_OFF = -0.0720          # a bit higher at the handoff (was -0.0850)
 LEFT_RECEIVE_POS = [RIGHT_HANDOFF[0] + LEFT_RECEIVE_X_OFF,
                     RIGHT_HANDOFF[1] + LEFT_RECEIVE_Y_OFF,
                     RIGHT_HANDOFF[2] + LEFT_RECEIVE_Z_OFF]
@@ -201,11 +211,21 @@ PLACE_DWELL = 0.0                    # wait after releasing in the box (0 = no w
 # ── timings / IK modes ──
 # Motion planning (MoveIt/OMPL) OFF by default: it needs `move_group` running and makes
 # the motion non-deterministic (bad for ACT data). Toggle in the REPL with `mp on|off`.
+DATA_MODE = False                     # True = data collection: every wait is a FIXED
+                                      # duration and retries are disabled, so episodes
+                                      # have identical timing (what ACT needs)
+DATA_WAIT = 0.2                       # the one fixed wait used in DATA_MODE
+DATA_GRIP_WAIT = 0.5                  # fixed claw settle in DATA_MODE
+PICK_GRASP_DELAY = 1.5                # pause after descending, before closing
+PICK_BAG_DIR = "/root/kuavo_ws/bags/pick0"   # where `recpick` writes (host: Project/pick0 dataset)
+FULL_BAG_DIR = "/root/kuavo_ws/bags/full"    # where `rfull` / --record-full writes
+REC_GAP = 2.0                         # `rec 0123`: rest between two bags (s)
 WAIT_STILL_ENABLED = True             # wait for the arm to settle (ws off to disable)
 USE_MOTION_PLANNING = False
 
 MOVE_TIME = 1.0
 SETTLE_TIME = 0.0                    # settle after each move (0 = no wait)
+HOME_SETTLE_BEFORE_REC = 1.5          # let the arm stop moving before the bag opens
 HANDOFF_MOVE_TIME = 2.2
 RIGHT_HANDOFF_MOVE_TIME = 4.5         # the right arm gets there SLOWER (tracks/poses better)
 SCALE_TO_HANDOFF_DELAY = 0.0          # the ONE remaining deliberate pause (after re-grasp)
@@ -218,7 +238,8 @@ HANDOFF_GRIPPER_HOLD = 0.0           # after every claw command inside do_handof
                                      # (original: GRIPPER_HOLD 0.7 + GRIPPER_SETTLE 1.0)
 HANDOFF_SETTLE_TIME = 0.0            # after each ABS move inside do_handoff
 HANDOFF_MOVE_SETTLE = 0.0            # after each Cartesian (linear) move inside do_handoff
-HEAD_SETTLE = 0.0
+HEAD_SETTLE = 0.5                    # let the head finish moving before the cloud
+                                     # (without it the first detect often misses)
 PICK_SETTLE_TIME = 1.2               # rest on top of the parcel before descending (was 0.0)
 IK_MODE_POS_HARD_ORI_HARD = 0x03
 IK_MODE_THREE_POINT = 0x06
@@ -332,9 +353,11 @@ class TaskSequence(object):
         self.home_retract = list(HOME_RETRACT) if HOME_RETRACT else None
         self.six_seven_pose = None          # set by `set67`: base pose for the 6-7 move
         self._planners = {}                 # group name -> moveit_planner.ArmPlanner
+        self.last_grip = {}
         self._pd_profile = "free"
         self._pd_mode = "combined"
         self._ee_pub = None
+        self._start_action_stream()
         self._start_ee_stream()
         try:
             self.apply_pd_defaults()
@@ -448,6 +471,46 @@ class TaskSequence(object):
             ar.move_joints(self.home_retract, duration=dur)
         return ar.move_joints(READY_JOINTS, duration=dur)
 
+    def _start_action_stream(self):
+        """Publish the ACT action stream: 14 joint setpoints (deg) + 2 claw values.
+
+        ACT needs ONE action vector per frame: the joint targets it should reproduce
+        AND the gripper command. Without the claw the policy never learns when to
+        close. Topic: /act_action  (Float64MultiArray, 50 Hz)
+          [0..13] = joint setpoints in degrees, order L1..L7, R1..R7
+          [14]    = left claw percent (0 open .. 100 closed)
+          [15]    = right claw percent
+        """
+        try:
+            from std_msgs.msg import Float64MultiArray
+            import threading
+            self._act_pub = rospy.Publisher("/act_action", Float64MultiArray, queue_size=5)
+
+            def _run():
+                rate = rospy.Rate(50.0)
+                while not rospy.is_shutdown():
+                    try:
+                        ar = self.arm
+                        if ar is not None and ar.stream is not None:
+                            q = ar.stream.get()
+                            m = Float64MultiArray()
+                            if DATA_MODE:
+                                # same convention as the organiser dataset:
+                                # 0 = open, 255 = close
+                                cl = [255.0 if v > 50.0 else 0.0 for v in ar.claw_cmd]
+                            else:
+                                cl = [float(ar.claw_cmd[0]), float(ar.claw_cmd[1])]
+                            m.data = [float(v) for v in q[:14]] + cl
+                            self._act_pub.publish(m)
+                    except Exception:
+                        pass
+                    rate.sleep()
+
+            threading.Thread(target=_run, name="act_action_stream", daemon=True).start()
+            log("  /act_action stream started (14 joints + 2 claws, 50 Hz)")
+        except Exception as e:
+            log("  /act_action stream unavailable (%s)" % e)
+
     def _start_ee_stream(self):
         """Publish the last end-effector error at 10 Hz on /ee_err.
 
@@ -457,6 +520,7 @@ class TaskSequence(object):
             from std_msgs.msg import Float64MultiArray
             import threading
             self._ee_pub = rospy.Publisher("/ee_err", Float64MultiArray, queue_size=1)
+            self._pose_pub = rospy.Publisher("/ee_pose", Float64MultiArray, queue_size=1)
 
             def _run():
                 rate = rospy.Rate(10.0)
@@ -467,12 +531,18 @@ class TaskSequence(object):
                         m = Float64MultiArray()
                         m.data = [float(x) for x in v]
                         self._ee_pub.publish(m)
+                        pz = (ar.last_ee_pose if ar is not None
+                              else [0.0] * 8)
+                        m2 = Float64MultiArray()
+                        m2.data = [float(x) for x in pz]
+                        self._pose_pub.publish(m2)
                     except Exception:
                         pass
                     rate.sleep()
 
             threading.Thread(target=_run, name="ee_err_stream", daemon=True).start()
-            log("  /ee_err stream started at 10 Hz (rqt_plot /ee_err/data[0] ...)")
+            log("  /ee_err (dx,dy,dz,norm mm) and /ee_pose (tgt xyz, act xyz, err mm, rot deg)"
+                " streams started at 10 Hz")
         except Exception as e:
             log("  /ee_err stream unavailable (%s)" % e)
 
@@ -981,6 +1051,8 @@ class TaskSequence(object):
         # descent (looks like "it drops twice"), so go straight to the permissive mode.
         self.move_hand("right", [gx, gy, gz], q, IK_MODE_THREE_POINT, PICK_GRASP_MOVE_TIME)
         self.wait_still()          # settle at the grasp pose before closing
+        if PICK_GRASP_DELAY > 0.0:
+            rospy.sleep(PICK_GRASP_DELAY)     # pause at the grasp pose before closing
         self.grip("right", 100.0, effort=RIGHT_GRIP_EFFORT)
         ar = self.ensure_arm()
         pct = ar.claw_pct[1 if ar.active == "right" else 0]
@@ -1004,6 +1076,9 @@ class TaskSequence(object):
         """Block until the arms STOP MOVING: the biggest joint change over `window`
         seconds is below `tol_deg`. Use before descending/closing so we never act
         while the claw is still swinging after a move."""
+        if DATA_MODE:
+            rospy.sleep(DATA_WAIT)                  # fixed, so episodes are identical
+            return True
         if not WAIT_STILL_ENABLED:
             return True                             # disabled: never block
         ar = self.ensure_arm()
@@ -1035,13 +1110,25 @@ class TaskSequence(object):
         ar.active = side
         got = None
         if pct > 0:
-            got = ar.grip_close_loop(effort=effort)
-            if got:
+            if DATA_MODE:
+                # fixed-duration close: command, wait DATA_GRIP_WAIT, read the state
+                # once. No polling -> identical timing in every episode.
+                ar.set_gripper(100.0, effort=effort)
+                rospy.sleep(DATA_GRIP_WAIT)
+                st, pct_now = ar.claw_state_of()
+                got = (st == 3) or (pct_now is not None and pct_now < 80.0)
+            else:
+                got = ar.grip_close_loop(timeout=2.0, effort=effort)
+            if got and not DATA_MODE:
                 self.set_pd_profile("loaded")      # payload on board
         else:
             ar.set_gripper(pct)
-            self.set_pd_profile("free")            # nothing in the claw
+            if DATA_MODE:
+                rospy.sleep(DATA_GRIP_WAIT)
+            if not DATA_MODE:
+                self.set_pd_profile("free")        # nothing in the claw
         ar.active = prev
+        self.last_grip[side] = got
         return got
 
     # ── phase 2: place on the scale, then regrasp ───────────────────
@@ -1087,6 +1174,9 @@ class TaskSequence(object):
         self.move_hand("right", release, q_rel, IK_MODE_POS_HARD_ORI_HARD,
                        PICK_GRASP_MOVE_TIME)
         self.wait_still()          # claw must stop swinging before we release
+        if SCALE_RELEASE_DELAY > 0.0:
+            log("  scale-drop: holding %.1f s before opening" % SCALE_RELEASE_DELAY)
+            rospy.sleep(SCALE_RELEASE_DELAY)
         self.grip("right", 0.0)
         rospy.sleep(WEIGH_DWELL)
 
@@ -1218,6 +1308,9 @@ class TaskSequence(object):
 
         The official collector does this before every grip: commanding a pose is not
         the same as being there, especially with a soft arm."""
+        if DATA_MODE:
+            rospy.sleep(DATA_WAIT)                  # fixed, no convergence loop
+            return True
         ar = self.ensure_arm()
         ar.active = side
         t0 = time.time()
@@ -1387,15 +1480,450 @@ class TaskSequence(object):
         if not (0 <= idx < len(self.parcels)):
             log("  parcel index %d out of range" % idx)
             return False
+        ar = self.ensure_arm()
+        ar.ik_fail_count = 0
+        t0 = time.time()
+
         self.do_pick(idx)
+        pick_ok = bool(self.last_grip.get("right"))
         self.do_scale(idx)
-        # settle after the re-grasp before starting the handoff
+        scale_ok = bool(self.last_grip.get("right"))
         log("  pause %.1f s (settle after re-grasp, before handoff)" % SCALE_TO_HANDOFF_DELAY)
         rospy.sleep(SCALE_TO_HANDOFF_DELAY)
         self.do_handoff()
-        self.do_box(idx)
-        log("=== task parcel[%d] done ===" % idx)
-        return True
+        handoff_ok = bool(self.last_grip.get("left"))
+        box_ok = bool(self.do_box(idx))
+        ok = pick_ok and scale_ok and handoff_ok and box_ok
+        self.record_episode(idx, ok, pick_ok, scale_ok, handoff_ok, box_ok,
+                            ar.ik_fail_count, time.time() - t0)
+        log("=== task parcel[%d] done  pick=%s scale=%s handoff=%s box=%s ik_fails=%d ==="
+            % (idx, pick_ok, scale_ok, handoff_ok, box_ok, ar.ik_fail_count))
+        return ok
+
+    WRITE_EPISODE_CSV = False          # set True to also append episodes.csv
+
+    def record_episode(self, idx, ok, pick_ok, scale_ok, handoff_ok, box_ok,
+                       ik_fails, duration):
+        """Log one verdict per parcel: only clean ones belong in the ACT dataset."""
+        if not self.WRITE_EPISODE_CSV:
+            return
+        try:
+            import os
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "episodes.csv")
+            new = not os.path.exists(path)
+            with open(path, "a") as f:
+                if new:
+                    f.write("time,parcel,ok,pick,scale,handoff,box,ik_fails,duration\n")
+                f.write("%.0f,%d,%d,%d,%d,%d,%d,%d,%.1f\n"
+                        % (time.time(), idx, int(ok), int(pick_ok), int(scale_ok),
+                           int(handoff_ok), int(box_ok), int(ik_fails), duration))
+        except Exception as e:
+            log("  episode log failed (%s)" % e)
+
+    def _resolve_seed(self):
+        """The seed the running simulator reports, else --seed, else 0.
+
+        challenge_task.py publishes /challenge_sim_seed, so the bag name follows
+        the simulator even when --seed was forgotten or typed differently.
+        """
+        arg = getattr(self.args, "seed", None)
+        sim = None
+        try:
+            sim = rospy.get_param("/challenge_sim_seed", None)
+            sim = None if sim is None else int(sim)
+        except Exception:
+            sim = None
+        if sim is not None:
+            if arg is not None and int(arg) != sim:
+                log("  rec: --seed %d ignored — the simulator is running seed %d"
+                    % (int(arg), sim))
+            return sim
+        if arg is not None:
+            return int(arg)
+        log("  rec: WARNING no /challenge_sim_seed (sim started without challenge_task.py?)"
+            " — naming seed0")
+        return 0
+
+    def _record_bag(self, idx=0, tag_fmt="seed%s_p%d", action=None,
+                    delete_on_fail=False, home_after=False, out_dir=None):
+        """Record whatever `action()` does as one bag, then rename it by verdict.
+
+        The bag starts at the CURRENT pose (caller leaves the arm at ready) and
+        stops as soon as `action()` returns, so the episode is exactly that action.
+        """
+        import os
+        import signal
+        import subprocess
+
+        idx = int(idx)
+        if not (0 <= idx < len(self.parcels)):
+            log("  rec: parcel index %d out of range (%d detected)" % (idx, len(self.parcels)))
+            return False
+
+        # 0) recording always uses data-collection timing (fixed waits, claw 0/255)
+        global DATA_MODE
+        if not DATA_MODE:
+            DATA_MODE = True
+            log("  rec: DATA_MODE enabled automatically")
+
+        # 1) the caller must already be at the ready pose (run `home` first);
+        #    we do NOT move the arm here, so the bag starts exactly at rest
+        log("  rec: starting from the CURRENT pose (make sure you are at ready)")
+        log("  rec: filename seed = %s" % self._resolve_seed())
+
+        # 2) topics: action + state + claw + every camera stream we can see
+        try:
+            tl = subprocess.check_output(["rostopic", "list"], text=True, timeout=5).split()
+        except Exception:
+            tl = []
+        # compressed COLOR only: ACT does not use depth, and raw RGB is ~20x bigger
+        cams = [t for t in tl if t.endswith("color/image_raw/compressed")]
+        if not cams:
+            cams = [t for t in tl if t.endswith("image_raw/compressed")
+                    and "depth" not in t]
+        if not cams:
+            cams = [t for t in tl if t.endswith("image_raw") and "depth" not in t]
+        topics = ["/act_action", "/sensors_data_raw", "/kuavo_arm_traj",
+                  "/leju_claw_state", "/leju_claw_command"] + cams
+
+        out_dir = out_dir or "/root/kuavo_ws/bags/act"
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+        seed = self._resolve_seed()
+        tag = (tag_fmt % (seed,)) if tag_fmt.count("%") == 1 else (tag_fmt % (seed, idx))
+        path = os.path.join(out_dir, tag + ".bag")
+
+        for stale in (path, path + ".active"):
+            if os.path.exists(stale):
+                log("  rec: removing stale %s" % os.path.basename(stale))
+                try:
+                    os.remove(stale)
+                except Exception as e:
+                    log("  rec: could not remove %s (%s)" % (stale, e))
+
+        log("  rec: recording -> %s" % path)
+        log("  rec: topics: %s" % " ".join(topics))
+        proc = subprocess.Popen(["rosbag", "record", "-O", path] + topics,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rospy.sleep(0.5)                       # let the recorder subscribe
+
+        # 3) the parcel, exactly as in runall
+        ok = False
+        try:
+            ok = self.do_task(idx) if action is None else bool(action())
+        finally:
+            proc.send_signal(signal.SIGINT)    # clean stop -> .active becomes .bag
+            try:
+                proc.wait(timeout=60)          # a 200 MB bag needs time to flush
+            except Exception:
+                proc.kill()
+            # rosbag renames .active -> .bag only after the file is closed; wait for it
+            deadline = time.time() + 90.0
+            while time.time() < deadline:
+                done = os.path.exists(path) and not os.path.exists(path + ".active")
+                if done:
+                    break
+                rospy.sleep(0.2)
+            if os.path.exists(path + ".active"):
+                log("  rec: WARNING .active still present — bag may be incomplete")
+
+        # 4) rename with the verdict so the dataset filter is a filename filter
+        #    an unfinished .active must NEVER get an ok1_ik0 name
+        ik = getattr(self.arm, "ik_fail_count", 0) if self.arm else 0
+        if os.path.exists(path):
+            base = "%s_ok%d_ik%d" % (tag, int(bool(ok)), int(ik))
+            final = os.path.join(out_dir, base + ".bag")
+            if os.path.exists(final):        # same seed + parcel recorded again
+                import datetime
+                st = os.stat(final)
+                log("  rec: replacing %s.bag  (from %s, %.0f MB)"
+                    % (base, datetime.datetime.fromtimestamp(st.st_mtime).strftime("%H:%M"),
+                       st.st_size / 1e6))
+            src = path
+        else:
+            final = os.path.join(out_dir, "%s_INCOMPLETE_ok%d_ik%d.bag" % (tag, int(bool(ok)), int(ik)))
+            src = path + ".active"
+            ok = False
+            log("  rec: bag was never finalised by rosbag — saved as INCOMPLETE")
+        try:
+            if os.path.exists(src):
+                os.replace(src, final)
+        except Exception as e:
+            log("  rec: rename failed (%s)" % e)
+            final = src
+        log("  rec: saved %s  (ok=%s ik_fails=%d)" % (final, ok, ik))
+
+        if home_after:
+            try:
+                self.do_home()
+            except Exception as e:
+                log("  rec: home after the bag failed (%s)" % e)
+
+        if delete_on_fail and not ok:
+            try:
+                os.remove(final)
+                log("  rec: deleted the failed bag")
+            except Exception:
+                pass
+        return ok
+
+    def do_record_parcel(self, idx=0, delete_on_fail=False):
+        """Record ONE parcel as one bag: ready -> pick -> scale -> handoff -> box."""
+        return self._record_bag(idx, "seed%s_p%d", None, delete_on_fail)
+
+    def _quick_confirm(self):
+        """detect, print the parcels, ask y/n until confirmed. -> True if confirmed."""
+        while not rospy.is_shutdown():
+            self.do_detect()
+            n = len(self.parcels)
+            log("  r: %d parcel(s) detected" % n)
+            for k, p in enumerate(self.parcels):
+                log("     p%d   x=%+.3f  y=%+.3f" % (k, float(p["x"]), float(p["y"])))
+            try:
+                ans = input("  parcels ok?  [y] record   [n] detect again   [q] abort : ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                log("  r: aborted")
+                return False
+            if ans.startswith("q"):
+                log("  r: aborted")
+                return False
+            if ans.startswith("y"):
+                return True
+            log("  r: re-detecting ...")
+        return False
+
+    def do_record_full(self, delete_on_fail=False, auto_confirm=False,
+                       skip_detect=False):
+        """Record the WHOLE run as ONE bag: ready -> parcel 0..N -> ready.
+
+        Unlike `rec 0123` (one bag per parcel) this keeps everything in a single
+        continuous recording, ~3 min and ~900 MB for four parcels.
+        """
+        if skip_detect:
+            pass                               # caller already detected and validated
+        elif auto_confirm:
+            self.do_detect(show_window=False)
+        elif not self._quick_confirm():        # detect + y/n, like `r`
+            return False
+
+        self.do_home()                         # ready BEFORE the bag starts
+        if HOME_SETTLE_BEFORE_REC > 0.0:       # ... and let it physically settle there
+            log("  rec: settling %.1f s at ready before the bag opens"
+                % HOME_SETTLE_BEFORE_REC)
+            rospy.sleep(HOME_SETTLE_BEFORE_REC)
+
+        def act():
+            ok_all = True
+            n = len(self.parcels)
+            for i in range(n):
+                log("  rfull: parcel %d/%d" % (i + 1, n))
+                ok_i = self.do_task(i)
+                ok_all = ok_all and bool(ok_i)
+            return ok_all
+
+        return self._record_bag(0, "seed%s_full", act, delete_on_fail,
+                                home_after=False, out_dir=FULL_BAG_DIR)
+
+    def do_collect_full(self):
+        """Unattended: headless detect (no windows) until 4 parcels -> home -> rfull.
+
+        Fewer than 4 parcels -> keep detecting; it never records a partial scene.
+        """
+        global DATA_MODE
+        DATA_MODE = True
+        self.pa.show = False
+        self.pa.live = False
+
+        n = 0
+        attempt = 0
+        MAX_TRIES = 12
+        log("  collect: headless detect (no windows), retrying until 4 parcels")
+        while attempt < MAX_TRIES and not rospy.is_shutdown():
+            attempt += 1
+            self.do_detect(show_window=False)
+            n = len(self.parcels)
+            log("  collect: attempt %d/%d -> %d parcel(s)" % (attempt, MAX_TRIES, n))
+            if n >= 4:
+                break
+            rospy.sleep(1.0)
+
+        if n < 4:
+            log("  collect: only %d parcel(s) after %d attempts, aborting (no bag written)"
+                % (n, attempt))
+            return False
+
+        for k, p in enumerate(self.parcels):
+            log("     p%d   x=%+.3f  y=%+.3f" % (k, float(p["x"]), float(p["y"])))
+        # do_record_full() sends the arm home itself, before opening the bag
+        return self.do_record_full(skip_detect=True)
+
+    def do_collect_all(self):
+        """Unattended: headless detect until 4 parcels -> home -> rec 0..N (one bag each).
+
+        Per-parcel bags are ~50 s, which keeps each recording inside the window where
+        the laptop can still render 3 cameras at 30 Hz.
+        """
+        global DATA_MODE
+        DATA_MODE = True
+        self.pa.show = False
+        self.pa.live = False
+
+        n = 0
+        attempt = 0
+        MAX_TRIES = 12
+        log("  collect: headless detect (no windows), retrying until 4 parcels")
+        while attempt < MAX_TRIES and not rospy.is_shutdown():
+            attempt += 1
+            self.do_detect(show_window=False)
+            n = len(self.parcels)
+            log("  collect: attempt %d/%d -> %d parcel(s)" % (attempt, MAX_TRIES, n))
+            if n >= 4:
+                break
+            rospy.sleep(1.0)
+        if n < 4:
+            log("  collect: only %d parcel(s) after %d attempts, aborting" % (n, attempt))
+            return False
+
+        for k, p in enumerate(self.parcels):
+            log("     p%d   x=%+.3f  y=%+.3f" % (k, float(p["x"]), float(p["y"])))
+        self.do_home()
+        if HOME_SETTLE_BEFORE_REC > 0.0:
+            rospy.sleep(HOME_SETTLE_BEFORE_REC)
+        log("  collect: recording %d per-parcel bags (rec 0..%d)" % (n, n - 1))
+        return self.do_record_run(list(range(n)))
+
+    def do_quick_record_all(self):
+        """`r all`: confirm once, then record EVERY parcel, one full bag each."""
+        if not self._quick_confirm():
+            return False
+        n = len(self.parcels)
+        if n == 0:
+            log("  r: no parcels")
+            return False
+        self.do_home()
+        log("  r: recording %d parcels as %d bags (rec 0..%d)" % (n, n, n - 1))
+        return self.do_record_run(list(range(n)))
+
+    def do_quick_record(self, idx=0):
+        """`r`: detect -> ask y/n -> home -> recp idx. Repeat detect while you answer n.
+
+        Intended for collecting one pick bag per seed: it puts the head in the
+        trained pose (detect), lets you confirm the parcels are the ones you expect,
+        then records ready -> grasp and leaves the arm holding.
+        """
+        idx = int(idx)
+        while not rospy.is_shutdown():
+            self.do_detect()
+            n = len(self.parcels)
+            log("  r: %d parcel(s) detected" % n)
+            for k, p in enumerate(self.parcels):
+                log("     p%d   x=%+.3f  y=%+.3f" % (k, float(p["x"]), float(p["y"])))
+            try:
+                ans = input("  parcels ok?  [y] record   [n] detect again   [q] abort : ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                log("  r: aborted")
+                return False
+            if ans.startswith("q"):
+                log("  r: aborted")
+                return False
+            if ans.startswith("y"):
+                break
+            log("  r: re-detecting ...")
+
+        if idx >= len(self.parcels):
+            log("  r: parcel %d out of range (%d detected)" % (idx, len(self.parcels)))
+            return False
+        self.do_home()
+        return self.do_record_pick(idx)
+
+    def do_record_pick(self, idx=0, delete_on_fail=False):
+        """Record ONLY the pick of one parcel: ready -> approach -> descend -> grasp.
+
+        Short, single-target episodes: no ambiguity about *which* parcel and no
+        pauses at the far end of the task, which is what made the full-task policy
+        stop. File: seed<S>_pick<D>_ok<0|1>_ik<F>.bag
+        """
+        def act():
+            try:
+                ar = self.ensure_arm()
+                ar.ik_fail_count = 0
+                self.do_pick(idx)             # approach, descend, close the claw
+                return bool(self.last_grip.get("right"))
+            except Exception as e:
+                log("  recpick: pick failed (%s)" % e)
+                return False
+
+        # no lift and no return home: the arm stays at the grasp pose after the bag,
+        # so nothing extra is recorded and nothing else moves
+        return self._record_bag(idx, "seed%s_pick%d", act, delete_on_fail,
+                                home_after=False, out_dir=PICK_BAG_DIR)
+
+    def do_record_run(self, idxs, pause=None):
+        """Record several parcels back to back: `rec 0123` (one bag each).
+
+        Between two parcels the arm stays at the ready pose and we wait `REC_GAP`
+        seconds, so the next bag starts from rest exactly like a manual `rec`.
+        """
+        idxs = [int(i) for i in idxs]
+        if pause is None:
+            pause = REC_GAP
+        log("  rec: batch %s (%d bags, %.1f s gap)" % ("".join(str(i) for i in idxs),
+                                                       len(idxs), pause))
+        results = []
+        for k, i in enumerate(idxs):
+            log("  rec: --- parcel %d  (%d/%d) ---" % (i, k + 1, len(idxs)))
+            try:
+                ok = self.do_record_parcel(i)
+            except Exception as e:
+                log("  rec: parcel %d aborted (%s)" % (i, e))
+                ok = False
+            results.append((i, bool(ok)))
+            if not ok:
+                try:
+                    self.do_home()          # a failed run may stop mid-air: re-seat it
+                except Exception as e:
+                    log("  rec: home after failed parcel %d failed (%s)" % (i, e))
+            if k < len(idxs) - 1:
+                log("  rec: next bag in %.1f s (hand back to ready)" % pause)
+                rospy.sleep(pause)
+
+        good = [i for i, ok in results if ok]
+        bad = [i for i, ok in results if not ok]
+        log("  rec: batch done — %d ok %s, %d failed %s"
+            % (len(good), good, len(bad), bad))
+        return not bad
+
+    def do_collect(self, n_parcels=4):
+        """Unattended: detect (headless) -> require 4 parcels -> home -> rec 0..3."""
+        global DATA_MODE
+        DATA_MODE = True
+        self.pa.show = False
+        self.pa.live = False
+        log("  collect: DATA_MODE on, windows off")
+
+        self.do_head()
+        rospy.sleep(0.5)
+        self.do_cloud()
+        self.do_ransac()
+        self.do_cluster()
+        self.do_classify()
+        self.do_weigh()
+
+        n = len(self.parcels)
+        log("  collect: %d parcel(s) detected" % n)
+        if n != n_parcels:
+            log("  collect: SKIP this seed (need %d, got %d)" % (n_parcels, n))
+            return False
+
+        self.do_home()
+        all_ok = True
+        for i in range(n):
+            log("  collect: recording parcel %d" % i)
+            all_ok = self.do_record_parcel(i) and all_ok
+        log("  collect: done, all_ok=%s" % all_ok)
+        return all_ok
 
     def do_auto(self):
         """One command: detect -> check 4 parcels -> home -> runall."""
@@ -1462,7 +1990,7 @@ class TaskSequence(object):
     def do_cluster(self):
         P.step_cluster(self.pa)
 
-    def do_detect(self):
+    def do_detect(self, show_window=True):
         """head -> cloud -> ransac -> cluster -> classify -> weigh.
 
         Only the CLUSTER result is shown (its window blocks until you press a key);
@@ -1487,7 +2015,7 @@ class TaskSequence(object):
             sys.stdout = real
         # the cluster overlay is drawn only when args.show is True -> enable it just
         # for this step, so `detect` shows exactly ONE window (the clusters)
-        self.pa.show = True
+        self.pa.show = bool(show_window)
         try:
             self.do_cluster()
         finally:
@@ -1721,6 +2249,32 @@ class TaskSequence(object):
                         log("  wait_still: OFF")
                     else:
                         log("  usage: ws on | ws off | ws")
+                elif cmd in ("data", "datamode"):
+                    global DATA_MODE
+                    if not a:
+                        log("  DATA_MODE: %s (fixed %.1f s waits, no retries)"
+                            % ("ON" if DATA_MODE else "OFF", DATA_WAIT))
+                    else:
+                        DATA_MODE = a[0].lower() in ("on", "1", "true")
+                        log("  DATA_MODE: %s" % ("ON" if DATA_MODE else "OFF"))
+                elif cmd in ("rfull", "rf"):
+                    self.do_record_full()
+                elif cmd in ("r", "quick"):
+                    if a and a[0].lower() in ("all", "a", "-1"):
+                        self.do_quick_record_all()
+                    else:
+                        self.do_quick_record(int(a[0]) if a else 0)
+                elif cmd in ("recp", "recpick", "rp"):
+                    self.do_record_pick(int(a[0]) if a else 0)
+                elif cmd in ("rec", "record"):
+                    if not a:
+                        self.do_record_parcel(0)
+                    elif len(a) == 1 and len(a[0]) > 1 and a[0].isdigit():
+                        self.do_record_run([int(c) for c in a[0]])   # rec 0123
+                    elif len(a) > 1:
+                        self.do_record_run([int(x) for x in a])      # rec 0 1 2 3
+                    else:
+                        self.do_record_parcel(int(a[0]))
                 elif cmd in ("auto", "go"):
                     self.do_auto()
                 elif cmd in ("pdmode", "mode"):
@@ -1866,6 +2420,14 @@ class TaskSequence(object):
                 log("error: %s" % e)
 
     def run(self):
+        if getattr(self.args, "record_all", False):
+            ok = self.do_collect_all()
+            log("record-all: %s" % ("OK" if ok else "FAILED"))
+            return
+        if getattr(self.args, "record_full", False):
+            ok = self.do_collect_full()
+            log("record-full: %s" % ("OK" if ok else "FAILED"))
+            return
         if self.args.live > 0:
             self.do_head()
             self.do_live(self.args.live)
@@ -1886,6 +2448,9 @@ def main():
     ap.add_argument("--ready-bag", default=None,
                     help="bag whose arm trajectory is replayed (default %s)"
                          % DEFAULT_READY_BAG)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="simulation seed for the filename; normally read from the "
+                         "simulator (/challenge_sim_seed), so set it only as a fallback")
     ap.add_argument("--frame", type=float, nargs=3, default=list(FRAME_OFFSET),
                     metavar=("X", "Y", "Z"),
                     help="base_link -> organisers' IK-frame offset for pick")
@@ -1901,10 +2466,24 @@ def main():
     ap.add_argument("--green-hi", type=int, nargs=3, default=list(P.GREEN_HI))
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--show", action="store_true")
+    ap.add_argument("--record-all", action="store_true",
+                    help="unattended: headless detect -> home -> record EVERY parcel "
+                         "as its own bag (per-parcel bags, ~50 s each)")
+    ap.add_argument("--record-full", action="store_true",
+                    help="unattended: headless detect -> home -> record ALL parcels as ONE bag")
+    ap.add_argument("--collect", action="store_true",
+                    help="unattended: detect headless, then record parcels 0..3 as bags")
     args = ap.parse_args()
 
+    if args.collect:
+        os.environ["PERCEPTION_HEADLESS"] = "1"
+
     rospy.init_node("task_sequence", anonymous=True, log_level=rospy.ERROR)
-    TaskSequence(args).run()
+    ts = TaskSequence(args)
+    if args.collect:
+        ts.do_collect()
+        return
+    ts.run()
 
 
 if __name__ == "__main__":

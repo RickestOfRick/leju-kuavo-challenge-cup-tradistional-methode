@@ -134,6 +134,7 @@ ORI_TOL_DEG = 8.0                  # warn above this orientation error
 SERVICE_TIMEOUT = 30.0
 CLAW_HOLD_HZ = 50.0                # rate of the continuous claw command
 CLAW_EFFORT = 2.0                  # grip force (claw docs: 1-2 A; 1.0 = weak)
+BIAS_ENABLED = True                # joint_bias (sag compensation) on/off
 CLAW_GRABBED = 3                   # lejuClawState.state value meaning "grabbed"
 CLAW_REACHED = 2                   # jaw closed but nothing between them
 CLAW_HOLD_PCT = 80.0               # closure below this = something between the jaws
@@ -271,6 +272,9 @@ class ArmTestControl(object):
         self.roll = self.pitch = 0.0
         self.claw_pct = [None, None]
         self.last_ee_err = [0.0, 0.0, 0.0, 0.0]
+        self.last_ee_pose = [0.0] * 8      # tgt xyz, act xyz, perr mm, oerr deg
+        self.claw_cmd = [0.0, 0.0]      # last COMMANDED claw percent (L, R)
+        self.ik_fail_count = 0          # IK failures since the last reset
         self.claw_state = [0, 0]       # lejuClawState.state: 3 = grabbed
         self.poses = {}
         self.stream = None
@@ -610,6 +614,11 @@ class ArmTestControl(object):
 
         with self.lock:
             q_cur = list(self.joint_q)
+        # start the COMMAND from the last commanded setpoint, not from the measured
+        # pose: otherwise every move begins with a step in the action (the arm lagged
+        # behind the previous target by the sag)
+        start_deg_src = (self.stream.get() if self.stream is not None
+                         else [math.degrees(v) for v in q_cur])
         fk = self.fk(q_cur)
         l_pos = np.array(fk.left_pose.pos_xyz, dtype=float)
         r_pos = np.array(fk.right_pose.pos_xyz, dtype=float)
@@ -637,6 +646,7 @@ class ArmTestControl(object):
                                         IK_MODE_POS_HARD_ORI_SOFT,
                                         pos_tol=IK_POS_TOL_RELAXED)
         if q_cmd is None:
+            self.ik_fail_count += 1
             log("  IK FAILED — the solver found no solution.")
             log("  This service leaves error_reason empty; the real reason is in the")
             log("  Terminal 1 log (look for 'out of workspace!'). Likely causes:")
@@ -660,7 +670,7 @@ class ArmTestControl(object):
                "(%5.1f, %5.1f, %5.1f)" % tuple(math.degrees(v)
                                                 for v in euler_from_quaternion(tgt_quat))))
 
-        start_deg = [math.degrees(v) for v in q_cur]
+        start_deg = list(start_deg_src)
         target_deg = self._apply_bias([math.degrees(v) for v in q_cmd])
         if self.bias_active and any(self.joint_bias):
             log("  (joint bias active on %s: %s)"
@@ -697,11 +707,21 @@ class ArmTestControl(object):
                 quat = list(q0)
         else:
             quat = list(quat)
-        cur_pos, _ = self.current_pose()
-        start = np.array(cur_pos, dtype=float)
-        end = np.array(pos, dtype=float)
         with self.lock:
             warm = list(self.joint_q)
+        # same rule as move_to: start the COMMAND where the last command ended, so the
+        # first waypoint is not the measured pose (that was a step in /act_action)
+        if self.stream is not None:
+            warm = [math.radians(v) for v in self.stream.get()]
+        # the Cartesian line also starts at the COMMANDED pose, not the measured one
+        try:
+            fk0 = self.fk(warm)
+            cur_pos = np.array(getattr(fk0, self.active + "_pose").pos_xyz, dtype=float)
+        except Exception:
+            cur_pos, _ = self.current_pose()
+            cur_pos = np.array(cur_pos, dtype=float)
+        start = np.array(cur_pos, dtype=float)
+        end = np.array(pos, dtype=float)
         base = 7 if self.active == "right" else 0
         wrist_hold = [warm[base + k] for k in (4, 5, 6)] if self.freeze_wrist else None
         joint_wps = [[math.degrees(v) for v in warm]]
@@ -727,6 +747,7 @@ class ArmTestControl(object):
                                             pos_tol=IK_POS_TOL_RELAXED)
             if q_cmd is None:
                 solved = len(joint_wps) - 1
+                self.ik_fail_count += 1
                 log("  LINEAR IK failed at segment %d/%d (mode 0x%02x) — keeping %d solved"
                     % (k, int(n_points), self.ik_mode, solved))
                 # DO NOT throw away the progress we already solved: stream the waypoints
@@ -831,7 +852,8 @@ class ArmTestControl(object):
             return False
         with self.lock:
             q_cur = list(self.joint_q)
-        start_deg = [math.degrees(v) for v in q_cur]
+        start_deg = (self.stream.get() if self.stream is not None
+                     else [math.degrees(v) for v in q_cur])
         target_deg = [float(v) for v in degrees]
         log("  JOINTS -> [%s]" % ", ".join("%.1f" % v for v in target_deg))
         tmsg = armTargetPoses()
@@ -893,6 +915,9 @@ class ArmTestControl(object):
                             (tgt_pos[1] - act_pos[1]) * 1000.0,
                             (tgt_pos[2] - act_pos[2]) * 1000.0,
                             perr]
+        self.last_ee_pose = [float(tgt_pos[0]), float(tgt_pos[1]), float(tgt_pos[2]),
+                             float(act_pos[0]), float(act_pos[1]), float(act_pos[2]),
+                             float(perr), float(oerr)]
         try:                                    # log the xyz error for plotting
             import os
             path = "/tmp/ee_err.csv"
@@ -938,6 +963,8 @@ class ArmTestControl(object):
         else:
             left = pct
         pos = [left, right]
+        with self.lock:
+            self.claw_cmd = [float(left), float(right)]
         if self.claw_hold is not None:               # keep re-sending this command
             self.claw_hold.set(pos, eff=[eff, eff])
         req = controlLejuClawRequest()

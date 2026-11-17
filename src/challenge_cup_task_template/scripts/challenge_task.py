@@ -63,6 +63,13 @@ def run_scene(scene, seed, node_name=None, timeout=120,
     from geometry_msgs.msg import Twist
     from sensor_msgs.msg import JointState
 
+    # the seed this simulator is actually using (read back by task_sequence.py so a
+    # recorded bag is named after the real seed, not a remembered command line)
+    try:
+        rospy.set_param("/challenge_sim_seed", int(seed))
+    except Exception as e:
+        rospy.logwarn("could not publish /challenge_sim_seed: %s", e)
+
     rospy.loginfo("=== %s任务启动 ===", config["title"])
 
     cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
